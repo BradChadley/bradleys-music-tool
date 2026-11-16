@@ -287,8 +287,8 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
                     },
                 }
             };
-            let login = cards::Slsk { user: &mut app.slsk_user, pass: &mut app.slsk_pass, show: &mut app.slsk_show, keep: &mut app.cfg.keep_lossless, saved: has_saved, optional: !has_saved };
-            changed |= cards::soulseek(ui, login, Some(&mut row));
+            let login = cards::Slsk { user: &mut app.slsk_user, pass: &mut app.slsk_pass, show: &mut app.slsk_show, saved: has_saved, optional: !has_saved };
+            cards::soulseek(ui, login, Some(&mut row));
             Some(if typed && !client {
                 (format!("The Soulseek client ({} MB) is fetched when you save.", (Helper::Soulseek.pin().size as f64 / 1_000_000.0).round()), FAINT())
             } else if has_saved {
@@ -319,6 +319,12 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
     }
     ui.add_space(14.0);
     theme::centered_wrapped(ui, "Both logins are kept in Windows Credential Manager on this PC, not in a file and not in the backups.", 12.5, FAINT(), wide);
+    // what an import does with a lossless album: a card of its own, the full width
+    ui.add_space(GAP);
+    theme::card_row(ui, "settings-lossless", left, wide, 1, 1, GAP, PAD, 0.0, false, |_, ui| {
+        changed |= cards::lossless(ui, &mut app.cfg.keep_lossless);
+        None
+    });
     changed
 }
 

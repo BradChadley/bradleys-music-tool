@@ -20,7 +20,8 @@ pub(crate) struct Setup {
     folder: FolderCard,
     /// "Look only, change nothing", for a library laid out another way (it starts chosen)
     look_only: bool,
-    /// lossless downloads stay as they are (for someone new, the choice that loses nothing)
+    /// lossless downloads stay lossless; for someone new they become MP3 320 (a third of the room, and they
+    /// play on anything), the choice shown first on the card
     keep_lossless: bool,
     slsk_user: String,
     slsk_pass: String,
@@ -35,7 +36,7 @@ impl Setup {
         // (a test run can start with a made-up Soulseek login typed in, since a script cannot type:
         // `MUSIC_RECS_SETUP_LOGIN=name:password`)
         let (slsk_user, slsk_pass) = cards::test_switch("MUSIC_RECS_SETUP_LOGIN").and_then(|l| l.split_once(':').map(|(n, p)| (n.to_string(), p.to_string()))).unwrap_or_default();
-        Self { folder: FolderCard::default(), look_only: true, keep_lossless: true, slsk_user, slsk_pass, slsk_show: false, slsk_trouble: None, ffmpeg: (-10.0, false) }
+        Self { folder: FolderCard::default(), look_only: true, keep_lossless: false, slsk_user, slsk_pass, slsk_show: false, slsk_trouble: None, ffmpeg: (-10.0, false) }
     }
 
     /// A Soulseek login was typed in: both parts are there.
@@ -104,7 +105,7 @@ pub(crate) fn screen(app: &mut App, ui: &mut Ui) {
                     Some(("Your listening history makes Recs better. It works without it.".to_string(), FAINT()))
                 }
                 _ => {
-                    let login = cards::Slsk { user: &mut s.slsk_user, pass: &mut s.slsk_pass, show: &mut s.slsk_show, keep: &mut s.keep_lossless, saved: false, optional: true };
+                    let login = cards::Slsk { user: &mut s.slsk_user, pass: &mut s.slsk_pass, show: &mut s.slsk_show, saved: false, optional: true };
                     cards::soulseek(ui, login, None);
                     let fetched = format!("The Soulseek client ({} MB) is fetched when you start.", (Helper::Soulseek.pin().size as f64 / 1_000_000.0).round());
                     match &s.slsk_trouble {
@@ -113,6 +114,13 @@ pub(crate) fn screen(app: &mut App, ui: &mut Ui) {
                         None => Some(("Use an account of its own, not the one you chat with.".to_string(), FAINT())),
                     }
                 }
+            });
+
+            // what an import does with a lossless album: a card of its own, the full width, faint like the three
+            ui.add_space(GAP);
+            theme::card_row(ui, "setup-lossless", left, wide, 1, 1, GAP, PAD, 0.0, !ready, |_, ui| {
+                cards::lossless(ui, &mut s.keep_lossless);
+                None
             });
 
             // the one loud word, once there is a folder

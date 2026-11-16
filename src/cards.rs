@@ -664,19 +664,17 @@ pub(crate) struct Slsk<'a> {
     pub pass: &'a mut String,
     /// the password's letters are on show
     pub show: &'a mut bool,
-    /// lossless downloads stay as they are
-    pub keep: &'a mut bool,
     /// a password is saved already: its box says so
     pub saved: bool,
     /// "optional" stands at the card's top
     pub optional: bool,
 }
 
-/// The Soulseek card: the login the Downloads page searches with, and what happens to a lossless
-/// download when it is imported. `row` draws the one line under the two boxes (Settings: how the
+/// The Soulseek card: the login the Downloads page searches with (what happens to a lossless download is
+/// the card of its own under it, `lossless`). `row` draws the one line under the two boxes (Settings: how the
 /// sign-in stands, or the word that saves the login); `None` leaves that line out (the first start,
-/// where "Start" saves). True when the choice about lossless downloads was changed.
-pub(crate) fn soulseek(ui: &mut Ui, s: Slsk, row: Option<&mut dyn FnMut(&mut Ui)>) -> bool {
+/// where "Start" saves).
+pub(crate) fn soulseek(ui: &mut Ui, s: Slsk, row: Option<&mut dyn FnMut(&mut Ui)>) {
     head(ui, "SOULSEEK", s.optional);
     ui.add_space(8.0);
     box_(ui, TextEdit::singleline(s.user).hint_text("Name"));
@@ -692,21 +690,126 @@ pub(crate) fn soulseek(ui: &mut Ui, s: Slsk, row: Option<&mut dyn FnMut(&mut Ui)
             row(ui);
         });
     }
+}
+
+/// One of the two ways a lossless album can come in, as `lossless` draws it.
+struct Way {
+    keep: bool,
+    from: &'static str,
+    to: &'static str,
+    /// the format it comes out as is lossless too (drawn in blue, as FLAC going in is)
+    to_lossless: bool,
+    name: &'static str,
+    why: &'static str,
+    /// a typical album of this kind, in MB, and how long its bar is
+    size: &'static str,
+    bar: f32,
+}
+
+const WAYS: [Way; 2] = [
+    Way { keep: false, from: "FLAC", to: "MP3 320", to_lossless: false, name: "Convert to MP3 320", why: "About a third of the room, and it plays on anything. Tags, cover and lyrics come along.", size: "about 110 MB an album", bar: 34.0 },
+    Way { keep: true, from: "FLAC", to: "FLAC", to_lossless: true, name: "Keep lossless", why: "The sound exactly as downloaded. WAV, ALAC and APE become FLAC.", size: "about 300 MB an album", bar: 100.0 },
+];
+
+/// The card of its own under the three: what an import does with a lossless album (`keep`: it stays
+/// lossless). Each way is a small picture of what happens, the format going in and coming out, why, and
+/// how much room an album takes; the chosen one is lit and a click on the other chooses it. Side by side,
+/// one under the other in a narrow card, and one faint line under them. True when the choice was changed.
+pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool) -> bool {
+    theme::caption(ui, "WHEN A LOSSLESS ALBUM IS IMPORTED");
     ui.add_space(10.0);
-    ui.label(RichText::new("Lossless downloads").size(12.5).color(FAINT()));
-    ui.add_space(2.0);
+    let full = ui.available_width();
+    let side = full >= 640.0;
+    let (gap, inset) = (18.0, 10.0);
+    let w = if side { ((full - gap) / 2.0).floor() } else { full };
+    // (both are as tall as the taller, so they read across)
+    let text_w = w - 2.0 * inset - 25.0;
+    let whys: Vec<_> = WAYS.iter().map(|way| ui.painter().layout(way.why.to_string(), FontId::proportional(12.5), DIM(), text_w)).collect();
+    let h = (inset + 20.0 + 4.0 + whys.iter().map(|g| g.size().y).fold(0.0, f32::max) + 6.0 + 14.0 + inset).ceil();
+    let rows = if side { 1 } else { 2 };
+    let (area, _) = ui.allocate_exact_size(vec2(full, h * rows as f32 + if side { 0.0 } else { 8.0 }), Sense::hover());
     let mut changed = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
-        changed |= theme::choice(ui, s.keep, true, "Keep as they are").clicked();
-        changed |= theme::choice(ui, s.keep, false, "Convert to MP3 320").clicked();
-    });
+    for (n, (way, why)) in WAYS.iter().zip(whys).enumerate() {
+        let at = if side { pos2(area.left() + n as f32 * (w + gap), area.top()) } else { pos2(area.left(), area.top() + n as f32 * (h + 8.0)) };
+        let rect = Rect::from_min_size(at, vec2(w, h));
+        let chosen = *keep == way.keep;
+        let r = ui.interact(rect, egui::Id::unique(("lossless-way", way.keep)), Sense::click());
+        script::seen(if way.keep { "lossless:keep" } else { "lossless:convert" }, rect);
+        let p = ui.painter();
+        if chosen {
+            p.rect_filled(rect, 8, theme::CARD_HOVER());
+        } else if r.hovered() {
+            p.rect_filled(rect, 8, theme::CARD_HOVER().gamma_multiply(0.5));
+        }
+        if r.hovered() && !chosen {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // the round mark: coral and filled when chosen
+        let dot = pos2(rect.left() + inset + 6.0, rect.top() + inset + 10.0);
+        if chosen {
+            p.circle_stroke(dot, 6.0, egui::Stroke::new(1.4, theme::ACCENT()));
+            p.circle_filled(dot, 3.0, theme::ACCENT());
+        } else {
+            p.circle_stroke(dot, 6.0, egui::Stroke::new(1.4, if r.hovered() { DIM() } else { FAINT() }));
+        }
+        // the picture: the format going in, an arrow, the format coming out, then its name
+        let mut x = rect.left() + inset + 25.0;
+        let mid = dot.y;
+        let chip = |p: &egui::Painter, x: f32, words: &str, lossless: bool| -> f32 {
+            let color = if lossless { ACCENT2() } else { TEXT() };
+            let g = p.layout_no_wrap(words.to_string(), FontId::proportional(10.5), color);
+            let r = Rect::from_min_size(pos2(x, (mid - g.size().y / 2.0 - 2.0).round()), g.size() + vec2(12.0, 4.0));
+            p.rect_stroke(r, 4, egui::Stroke::new(1.0, if lossless { ACCENT2().gamma_multiply(0.45) } else { theme::BORDER().lerp_to_gamma(TEXT(), 0.25) }), egui::StrokeKind::Inside);
+            p.galley(pos2(r.left() + 6.0, r.top() + 2.0), g, color);
+            r.right()
+        };
+        x = chip(p, x, way.from, true) + 7.0;
+        let arrow = p.layout_no_wrap("\u{2192}".to_string(), FontId::proportional(12.0), FAINT());
+        p.galley(pos2(x, (mid - arrow.size().y / 2.0).round()), arrow.clone(), FAINT());
+        x += arrow.size().x + 7.0;
+        x = chip(p, x, way.to, way.to_lossless) + 10.0;
+        let name_color = if chosen { TEXT() } else { DIM() };
+        let name = p.layout_no_wrap(way.name.to_string(), FontId::proportional(14.0), name_color);
+        p.galley(pos2(x, (mid - name.size().y / 2.0).round()), name, name_color);
+        // why, and how much room an album takes, as a bar and in words
+        let text_x = rect.left() + inset + 25.0;
+        let why_color = if chosen { DIM() } else { FAINT() };
+        let why_top = rect.top() + inset + 24.0;
+        let why_h = why.size().y;
+        p.galley_with_override_text_color(pos2(text_x, why_top), why, why_color);
+        let bar_y = why_top + why_h + 6.0 + 7.0;
+        let bar = Rect::from_min_size(pos2(text_x, bar_y - 2.5), vec2(way.bar, 5.0));
+        p.rect_filled(bar, 3, if chosen { DIM() } else { theme::BORDER().lerp_to_gamma(FAINT(), 0.3) });
+        let size = p.layout_no_wrap(way.size.to_string(), FontId::proportional(11.5), FAINT());
+        p.galley(pos2(bar.right() + 6.0, (bar_y - size.size().y / 2.0).round()), size, FAINT());
+        if r.clicked() && !chosen {
+            *keep = way.keep;
+            changed = true;
+        }
+    }
+    ui.add_space(12.0);
+    ui.add(Label::new(RichText::new(LOSSLESS_FOOT).size(12.5).color(FAINT())).wrap());
     changed
 }
+
+/// What the lossless card says at its foot.
+pub(crate) const LOSSLESS_FOOT: &str = "MP3 and other lossy downloads come in as they are.";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lossless_card_offers_convert_first_and_says_what_each_way_does() {
+        // (the first-start screen starts on the first: MP3 320 for someone new)
+        assert!(!WAYS[0].keep && WAYS[1].keep);
+        assert_eq!((WAYS[0].from, WAYS[0].to, WAYS[1].to), ("FLAC", "MP3 320", "FLAC"));
+        // the bars keep the sizes' proportion (about 110 MB to about 300 MB)
+        assert!((WAYS[0].bar / WAYS[1].bar - 110.0 / 300.0).abs() < 0.05);
+        for w in &WAYS {
+            assert!(!w.why.contains('\u{2014}'), "no em dashes");
+        }
+    }
 
     fn lab(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("music-recs-setup-{name}-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
