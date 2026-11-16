@@ -474,7 +474,8 @@ impl DownloadsPanel {
     /// The box: a magnifying glass, the words, and "Search" at its right end, which is the page's loud
     /// word only while the box holds words that are not a kept search's.
     fn search_box(&mut self, ui: &mut Ui, left: f32, wide: f32) {
-        let ready = self.snap.setup == Setup::Ready;
+        // (while the client starts, a search can be typed and asked for: it runs once the client is signed in)
+        let ready = matches!(self.snap.setup, Setup::Ready | Setup::Starting);
         let w = wide.min(620.0);
         let rect = Rect::from_min_size(pos2((left + (wide - w) / 2.0).round(), ui.cursor().top()), vec2(w, 46.0));
         let frame = ui.painter().add(egui::Shape::Noop);
@@ -548,6 +549,12 @@ impl DownloadsPanel {
         };
         // (put in place a moment before the client is looked for again)
         let in_place = not_installed && doing.is_none() && crate::helpers::arrived(Helper::Soulseek) > 0 && slskd::exe().exists();
+        // a search typed while the client was starting waits only while it is starting or signing in: once
+        // that has failed, the line says why (the words stay in the box, for a click on Search later)
+        let on_the_way = matches!(&setup, Setup::Starting) || matches!(&setup, Setup::Offline(w) if w.starts_with("Signing in")) || (not_installed && (doing.is_some() || in_place));
+        if self.waiting.is_some() && !on_the_way && setup != Setup::Ready {
+            self.waiting = None;
+        }
         {
             let pieces: Vec<Piece> = if self.facts.link.is_some() {
                 vec![Piece::Spin, Piece::Say("Reading the link", DIM())]
@@ -555,7 +562,7 @@ impl DownloadsPanel {
                 vec![Piece::Spin, Piece::Say("Will search as soon as Soulseek is signed in", DIM())]
             } else {
                 match &setup {
-                    Setup::Starting => vec![Piece::Say("Starting the Soulseek client", DIM())],
+                    Setup::Starting => vec![Piece::Spin, Piece::Say("Starting the Soulseek client", DIM())],
                     Setup::NotInstalled => match (&doing, &fetch) {
                         (Some((words, Some(part))), _) => vec![Piece::Say(words, DIM()), Piece::Bar(*part), Piece::Say(&amount, FAINT()), Piece::Word("Stop")],
                         (Some((words, None)), _) => vec![Piece::Spin, Piece::Say(words, DIM()), Piece::Word("Stop")],

@@ -55,6 +55,8 @@ pub fn take_asked() -> Option<String> {
 #[derive(Clone, PartialEq)]
 pub struct Settings {
     pub port: u16,
+    /// the port it takes Soulseek connections on (`soulseek: listen_port`; slskd's own default when absent)
+    pub listen_port: u16,
     pub key: String,
     /// both a user name and a password have been typed in
     pub has_login: bool,
@@ -260,6 +262,7 @@ fn unquote(s: &str) -> &str {
 /// changed over its web side, or a web side that asks for no sign-in.
 pub fn parse_settings(text: &str) -> Result<Settings, String> {
     let (mut section, mut port, mut user, mut pass, mut in_auth) = (String::new(), None, false, false, false);
+    let mut listen: Option<u16> = None;
     let mut mark = std::collections::hash_map::DefaultHasher::new();
     let yes = |v: &str| matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "y" | "1");
     let sharing = || Err("The Soulseek client's settings file shares folders with other Soulseek users. The app shares nothing, so it does not start it like that. Empty \"shares: directories\" in slskd.yml.".to_string());
@@ -308,11 +311,12 @@ pub fn parse_settings(text: &str) -> Result<Settings, String> {
                 mark.write(line.as_bytes());
             }
             ("web", "port") if indent == 2 => port = v.parse::<u16>().ok(),
+            ("soulseek", "listen_port") if indent == 2 => listen = v.parse::<u16>().ok(),
             _ => {}
         }
     }
     let port = port.ok_or("The slskd settings file has no web port.")?;
-    Ok(Settings { port, key: session_key().to_string(), has_login: user && pass, login_mark: mark.finish() })
+    Ok(Settings { port, listen_port: listen.unwrap_or(LISTEN_DEFAULT), key: session_key().to_string(), has_login: user && pass, login_mark: mark.finish() })
 }
 
 pub fn read_settings() -> Result<Settings, String> {
@@ -615,8 +619,13 @@ pub struct Client {
 
 impl Client {
     pub fn new(set: &Settings) -> Self {
+        Self::at(set, set.port)
+    }
+
+    /// The client of a slskd started on another web port than its settings file names (see `ports_for_start`).
+    pub fn at(set: &Settings, web_port: u16) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
-        Client { base: format!("http://127.0.0.1:{}", set.port), key: set.key.clone(), agent }
+        Client { base: format!("http://127.0.0.1:{web_port}"), key: set.key.clone(), agent }
     }
 
     fn finish(res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Value), String> {
@@ -733,12 +742,97 @@ fn tie_to_app(child: &std::process::Child) {
     }
 }
 
-/// Starts slskd with no window, saving into `downloads` (see `start_args`). The caller keeps the handle and
-/// stops it when the app closes.
-pub fn spawn(downloads: Option<&std::path::Path>) -> Result<std::process::Child, String> {
-    let child = spawn_plain(downloads)?;
+/// slskd's own default for the port it takes Soulseek connections on.
+pub const LISTEN_DEFAULT: u16 = 50300;
+
+/// The two ports a start of slskd uses: its web side (where the app talks to it, on this PC only) and the
+/// one it takes Soulseek connections on.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Ports {
+    pub web: u16,
+    pub listen: u16,
+}
+
+/// The ports for this start: the settings file's, unless one of them cannot be listened on now (another
+/// program has it, or Windows keeps it for itself: Hyper-V, WSL and Docker reserve blocks of ports, often
+/// other ones after each restart). Then the first free port after it, and failing that one Windows hands
+/// out. The settings file is not changed: the next start looks again.
+pub fn ports_for_start(set: &Settings) -> Ports {
+    let free = |ip: [u8; 4], p: u16| std::net::TcpListener::bind((std::net::Ipv4Addr::from(ip), p)).is_ok();
+    Ports { web: port_to_use(set.port, |p| free([127, 0, 0, 1], p)), listen: port_to_use(set.listen_port, |p| free([0, 0, 0, 0], p)) }
+}
+
+fn port_to_use(want: u16, free: impl Fn(u16) -> bool) -> u16 {
+    if want != 0 && free(want) {
+        return want;
+    }
+    // the next hundred ports, skipping 0 and the ones under 1024
+    if let Some(p) = (1..=100u16).filter_map(|n| want.checked_add(n)).find(|p| *p >= 1024 && free(*p)) {
+        return p;
+    }
+    // one Windows says is free
+    std::net::TcpListener::bind(("0.0.0.0", 0)).ok().and_then(|l| l.local_addr().ok()).map(|a| a.port()).unwrap_or(want)
+}
+
+/// The last lines slskd wrote at its latest start (it writes its log to its output): what it said when it
+/// stopped. Kept in memory only, at most `TAIL_LINES` lines; everything else it writes is passed over.
+static TAIL: Mutex<std::collections::VecDeque<String>> = Mutex::new(std::collections::VecDeque::new());
+const TAIL_LINES: usize = 40;
+
+fn keep_line(line: &str) {
+    static ESC: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").unwrap());
+    let line = ESC.replace_all(line, "").trim().to_string();
+    if line.is_empty() {
+        return;
+    }
+    let mut t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    if t.len() >= TAIL_LINES {
+        t.pop_front();
+    }
+    t.push_back(line);
+}
+
+/// Why the latest start of slskd stopped, in words for the page, from what it wrote. None when it said
+/// nothing that tells.
+pub fn why_it_stopped() -> Option<String> {
+    let t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    stopped_words(t.iter().map(String::as_str))
+}
+
+fn stopped_words<'a>(lines: impl DoubleEndedIterator<Item = &'a str> + Clone) -> Option<String> {
+    let low = |l: &str| l.to_lowercase();
+    if lines.clone().any(|l| low(l).contains("already running")) {
+        return Some("Another Soulseek client (slskd) is already running on this PC. Close it, then click Try again.".into());
+    }
+    if lines.clone().any(|l| {
+        let l = low(l);
+        l.contains("failed to start listening") || l.contains("address already in use") || l.contains("an attempt was made to access a socket in a way forbidden") || l.contains("only one usage of each socket address")
+    }) {
+        return Some("The Soulseek client could not listen on its network port; another program may have it. Click Try again.".into());
+    }
+    // the last line that reads as an error, not a line of the program's own trace ("   at slskd...")
+    lines.rev().filter(|l| !l.trim_start().starts_with("at ") && !l.contains(" WRN]")).find(|l| {
+        let l = low(l);
+        l.contains("error") || l.contains("fatal") || l.contains("exception") || l.contains("failed") || l.contains("invalid")
+    }).map(|l| {
+        // "Soulseek.ListenException: Failed ..." reads as "Failed ..."
+        static NAME: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| regex::Regex::new(r"^(\[[^\]]*\]\s*)?([A-Za-z_][\w.]*Exception(\s*\(\d+\))?:\s*)").unwrap());
+        let l = NAME.replace(l, "$1").to_string();
+        format!("The Soulseek client stopped: {}", crate::util::plain_err(tidy(&l, 160)))
+    })
+}
+
+/// Starts slskd with no window, saving into `downloads` (see `start_args`), on the ports `ports_for_start`
+/// picks. The caller keeps the handle and stops it when the app closes; the web port is where to reach it.
+pub fn spawn(downloads: Option<&std::path::Path>, set: &Settings) -> Result<(std::process::Child, Ports), String> {
+    let ports = ports_for_start(set);
+    if ports.web != set.port || ports.listen != set.listen_port {
+        crate::config::log(&format!("soulseek: port {} or {} cannot be used now; starting the client on {} and {}", set.port, set.listen_port, ports.web, ports.listen));
+    }
+    let child = spawn_plain(downloads, ports)?;
     tie_to_app(&child);
-    Ok(child)
+    crate::config::log(&format!("soulseek: the client was started (process {}, ports {} and {})", child.id(), ports.web, ports.listen));
+    Ok((child, ports))
 }
 
 /// What slskd is handed when the app starts it, as environment variables of that one process (slskd's own
@@ -761,8 +855,11 @@ fn start_env(login: Option<&crate::secrets::Entry>, key: &str, web_password: &st
 /// wins over slskd's settings file, so whatever that file says, slskd's web side answers only on this PC.
 /// So does `--downloads`: the Soulseek downloads folder from Settings (when one is set), so slskd saves
 /// where the import list looks, whatever folder its settings file was written with.
-fn start_args(data: &std::path::Path, downloads: Option<&std::path::Path>) -> Vec<std::ffi::OsString> {
+/// The ports are given here too, so a port taken since the settings file was written does not stop it.
+fn start_args(data: &std::path::Path, downloads: Option<&std::path::Path>, ports: Ports) -> Vec<std::ffi::OsString> {
     let mut args: Vec<std::ffi::OsString> = vec!["--app-dir".into(), data.as_os_str().to_owned(), "--http-ip-address".into(), "127.0.0.1".into()];
+    // (and no HTTPS side at all: the app talks plain HTTP on this PC, and a taken port 5031 must not stop it)
+    args.extend(["--http-port".into(), ports.web.to_string().into(), "--slsk-listen-port".into(), ports.listen.to_string().into(), "--no-https".into()]);
     if let Some(d) = downloads {
         args.push("--downloads".into());
         args.push(d.as_os_str().to_owned());
@@ -794,19 +891,36 @@ fn test_no_connect() -> bool {
     test("MUSIC_RECS_DATA") && test("MUSIC_RECS_SLSKD_NO_CONNECT")
 }
 
-fn spawn_plain(downloads: Option<&std::path::Path>) -> Result<std::process::Child, String> {
+fn spawn_plain(downloads: Option<&std::path::Path>, ports: Ports) -> Result<std::process::Child, String> {
     // never with a settings file that would open slskd up (see `parse_settings`)
     read_settings()?;
-    std::process::Command::new(exe())
-        .args(start_args(&data_dir(), downloads))
+    TAIL.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    let mut child = std::process::Command::new(exe())
+        .args(start_args(&data_dir(), downloads, ports))
         .args(test_no_connect().then_some("--no-connect"))
         .envs(start_env(crate::secrets::get(crate::secrets::SOULSEEK).as_ref(), session_key(), &crate::secrets::random_hex(24)))
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .creation_flags(NO_WINDOW)
         .spawn()
-        .map_err(|e| crate::util::plain_err(format!("The Soulseek client could not be started: {e}")))
+        .map_err(|e| crate::util::plain_err(format!("The Soulseek client could not be started: {e}")))?;
+    // what it writes is read as it comes (a full pipe would stop it), and only the last lines are kept
+    fn drain(from: impl std::io::Read + Send + 'static) {
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(from).split(b'\n').map_while(Result::ok) {
+                keep_line(&String::from_utf8_lossy(&line));
+            }
+        });
+    }
+    if let Some(out) = child.stdout.take() {
+        drain(out);
+    }
+    if let Some(err) = child.stderr.take() {
+        drain(err);
+    }
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -857,18 +971,61 @@ mod tests {
     }
 
     #[test]
+    fn a_port_that_cannot_be_listened_on_is_passed_over() {
+        // free: kept; taken: the next free one; under 1024 never; nothing free near it: one Windows gives
+        assert_eq!(port_to_use(50300, |_| true), 50300);
+        assert_eq!(port_to_use(50300, |p| p > 50302), 50303);
+        assert_eq!(port_to_use(1000, |p| p > 1000), 1024);
+        let given = port_to_use(50300, |_| false);
+        assert!(given > 0 && given != 50300, "{given}");
+        // a port this PC really has in use is passed over
+        // (each held the way slskd uses it: its web side on this PC alone, Soulseek on every address)
+        let web_held = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let listen_held = std::net::TcpListener::bind(("0.0.0.0", 0)).unwrap();
+        let (web, listen) = (web_held.local_addr().unwrap().port(), listen_held.local_addr().unwrap().port());
+        let set = Settings { port: web, listen_port: listen, key: String::new(), has_login: false, login_mark: 0 };
+        let ports = ports_for_start(&set);
+        assert!(ports.web != web && ports.listen != listen, "{ports:?}");
+        drop((web_held, listen_held));
+        // the settings file's listen port is read; slskd's own default when there is none
+        assert_eq!(parse_settings("soulseek:\n  listen_port: 50310\nweb:\n  port: 5830\n").unwrap().listen_port, 50310);
+        assert_eq!(parse_settings("web:\n  port: 5830\n").unwrap().listen_port, LISTEN_DEFAULT);
+    }
+
+    #[test]
+    fn why_the_client_stopped_is_said_in_words() {
+        let say = |lines: &[&str]| stopped_words(lines.iter().copied());
+        assert!(say(&["slskd 0.26.2", "An instance of slskd is already running"]).unwrap().starts_with("Another Soulseek client (slskd) is already running"));
+        assert!(say(&["[ERR] Failed to start: System.Net.Sockets.SocketException (10013): An attempt was made to access a socket in a way forbidden by its access permissions."]).unwrap().contains("network port"));
+        assert!(say(&["Unhandled exception. System.Net.Sockets.SocketException (10048): Only one usage of each socket address (protocol/network address/port) is normally permitted."]).unwrap().contains("network port"));
+        assert_eq!(say(&["Starting", "[FTL] Invalid configuration: downloads directory is not writable", "bye"]).unwrap(), "The Soulseek client stopped: [FTL] Invalid configuration: downloads directory is not writable");
+        // as slskd 0.26.2 really says it when its port is taken (seen on this PC), its trace after it
+        let taken = ["[04:17:52 INF] Application started", "[04:17:52 ERR] Hosting failed to start", "Soulseek.ListenException: Failed to start listening on 0.0.0.0:50300; the IP and/or port may be in use or are otherwise unavailable", "   at slskd.Application.StartAsync(CancellationToken cancellationToken)", "   at Microsoft.Extensions.Hosting.Internal.Host.ForeachService[T](..., Boolean abortOnFirstException, ...)", "[04:17:52 FTL] Application terminated unexpectedly"];
+        assert!(say(&taken).unwrap().contains("network port"));
+        // an unknown failure: its own words, without the trace and without the exception's name
+        assert_eq!(say(&["[ERR] Hosting failed to start", "System.IO.IOException: The disk is full", "   at slskd.Program.Main(String[] args)", "   at Some.abortOnFirstException(x)"]).unwrap(), "The Soulseek client stopped: The disk is full");
+        assert_eq!(say(&["Starting", "Listening"]), None);
+        // a warning a client that runs well also writes is not why it stopped
+        assert_eq!(say(&["[04:19:31 WRN] Error initializing shares: Share cache backup is missing", "Stopped"]), None);
+        assert_eq!(say(&[]), None);
+    }
+
+    #[test]
     fn slskd_is_only_ever_started_answering_on_this_pc_alone() {
         // the command line wins over the settings file, and it always names 127.0.0.1
-        let args = start_args(std::path::Path::new(r"X:\data"), None);
+        let ports = Ports { web: 5831, listen: 50301 };
+        let args = start_args(std::path::Path::new(r"X:\data"), None, ports);
         let at = args.iter().position(|a| a == "--http-ip-address").unwrap();
         assert_eq!(args[at + 1], "127.0.0.1");
         assert_eq!((args[0].to_str(), args[1].to_str()), (Some("--app-dir"), Some(r"X:\data")));
+        // the ports of this start win over the settings file's
+        assert_eq!(args[4..].iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), ["--http-port", "5831", "--slsk-listen-port", "50301", "--no-https"]);
         // no secret is ever on the command line
-        assert_eq!(args.len(), 4);
+        assert_eq!(args.len(), 9);
         // the downloads folder from Settings, when there is one, wins over the settings file's too
-        let with = start_args(std::path::Path::new(r"X:\data"), Some(std::path::Path::new(r"D:\Someone's Downloads\Soul Seek")));
-        assert_eq!(with[4..].iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), ["--downloads", r"D:\Someone's Downloads\Soul Seek"]);
-        assert_eq!(with[..4], args[..]);
+        let with = start_args(std::path::Path::new(r"X:\data"), Some(std::path::Path::new(r"D:\Someone's Downloads\Soul Seek")), ports);
+        assert_eq!(with[9..].iter().map(|a| a.to_string_lossy().into_owned()).collect::<Vec<_>>(), ["--downloads", r"D:\Someone's Downloads\Soul Seek"]);
+        assert_eq!(with[..9], args[..]);
 
         // a settings file that would open slskd up is refused, so it is never started with one
         let base = "web:\n  port: 5830\n";

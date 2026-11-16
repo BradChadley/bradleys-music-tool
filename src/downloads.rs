@@ -1331,6 +1331,8 @@ fn worker(cmds: Receiver<Cmd>, out: Sender<Snapshot>, child: Arc<Mutex<Option<st
     let mut started_at: Option<Instant> = None;
     // how many times in a row the client was started without ever answering (see MAX_STARTS)
     let mut starts: u32 = 0;
+    // the latest start has been seen to stop, and what it said then
+    let (mut exit_seen, mut stop_reason): (bool, Option<String>) = (false, None);
     let mut tidied = false;
     // the downloads folder the client was started with, the one Settings names and since when, and whether
     // anything was arriving at the last look (see `restart_for_folder`)
@@ -1393,19 +1395,42 @@ fn worker(cmds: Receiver<Cmd>, out: Sender<Snapshot>, child: Arc<Mutex<Option<st
             match c.server() {
                 Err(_) => {
                     // not answering: start it (once), then give it time to come up
-                    let running = child.lock().unwrap_or_else(|e| e.into_inner()).as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(None)));
+                    let (running, ended) = {
+                        let mut held = child.lock().unwrap_or_else(|e| e.into_inner());
+                        match held.as_mut().map(|c| c.try_wait()) {
+                            Some(Ok(None)) => (true, None),
+                            Some(Ok(Some(status))) => (false, Some(status.code())),
+                            _ => (false, None),
+                        }
+                    };
+                    // it stopped: what it said is written down once, and a reason no new start can get past
+                    // (another slskd running) ends the starting at once
+                    if let Some(code) = ended {
+                        if !exit_seen {
+                            exit_seen = true;
+                            let said = slskd::why_it_stopped();
+                            crate::config::log(&format!("soulseek: the client stopped (exit code {}): {}", code.map_or("none".to_string(), |c| c.to_string()), said.as_deref().unwrap_or("it gave no reason")));
+                            if said.as_deref().is_some_and(|s| s.starts_with("Another Soulseek client")) {
+                                starts = MAX_STARTS;
+                            }
+                            stop_reason = said;
+                        }
+                    }
                     // one that stops each time it is started is started again after 10, 20, then 40 seconds,
                     // and then left alone until "Try again" (each start may sign in to Soulseek)
                     let due = started_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(10 << starts.min(3)));
                     if !running && starts >= MAX_STARTS {
-                        setup = Setup::Offline("The Soulseek client stopped each time it was started.".into());
+                        setup = Setup::Offline(stop_reason.clone().unwrap_or_else(|| "The Soulseek client stopped each time it was started.".into()));
                     } else if !running && due {
-                        match slskd::spawn(wanted.0.as_deref()) {
-                            Ok(c) => {
-                                *child.lock().unwrap_or_else(|e| e.into_inner()) = Some(c);
+                        match slskd::spawn(wanted.0.as_deref(), set) {
+                            Ok((proc, ports)) => {
+                                *child.lock().unwrap_or_else(|e| e.into_inner()) = Some(proc);
                                 started_with = wanted.0.clone();
                                 started_at = Some(Instant::now());
                                 starts += 1;
+                                exit_seen = false;
+                                // (it may be on another web port than its settings file says: see `ports_for_start`)
+                                *c = Client::at(set, ports.web);
                             }
                             Err(e) => setup = Setup::Offline(e),
                         }
@@ -1482,7 +1507,7 @@ fn worker(cmds: Receiver<Cmd>, out: Sender<Snapshot>, child: Arc<Mutex<Option<st
                 note = None;
                 // "Try again" also lets a client that kept stopping be started again
                 if matches!(cmd, Cmd::Reconnect) {
-                    (starts, started_at) = (0, None);
+                    (starts, started_at, stop_reason) = (0, None, None);
                 }
                 let Some(c) = &client else { continue };
                 match cmd {
