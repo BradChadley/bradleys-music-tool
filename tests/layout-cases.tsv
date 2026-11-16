@@ -1,0 +1,28 @@
+# Is a folder inside an artist folder a shelf (its folders are the albums) or an album?
+# One case per line: expected answer, the folder's name, how many tracks sit directly in it, and the names
+# of the folders in it that hold tracks (separated by |). Tabs between the four parts.
+# The app (src\library.rs) must agree with every line: `cargo test` reads this file.
+shelf	EPs and Singles	0	[1992]Songs For Petronius|[1993]Chile De Arbol|[2006]Babylon Springs EP
+shelf	Studio Albums	0	How To Save A Life|The Fray (Deluxe Version)
+shelf	Extended Plays [EP]	0	Movement - EP|Reason - EP
+shelf	Early stuff	0	Zopilote Machine (1994)|Sweden (1995)|Odds
+shelf	Rarities and oddities	0	Odds|Ends|Leftovers
+shelf	Singles	0	Only One (2020)
+shelf	Singles	3	A (2001)|B (2002)
+shelf	EPs	0	EP 1|EP 2
+shelf	Live	0	Bootlegs|Paris 1999
+shelf	Demos & B-Sides	0	Basement|Garage
+album	The Dethalbum (2007)	0	CD 01|Enhanced CD 02
+album	21st Century Breakdown (2009)	0	CD1 - (Japanese Edition WPCR 13377)|CD2 - Live in Japan (Target Bonus Disc)|Covers
+album	Machina II - The Friends And The Enemies Of Modern Music (2000)	0	EP 01|EP 02|EP 03|LP
+album	Mellon Collie And The Infinite Sadness (1995)	0	CD 1 - Dawn To Dusk|CD 2 - Twilight to Starlight
+album	Teargarden by Kaleidyscope (2010)	0	Bonus Material - VBR|Vol. 1 - Songs for a Sailor|Vol. 2 - The Solstice Bare
+album	Past Masters	0	Past Masters, Volume One|Past Masters, Volume Two
+album	The Beatles (White Album)	0	The Beatles (White Album) [Disc 1]|The Beatles (White Album) [Disc 2]
+album	Trilogy (2012)	0	Disc 1 - House Of Balloons|Disc 2 - Thursday|Disc 3 - Echoes Of Silence|Extras
+album	Live	0	CD1|CD2
+album	Oxnard (2018)	0	Anderson .Paak - Oxnard (320)
+album	Rocket	0	Side stuff|More
+album	Feels (2005)	9	Live Bonus Disc
+album	Rocket (2017)	12
+album	Rocket (2017)	0	FLAC|MP3

@@ -1,0 +1,7 @@
+# Every build of the app is made the same way, so the exe that is tested is the exe that is shipped:
+# the Visual C++ runtime is built in, so the exe starts on a PC that does not have it
+# (without this it asks Windows for vcruntime140.dll, which is not part of Windows).
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+    "-C", "target-feature=+crt-static",
+]

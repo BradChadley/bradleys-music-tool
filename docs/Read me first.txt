@@ -1,0 +1,70 @@
+Bradley's Music Tool
+====================
+
+A music library tool for Windows 10 and 11 (64-bit): recommendations from what you listen to, a Soulseek
+search with an import that tags and files albums for you, a library browser, and a health check that
+finds and repairs damaged files, bad tags and missing covers.
+
+
+Starting it
+-----------
+
+1. Unpack this zip into a folder of its own, for example "Documents\Bradley's Music Tool". The app keeps
+   itself up to date by replacing its own file, so it needs a folder it can write to (not "Program Files").
+2. Start bradleys-music-tool.exe.
+3. Windows will warn you the first time, because the app is not signed: "Windows protected your PC".
+   Click "More info", then "Run anyway". Windows asks only once.
+4. The app asks where your music is. Last.fm and Soulseek are optional and can be set up later in Settings.
+
+There is no installer. To remove the app, delete its folder and the folder %LOCALAPPDATA%\music-recs
+(your settings and saved lookups).
+
+
+What it fetches
+---------------
+
+Only when you ask for it, from the makers' own release pages, each checked against a known checksum:
+
+  FFmpeg          checking and converting music files           115 MB
+  PowerShell 7    the tag editor (installed by Windows' winget)  about 110 MB
+  slskd           the Soulseek client, only if you set it up      56 MB
+
+It looks up artist and album names at Last.fm, MusicBrainz, the Cover Art Archive, Apple's music search,
+Deezer, Bandcamp and LRCLIB (lyrics). Nothing is sent to the author.
+
+
+Updates
+-------
+
+Twice a day the app reads one small file from its GitHub releases. When there is a newer version it fetches
+it, checks that it carries the author's signature, and puts it in the next time you restart. It never
+restarts by itself. Settings, About lets you choose to be told only, or to never check.
+
+
+Your files
+----------
+
+It changes files in your music folder only when you click a repair or an import. Nothing is deleted for
+good: what a repair or an import replaces goes to an undo folder or the Recycle Bin, and Health's repair
+history can put it back. If your library is laid out another way, choose "Look only, change nothing" at
+the first start and the app will only report.
+
+The Last.fm key and the Soulseek login are kept in Windows Credential Manager, not in a file. The Soulseek
+client it sets up shares none of your files and can only be reached from your own PC.
+
+
+Problems and ideas
+------------------
+
+https://github.com/BradChadley/bradleys-music-tool/issues
+
+Say what you did, what you expected and what happened; a picture helps.
+
+
+Support
+-------
+
+The app is free and open source (GPL 3, see LICENSE). If it saved you an evening of retagging, you can buy
+me a coffee: https://ko-fi.com/bradchadley
+
+Also by Bradley: Cadence, a music player for Windows. https://github.com/BradChadley/Cadence-Releases
