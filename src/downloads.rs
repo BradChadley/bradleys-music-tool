@@ -952,6 +952,14 @@ impl DownloadsPanel {
         self.view = View::Import;
     }
 
+    /// The words of the kept search whose copies are on show, if any.
+    pub fn shown_text(&self) -> Option<&str> {
+        if self.view != View::Results {
+            return None;
+        }
+        self.history.shown().map(|k| k.text.as_str())
+    }
+
     /// True while a search's copies are on show in the page's main area (the import list is one click away).
     pub fn showing_results(&self) -> bool {
         self.view == View::Results && self.history.shown().is_some()

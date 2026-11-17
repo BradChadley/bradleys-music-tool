@@ -200,6 +200,97 @@ pub struct State {
     /// the time and size of the last file that could not be read (shown once, like a newer list)
     #[serde(default)]
     pub refused: String,
+    /// when the list in `seen` was first read (UTC, RFC 3339), for the answer Cadence reads
+    #[serde(default)]
+    pub read_at: String,
+}
+
+/// The file this app writes beside Cadence's list, for Cadence to read: which list was read and when, and
+/// how far each album has come. Written at every start (so Cadence knows this app answers, even with no
+/// list yet), whenever an album's step changes, and when the app closes.
+pub const ANSWER_FILE: &str = "cadence-missing-albums.answer.json";
+
+/// How far an album on the list has come, as the card shows it and the answer tells Cadence.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Stage {
+    Searching,
+    /// the search ended with this many copies
+    Found(usize),
+    /// a copy is on its way: files done of files
+    Arriving(usize, usize),
+    /// arrived and on the import list, not imported yet
+    Ready,
+    Imported,
+    /// arrived; where it stands on the import list is not known
+    Arrived,
+    /// searched once; that search is no longer kept
+    Searched,
+    /// taken off the list here with the X
+    SetAside,
+}
+
+impl Stage {
+    /// The words at a row's end.
+    pub fn words(&self) -> String {
+        match self {
+            Stage::Searching => "searching".into(),
+            Stage::Found(0) => "no copies found".into(),
+            Stage::Found(1) => "1 copy found".into(),
+            Stage::Found(n) => format!("{} copies found", commas(*n as u64)),
+            Stage::Arriving(done, of) => format!("arriving, {done} of {of}"),
+            Stage::Ready => "ready to import".into(),
+            Stage::Imported => "imported".into(),
+            Stage::Arrived => "arrived".into(),
+            Stage::Searched => "searched".into(),
+            Stage::SetAside => "set aside".into(),
+        }
+    }
+
+    /// Its name in the answer file.
+    fn name(&self) -> &'static str {
+        match self {
+            Stage::Searching => "searching",
+            Stage::Found(_) => "found",
+            Stage::Arriving(..) => "arriving",
+            Stage::Ready => "ready",
+            Stage::Imported => "imported",
+            Stage::Arrived => "arrived",
+            Stage::Searched => "searched",
+            Stage::SetAside => "set-aside",
+        }
+    }
+}
+
+/// The answer for a list (or none yet) and the albums that have a step, in the list's order. The
+/// artist, album and first song are Cadence's own words as read, so it can match them to its rows.
+/// `updated` is when this was true (UTC, RFC 3339).
+pub fn answer(list: Option<&List>, read_at: &str, steps: &[(Wanted, Stage)], updated: &str) -> Vec<u8> {
+    let albums: Vec<Value> = steps
+        .iter()
+        .map(|(w, s)| {
+            let song = if w.album.is_empty() { w.songs.first().cloned().unwrap_or_default() } else { String::new() };
+            let mut a = serde_json::json!({ "artist": w.artist, "album": w.album, "song": song, "stage": s.name(), "words": s.words() });
+            match s {
+                Stage::Found(n) => a["copies"] = (*n).into(),
+                Stage::Arriving(done, of) => {
+                    a["done"] = (*done).into();
+                    a["of"] = (*of).into();
+                }
+                _ => {}
+            }
+            a
+        })
+        .collect();
+    let doc = serde_json::json!({
+        "from": "Bradley's Music Tool", "kind": "missing-albums-answer", "version": 1,
+        "list": list.map(|l| l.written.as_str()).unwrap_or(""), "read": if list.is_some() { read_at } else { "" },
+        "updated": updated, "albums": albums,
+    });
+    serde_json::to_vec_pretty(&doc).unwrap_or_default()
+}
+
+fn utc_now() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 impl State {
@@ -261,6 +352,8 @@ pub struct Inbox {
     pub ready: bool,
     /// "Show all" is on
     pub show_all: bool,
+    /// the last answer written, less its time (so it is written again only when what it says changed)
+    answered: Vec<u8>,
 }
 
 impl Inbox {
@@ -270,11 +363,41 @@ impl Inbox {
         let dir = data.join("inbox");
         let _ = std::fs::create_dir_all(&dir);
         let state_file = State::file();
-        Inbox { dir, state: State::load_from(&state_file), state_file, mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false }
+        Inbox { dir, state: State::load_from(&state_file), state_file, mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
     }
 
     fn save(&self) {
         self.state.save_to(&self.state_file);
+    }
+
+    /// True when the answer for Cadence can be worked out: no list, a list that cannot be read, or a list
+    /// whose rows are known (the library has been read for it).
+    pub fn can_answer(&self) -> bool {
+        !matches!(&self.list, Some(Ok(_))) || self.ready
+    }
+
+    /// The albums on the list taken off here with the X, in the list's order.
+    pub fn set_aside(&self) -> Vec<Wanted> {
+        match &self.list {
+            Some(Ok(list)) => list.albums.iter().filter(|w| self.state.forgotten.contains(&w.key())).cloned().collect(),
+            _ => vec![],
+        }
+    }
+
+    /// Writes the answer for Cadence (`ANSWER_FILE`) when what it says has changed, or `always` (at the
+    /// close, so its time says when this app last had it open).
+    pub fn answer_with(&mut self, steps: &[(Wanted, Stage)], always: bool) {
+        let list = match &self.list {
+            Some(Ok(l)) => Some(l),
+            _ => None,
+        };
+        let key = answer(list, &self.state.read_at, steps, "");
+        if !always && key == self.answered {
+            return;
+        }
+        if crate::util::write_atomic(&self.dir.join(ANSWER_FILE), &answer(list, &self.state.read_at, steps, &utc_now())).is_ok() {
+            self.answered = key;
+        }
     }
 
     /// Looks at the file at most every two seconds and reads it again when it has changed. Returns true
@@ -312,6 +435,7 @@ impl Inbox {
         match &self.list {
             Some(Ok(list)) if !list.written.is_empty() && list.written > self.state.seen => {
                 self.state.seen = list.written.clone();
+                self.state.read_at = utc_now();
                 self.save();
                 true
             }
@@ -543,7 +667,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("inbox-tick-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut inbox = Inbox { dir: dir.clone(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false };
+        let mut inbox = Inbox { dir: dir.clone(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] };
         assert!(!inbox.tick(0.0), "no file, nothing to open");
         std::fs::write(dir.join(CADENCE_FILE), doc(vec![album("A", "B", &[])])).unwrap();
         assert!(!inbox.tick(1.0), "looked at every two seconds only");
@@ -570,7 +694,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn the_answer_says_which_list_was_read_and_how_far_each_album_came() {
+        let dir = std::env::temp_dir().join(format!("inbox-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut inbox = inbox_like(&dir);
+        // no list yet: an answer can be given (it says this app answers), and says no list
+        assert!(inbox.can_answer());
+        inbox.answer_with(&[], false);
+        let read = |dir: &Path| serde_json::from_slice::<Value>(&std::fs::read(dir.join(ANSWER_FILE)).unwrap()).unwrap();
+        let first = read(&dir);
+        assert_eq!((first["kind"].as_str(), first["version"].as_i64(), first["list"].as_str(), first["read"].as_str()), (Some("missing-albums-answer"), Some(1), Some(""), Some("")));
+        // a list arrives: it is read, and no answer is given until its rows are known
+        std::fs::write(dir.join(CADENCE_FILE), doc(vec![album("Amber Relay", "Signal Garden (Deluxe Edition)", &[]), album("North Pier", "", &["Harbor Lights", "Fog Signal"]), album("Coastal Drift", "The Long Shore", &[])])).unwrap();
+        assert!(inbox.tick(0.0));
+        assert!(!inbox.state.read_at.is_empty(), "when it was read is kept");
+        assert!(!inbox.can_answer());
+        inbox.ready = true;
+        let list = match &inbox.list {
+            Some(Ok(l)) => l.clone(),
+            _ => panic!("the list should read"),
+        };
+        inbox.forget(&list.albums[2]);
+        assert_eq!(inbox.set_aside(), vec![list.albums[2].clone()]);
+        let steps = vec![(list.albums[0].clone(), Stage::Arriving(6, 10)), (list.albums[1].clone(), Stage::Found(14)), (list.albums[2].clone(), Stage::SetAside)];
+        inbox.answer_with(&steps, false);
+        let said = read(&dir);
+        assert_eq!(said["list"].as_str(), Some(list.written.as_str()));
+        assert_eq!(said["read"].as_str(), Some(inbox.state.read_at.as_str()));
+        let albums = said["albums"].as_array().unwrap();
+        // Cadence's own words, so it can match them: the edition kept, the first song for songs with no album
+        assert_eq!((albums[0]["artist"].as_str(), albums[0]["album"].as_str(), albums[0]["stage"].as_str(), albums[0]["done"].as_u64(), albums[0]["of"].as_u64()), (Some("Amber Relay"), Some("Signal Garden (Deluxe Edition)"), Some("arriving"), Some(6), Some(10)));
+        assert_eq!((albums[1]["album"].as_str(), albums[1]["song"].as_str(), albums[1]["stage"].as_str(), albums[1]["copies"].as_u64()), (Some(""), Some("Harbor Lights"), Some("found"), Some(14)));
+        assert_eq!(albums[2]["stage"].as_str(), Some("set-aside"));
+        // written again only when what it says changed, or at the close
+        std::fs::remove_file(dir.join(ANSWER_FILE)).unwrap();
+        inbox.answer_with(&steps, false);
+        assert!(!dir.join(ANSWER_FILE).exists(), "nothing changed, nothing written");
+        inbox.answer_with(&steps, true);
+        assert!(dir.join(ANSWER_FILE).exists(), "at the close it is written");
+        let mut later = steps.clone();
+        later[0].1 = Stage::Ready;
+        inbox.answer_with(&later, false);
+        assert_eq!(read(&dir)["albums"][0]["stage"].as_str(), Some("ready"));
+        // the words at a row's end
+        assert_eq!([Stage::Found(0).words(), Stage::Found(1).words(), Stage::Found(1200).words(), Stage::Arriving(6, 10).words(), Stage::Ready.words()], ["no copies found", "1 copy found", "1,200 copies found", "arriving, 6 of 10", "ready to import"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn inbox_like(dir: &Path) -> Inbox {
-        Inbox { dir: dir.to_path_buf(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false }
+        Inbox { dir: dir.to_path_buf(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
     }
 }

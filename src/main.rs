@@ -327,6 +327,8 @@ struct App {
     inbox: inbox::Inbox,
     /// the import list was busy last frame (an import ending reads the library again for that list)
     import_was_busy: bool,
+    /// when the answer for Cadence was last worked out (see `keep_cadence_answer`)
+    answer_at: f64,
 }
 
 /// One album that is waited for (see `App::waiting_for`).
@@ -459,6 +461,7 @@ impl App {
             waiting_cache: (-10.0, vec![]),
             inbox: inbox::Inbox::new(),
             import_was_busy: false,
+            answer_at: -10.0,
         }
     }
 
@@ -1261,6 +1264,8 @@ impl eframe::App for App {
                 d.show_import_list();
             }
         }
+        // Cadence's list: the library read for it when due, and the answer for Cadence kept up to date
+        self.keep_cadence_answer(&ctx);
         if let Some(d) = &mut self.downloads {
             d.tick(&ctx);
             // folders that just arrived complete: tell the importer they are done (so it does not wait for them
@@ -1404,6 +1409,10 @@ impl eframe::App for App {
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.inbox.can_answer() {
+            let steps = self.cadence_steps();
+            self.inbox.answer_with(&steps, true);
+        }
         if let Some(Ok(imp)) = &mut self.importer {
             imp.on_exit();
         }
@@ -1807,23 +1816,72 @@ impl App {
         self.waiting_cache.1 = list;
     }
 
-    /// On the import list's view, over "Waiting for": the albums Cadence says are missed and the library
-    /// does not have, most missed first (`inbox.rs`). Five rows, all of them after "Show all". A row is the
-    /// control: a click searches Soulseek for the album (nothing is fetched until a copy is picked), and its
-    /// end says how far it has come since. Pointing at a row lists the songs that were wanted, as a tip that
-    /// covers nothing and moves nothing. The X forgets one for good; "Forget the list" puts the list away
-    /// until Cadence sends a newer one.
-    fn cadence_card(&mut self, ui: &mut Ui, left: f32, wide: f32) {
-        const ROW: f32 = 28.0;
-        const FIRST: usize = 5;
-        // the library is read for the list in the background: when it comes, after an import, now and then
+    /// The music folder Cadence's list is checked against, with what is skipped and the artist name list
+    /// (a test run's own library copy in a test run).
+    fn inbox_folders(&self) -> inbox::Folders {
+        let music = if importer::test_folders() { arg_after("--library").unwrap_or_default() } else { self.cfg.music_dir.clone() };
+        inbox::Folders { music, skip: self.cfg.skip_folders.clone(), aliases: self.cfg.alias_file.clone() }
+    }
+
+    /// Every frame, on any page: the library is read for Cadence's list when due (a new list, after an
+    /// import ends, every ten minutes), and at most every two seconds the answer for Cadence is worked out
+    /// and written when what it says changed (`inbox::ANSWER_FILE`).
+    fn keep_cadence_answer(&mut self, ctx: &egui::Context) {
         let busy = matches!(&self.importer, Some(Ok(imp)) if imp.busy());
         let ended = self.import_was_busy && !busy;
         self.import_was_busy = busy;
+        let now = ctx.input(|i| i.time);
+        let folders = self.inbox_folders();
+        self.inbox.keep_library(&folders, now, ended, ctx);
+        if now - self.answer_at < 2.0 || !self.inbox.can_answer() {
+            return;
+        }
+        self.answer_at = now;
+        let steps = self.cadence_steps();
+        self.inbox.answer_with(&steps, false);
+    }
+
+    /// The albums on Cadence's list that have a step, with it: the rows' own, then those set aside here.
+    fn cadence_steps(&self) -> Vec<(inbox::Wanted, inbox::Stage)> {
+        let mut steps: Vec<(inbox::Wanted, inbox::Stage)> = self.inbox.rows().into_iter().filter_map(|w| self.stage_of(&w).map(|s| (w, s))).collect();
+        steps.extend(self.inbox.set_aside().into_iter().map(|w| (w, inbox::Stage::SetAside)));
+        steps
+    }
+
+    /// How far one album on Cadence's list has come: its search, a copy of it arriving, then where that
+    /// copy stands on the import list. None while it has not been looked for.
+    fn stage_of(&self, w: &inbox::Wanted) -> Option<inbox::Stage> {
+        use inbox::Stage;
+        let trail = self.downloads.as_ref().and_then(|d| d.trail(&w.search()));
+        Some(match trail {
+            Some(downloads::Trail::Searching) => Stage::Searching,
+            Some(downloads::Trail::Found(n)) => Stage::Found(n),
+            Some(downloads::Trail::Arriving(done, of)) => Stage::Arriving(done, of),
+            Some(downloads::Trail::Arrived(folder)) => match &self.importer {
+                Some(Ok(imp)) => match imp.stage_of(&folder) {
+                    Some(false) => Stage::Ready,
+                    Some(true) => Stage::Imported,
+                    None => Stage::Arrived,
+                },
+                _ => Stage::Arrived,
+            },
+            None if self.inbox.state.searched.contains(&w.key()) => Stage::Searched,
+            None => return None,
+        })
+    }
+
+    /// On the import list's view, over "Waiting for": the albums Cadence says are missed and the library
+    /// does not have, most missed first (`inbox.rs`), as a card of its own: "FROM CADENCE", the count in a
+    /// large light line (the count the one heavy word), when it was sent, then five rows, all of them after
+    /// "Show all". A row is the control: a click searches Soulseek for the album (nothing is fetched until a
+    /// copy is picked). Its end says how far it has come, or "Find it" while it has not been looked for.
+    /// Pointing at a row lists the songs that were wanted, as a tip that covers nothing and moves nothing.
+    /// The X sets one aside for good; "Forget the list" puts the list away until Cadence sends a newer one.
+    fn cadence_card(&mut self, ui: &mut Ui, left: f32, wide: f32) {
+        const ROW: f32 = 54.0;
+        const FIRST: usize = 5;
+        const CARD_WIDE: f32 = 1100.0;
         let test = importer::test_folders();
-        let music = if test { arg_after("--library").unwrap_or_default() } else { self.cfg.music_dir.clone() };
-        let folders = inbox::Folders { music, skip: self.cfg.skip_folders.clone(), aliases: self.cfg.alias_file.clone() };
-        self.inbox.keep_library(&folders, ui.input(|i| i.time), ended, ui.ctx());
         // a list that cannot be read says so in one line, and nothing more
         if let Some(Err(why)) = &self.inbox.list {
             let why = why.clone();
@@ -1840,46 +1898,40 @@ impl App {
             return;
         }
         let when = match self.inbox.list.as_ref().and_then(|l| l.as_ref().ok()).and_then(inbox::written_at) {
-            Some(t) => format!("sent {}, most missed first", recs_top::when_words(t, Local::now())),
-            None => "most missed first".to_string(),
+            Some(t) => format!("Sent {}, most missed first. Each one leaves once your library has it.", recs_top::when_words(t, Local::now())),
+            None => "Most missed first. Each one leaves once your library has it.".to_string(),
         };
+        let stages: Vec<Option<inbox::Stage>> = rows.iter().map(|w| self.stage_of(w)).collect();
         let can_search = !test;
         let show_all = self.inbox.show_all && rows.len() > FIRST;
         let (mut forget, mut search, mut put_away, mut toggle) = (None, None, false, false);
-        let downloads = self.downloads.as_ref();
-        let importer = &self.importer;
-        let searched = &self.inbox.state.searched;
+        let rule = theme::blend(CARD(), TEXT(), 0.07);
+        // a card of reading width in the middle of the page, as the sketch has it
+        let (left, wide) = (left + ((wide - wide.min(CARD_WIDE)) / 2.0).round(), wide.min(CARD_WIDE));
         ui.add_space(16.0);
-        theme::panel(ui, left, wide, vec2(24.0, 16.0), "cadence-list", |ui| {
-            // the head: what the list is, when it came, and the two quiet words at the right
-            let (head, _) = ui.allocate_exact_size(vec2(ui.available_width(), 18.0), Sense::hover());
-            let font = FontId::proportional(13.0);
-            let mut right = head.right();
-            for (word, is_put_away) in [("Forget the list".to_string(), true), (if show_all { "Show fewer".to_string() } else { format!("Show all {}", library_page::commas(rows.len() as u64)) }, false)] {
-                if !is_put_away && rows.len() <= FIRST {
-                    continue;
-                }
-                let size = ui.painter().layout_no_wrap(word.clone(), font.clone(), DIM()).size();
-                let at = Rect::from_min_size(egui::pos2(right - size.x, (head.center().y - size.y / 2.0).round()), size);
-                if ui.put(at, |ui: &mut Ui| theme::quiet(ui, &word, 13.0, true)).clicked() {
-                    if is_put_away { put_away = true } else { toggle = true }
-                }
-                right = at.left() - 18.0;
-            }
-            let albums = if rows.len() == 1 { "1 ALBUM".to_string() } else { format!("{} ALBUMS", library_page::commas(rows.len() as u64)) };
-            let cap = ui.scope_builder(egui::UiBuilder::new().max_rect(Rect::from_min_max(head.min, egui::pos2(right, head.bottom()))), |ui| theme::caption(ui, &format!("FROM CADENCE  \u{b7}  {albums} NOT IN YOUR LIBRARY"))).inner.rect;
-            let room = right - cap.right() - 12.0;
-            if room > 40.0 {
-                let words = theme::cut(ui, &when, FontId::proportional(12.5), theme::FAINT(), room);
-                ui.painter().galley(egui::pos2(cap.right() + 12.0, (cap.center().y - words.size().y / 2.0).round()), words, theme::FAINT());
-            }
-            ui.add_space(6.0);
+        theme::panel(ui, left, wide, vec2(34.0, 26.0), "cadence-list", |ui| {
+            ui.vertical_centered(|ui| theme::caption(ui, "FROM CADENCE"));
+            ui.add_space(4.0);
+            // the large light line, its count the one heavy word
+            let n = rows.len();
+            let mut job = egui::text::LayoutJob::default();
+            job.append(&library_page::commas(n as u64), 0.0, egui::TextFormat::simple(FontId::proportional(32.0), TEXT()));
+            let rest = if n == 1 { " album is missing from your library" } else { " albums are missing from your library" };
+            job.append(rest, 0.0, egui::TextFormat::simple(theme::display(32.0), TEXT()));
+            job.wrap.max_width = ui.available_width();
+            let head = ui.painter().layout_job(job);
+            let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), head.size().y), Sense::hover());
+            ui.painter().galley(egui::pos2((line.center().x - head.size().x / 2.0).round(), line.top()), head, TEXT());
+            ui.add_space(4.0);
+            let room = ui.available_width();
+            theme::centered_wrapped(ui, &when, 13.0, theme::FAINT(), room);
+            ui.add_space(16.0);
             let shown = if show_all { rows.len() } else { rows.len().min(FIRST) };
             let mut draw = |ui: &mut Ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 // (room for the scroll bar only when there is one, so the X marks do not move otherwise)
-                let total = ui.available_width() - if show_all && rows.len() > 12 { 12.0 } else { 0.0 };
-                for w in rows.iter().take(shown) {
+                let total = ui.available_width() - if show_all && rows.len() > 7 { 12.0 } else { 0.0 };
+                for (w, stage) in rows.iter().zip(&stages).take(shown) {
                     let (rect, row) = ui.allocate_exact_size(vec2(total, ROW), if can_search { Sense::click() } else { Sense::hover() });
                     if !ui.is_rect_visible(rect) {
                         continue;
@@ -1888,55 +1940,59 @@ impl App {
                     let over = ui.rect_contains_pointer(rect);
                     if over {
                         ui.painter().rect_filled(rect.expand2(vec2(8.0, 0.0)), 6, CARD_HOVER());
+                    } else {
+                        ui.painter().hline(rect.x_range(), rect.top(), Stroke::new(1.0, rule));
                     }
                     let mid = rect.center().y;
                     let mark = Rect::from_center_size(egui::pos2(rect.right() - 7.0, mid), vec2(14.0, 14.0));
-                    let mut end = mark.left() - 14.0;
-                    // how far it has come: its search, a copy arriving, ready on the import list
-                    let trail = downloads.and_then(|d| d.trail(&w.search()));
-                    let state = match &trail {
-                        Some(downloads::Trail::Searching) => Some(("searching".to_string(), DIM())),
-                        Some(downloads::Trail::Found(0)) => Some(("searched, no copies found".to_string(), theme::FAINT())),
-                        Some(downloads::Trail::Found(1)) => Some(("searched, 1 copy".to_string(), ACCENT2())),
-                        Some(downloads::Trail::Found(n)) => Some((format!("searched, {} copies", library_page::commas(*n as u64)), ACCENT2())),
-                        Some(downloads::Trail::Arriving(done, of)) => Some((format!("arriving, {done} of {of}"), ACCENT2())),
-                        Some(downloads::Trail::Arrived(folder)) => Some(match importer {
-                            Some(Ok(imp)) => match imp.stage_of(folder) {
-                                Some(false) => ("ready to import".to_string(), GREEN()),
-                                Some(true) => ("imported".to_string(), GREEN()),
-                                None => ("arrived".to_string(), GREEN()),
-                            },
-                            _ => ("arrived".to_string(), GREEN()),
-                        }),
-                        None if searched.contains(&w.key()) => Some(("searched".to_string(), theme::FAINT())),
-                        None => None,
+                    let mut end = mark.left() - 18.0;
+                    let font = FontId::proportional(13.0);
+                    // how far it has come, or "Find it" while it has not been looked for
+                    let (words, color) = match stage {
+                        Some(s) => {
+                            use inbox::Stage::*;
+                            let color = match s {
+                                Searching => DIM(),
+                                Found(0) | Searched | SetAside => theme::FAINT(),
+                                Found(_) | Arriving(..) => ACCENT2(),
+                                Ready | Imported | Arrived => GREEN(),
+                            };
+                            (s.words(), color)
+                        }
+                        None => ("Find it".to_string(), if over && can_search { TEXT() } else { DIM() }),
                     };
-                    if let Some((words, color)) = &state {
-                        let g = ui.painter().layout_no_wrap(words.clone(), FontId::proportional(13.0), *color);
-                        end -= g.size().x;
-                        ui.painter().galley(egui::pos2(end, (mid - g.size().y / 2.0).round()), g, *color);
-                        end -= 16.0;
-                    }
-                    // under the pointer, what a click on the row does
+                    let g = ui.painter().layout_no_wrap(words, font.clone(), color);
+                    let size = g.size();
+                    end -= size.x;
+                    let at = egui::pos2(end, (mid - size.y / 2.0).round());
+                    ui.painter().galley(at, g, color);
                     if over && can_search {
-                        let word = if state.is_some() { "Search again" } else { "Search" };
-                        let g = ui.painter().layout_no_wrap(word.to_string(), FontId::proportional(13.0), TEXT());
-                        end -= g.size().x;
-                        ui.painter().galley(egui::pos2(end, (mid - g.size().y / 2.0).round()), g, TEXT());
-                        end -= 16.0;
+                        if stage.is_none() {
+                            ui.painter().hline(at.x..=at.x + size.x, at.y + size.y - 1.0, Stroke::new(1.0, TEXT()));
+                        } else {
+                            // a row that was looked for: what a click does now, beside how far it came
+                            let g = ui.painter().layout_no_wrap("Search again".to_string(), font.clone(), TEXT());
+                            end -= 16.0 + g.size().x;
+                            ui.painter().galley(egui::pos2(end, (mid - g.size().y / 2.0).round()), g, TEXT());
+                        }
                         ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     }
-                    // the album (or its first song), whose it is, and why it is missed
-                    let mut x = rect.left();
-                    for (text, size, color) in [(w.title(), 14.0, TEXT()), (w.artist.as_str(), 13.0, DIM()), (w.why().as_str(), 13.0, theme::FAINT())] {
-                        if end - x < 24.0 || text.is_empty() {
-                            break;
-                        }
-                        let words = theme::cut(ui, text, FontId::proportional(size), color, end - x);
-                        let at = egui::pos2(x, (mid - words.size().y / 2.0).round());
-                        x += words.size().x + 12.0;
-                        ui.painter().galley(at, words, color);
+                    end -= 18.0;
+                    // the album (or its first song) and whose it is, on one line of writing; why it is missed under them
+                    let width = (end - rect.left()).max(0.0);
+                    let title = theme::cut(ui, w.title(), FontId::proportional(15.0), TEXT(), width);
+                    let top = (mid - 20.0).round();
+                    let title_w = title.size().x;
+                    let title_base = theme::baseline(&title);
+                    ui.painter().galley(egui::pos2(rect.left(), top), title, TEXT());
+                    let room = width - title_w - 10.0;
+                    if room > 24.0 && !w.artist.is_empty() {
+                        let artist = theme::cut(ui, &w.artist, FontId::proportional(13.5), DIM(), room);
+                        let y = (top + title_base - theme::baseline(&artist)).round();
+                        ui.painter().galley(egui::pos2(rect.left() + title_w + 10.0, y), artist, DIM());
                     }
+                    let why = theme::cut(ui, &w.why(), FontId::proportional(12.5), theme::FAINT(), width);
+                    ui.painter().galley(egui::pos2(rect.left(), top + 22.0), why, theme::FAINT());
                     let name = if script::on() { format!("forget-cadence:{}", w.title()) } else { String::new() };
                     if theme::close_mark(&mut ui.new_child(egui::UiBuilder::new().max_rect(mark)), &name, "Take this album off the list").clicked() {
                         forget = Some(w.clone());
@@ -1952,10 +2008,26 @@ impl App {
                 }
             };
             if show_all {
-                ScrollArea::vertical().id_salt("cadence-list-scroll").max_height(ROW * 12.3).auto_shrink([false, true]).show(ui, |ui| draw(ui));
+                ScrollArea::vertical().id_salt("cadence-list-scroll").max_height(ROW * 7.4).auto_shrink([false, true]).show(ui, |ui| draw(ui));
             } else {
                 draw(ui);
             }
+            // under the rows, in the middle: the two quiet words
+            ui.add_space(12.0);
+            ui.horizontal(|ui| {
+                theme::centered_row(ui, "cadence-list-foot", 0.0, |ui| {
+                    ui.spacing_mut().item_spacing.x = 28.0;
+                    if rows.len() > FIRST {
+                        let word = if show_all { "Show fewer".to_string() } else { format!("Show all {}", library_page::commas(rows.len() as u64)) };
+                        if theme::quiet(ui, &word, 13.0, true).clicked() {
+                            toggle = true;
+                        }
+                    }
+                    if theme::quiet(ui, "Forget the list", 13.0, true).clicked() {
+                        put_away = true;
+                    }
+                });
+            });
         });
         if let Some(w) = forget {
             self.inbox.forget(&w);
@@ -1970,6 +2042,28 @@ impl App {
         if put_away {
             self.inbox.put_away();
         }
+    }
+
+    /// While the copies of a search a row of Cadence's list asked for are on show: the list as one line over
+    /// them, with the way back to it. True when "Show the list" was clicked.
+    fn cadence_line(ui: &mut Ui, left: f32, wide: f32, count: usize, title: &str) -> bool {
+        let mut back = false;
+        // (as wide as the copies' card under it)
+        theme::panel(ui, left, wide, vec2(24.0, 14.0), "cadence-line", |ui| {
+            // (one line's height, so the words at the right sit on the line and not halfway down the card's room)
+            ui.allocate_ui_with_layout(vec2(ui.available_width(), 20.0), egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                back = theme::quiet(ui, "Show the list", 13.0, true).clicked();
+                ui.add_space(18.0);
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 14.0;
+                    theme::caption(ui, "FROM CADENCE");
+                    let n = if count == 1 { "1 album missing from your library".to_string() } else { format!("{} albums missing from your library", library_page::commas(count as u64)) };
+                    ui.add(Label::new(RichText::new(n).size(14.0).color(TEXT())).selectable(false).truncate());
+                    ui.add(Label::new(RichText::new(format!("{title} is open below")).size(13.0).color(theme::FAINT())).selectable(false).truncate());
+                });
+            });
+        });
+        back
     }
 
     /// The Downloads page, in one centered stretch of the window: the search box and the kept searches,
@@ -2004,6 +2098,7 @@ impl App {
             self.downloads.get_or_insert_with(downloads::DownloadsPanel::demo);
         }
         let mut retry = false;
+        let list_rows = self.inbox.rows();
         CentralPanel::default().frame(Frame::new().fill(BG())).show(ui, |ui| {
           // the cards reach down to the end of the window; in a window too short for them they keep a least
           // height and the page scrolls
@@ -2027,6 +2122,11 @@ impl App {
                 dl.arriving(ui, left, wide, &stage);
                 // the kept search on show takes the main card; the import list is one click away
                 if dl.showing_results() {
+                    if let Some(w) = dl.shown_text().and_then(|t| list_rows.iter().find(|w| w.search() == t)) {
+                        if App::cadence_line(ui, left, wide, list_rows.len(), w.title()) {
+                            dl.show_import_list();
+                        }
+                    }
                     let music_dir = std::path::Path::new(if test { test_library.as_str() } else { self.cfg.music_dir.trim() });
                     dl.results(ui, left, wide, floor, downloads::Around { images: &mut self.images, music_dir, stage: &stage });
                     return;

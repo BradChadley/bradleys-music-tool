@@ -441,7 +441,7 @@ dependencies = [
 
 [[package]]
 name = "bradleys-music-tool"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "crossbeam-channel",
