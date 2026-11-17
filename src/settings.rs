@@ -11,7 +11,7 @@
 use crate::cards::{self, FolderCard, GAP, PAD};
 use crate::helpers::{self, Helper};
 use crate::theme::{self, ACCENT, DIM, FAINT, GREEN, TEXT, WARN};
-use crate::{backup, downloads, script, slskd, App};
+use crate::{backup, downloads, rows, script, slskd, App};
 use egui::{pos2, vec2, Align, Color32, FontId, Label, Layout, Rect, RichText, ScrollArea, Sense, Stroke, TextEdit, Ui};
 use std::path::Path;
 
@@ -24,11 +24,13 @@ const LOOK: usize = 3;
 pub(crate) const ABOUT: usize = 4;
 /// The page's one stretch of the window (the first-start screen's).
 const PAGE: f32 = 1000.0;
+/// The one column of rows the other sections are, so a row's words and its control stay near each other.
+const ROWS: f32 = 680.0;
+/// The one column of rows the other sections are, so a row's words and its control stay near each other. ROWS: f32 = 680.0;
 /// How wide the Look card's strip is beside the pages.
 pub(crate) const BESIDE: f32 = 392.0;
-/// Three cards stand side by side from this width of the page's stretch, two from the other.
+/// Basics' three cards stand side by side from this width of the page's stretch.
 const THREE: f32 = 820.0;
-const TWO: f32 = 640.0;
 
 /// What Settings keeps between frames beyond the settings themselves.
 pub(crate) struct State {
@@ -69,7 +71,8 @@ pub(crate) fn page(app: &mut App, ui: &mut Ui) {
     changed |= st.folder.tick(app, &ctx).picked;
     egui::CentralPanel::default().frame(theme::page_frame()).show(ui, |ui| {
         ScrollArea::vertical().id_salt(("settings-scroll", app.settings_tab)).auto_shrink([false, false]).show(ui, |ui| {
-            let (left, wide) = theme::column(ui, PAGE);
+            // (Basics keeps the first-start screen's cards side by side; the other sections are one column of rows)
+            let (left, wide) = theme::column(ui, if app.settings_tab == BASICS { PAGE } else { ROWS });
             top(app, ui, now);
             changed |= match app.settings_tab {
                 BASICS => basics(app, &mut st, ui, left, wide, now),
@@ -339,28 +342,49 @@ struct Did {
     remove: bool,
 }
 
-/// A folder's card, built from the parts of the music folder's: its name, the path as large words (a
-/// click on them types one), and under them a line with what there is to say and the words that act on
-/// the folder. `open` is the folder to open, when it is there.
+/// A card of rows: its small heading, then what `add` draws, one column wide.
+fn rows_card<R>(ui: &mut Ui, left: f32, wide: f32, salt: &str, caption: Option<&str>, add: impl FnOnce(&mut Ui) -> R) -> R {
+    theme::panel(ui, left, wide, vec2(PAD.x, 14.0), salt, |ui| {
+        if let Some(c) = caption {
+            ui.add_space(2.0);
+            theme::caption(ui, c);
+            ui.add_space(2.0);
+        }
+        add(ui)
+    })
+}
+
+/// A folder as a row: its name with the path under it (a click on the path types one), and at the right
+/// the words that act on it. `note` stands in the path's place when there is something wrong with it.
 #[allow(clippy::too_many_arguments)]
-fn folder_card(ui: &mut Ui, caption: &str, name: &str, shown: (&str, Color32), value: &mut String, note: (&str, Color32), choose: &str, open: Option<&str>, remove: bool) -> Did {
+fn folder_row(ui: &mut Ui, name: &str, label: &str, shown: (&str, Color32), value: &mut String, note: Option<(&str, Color32)>, choose: &str, open: Option<&str>, remove: bool) -> Did {
     let mut did = Did::default();
-    theme::caption(ui, caption);
-    ui.add_space(8.0);
-    did.typed = cards::typed_path(ui, name, shown.0, value, theme::display(18.0), shown.1, ui.available_width());
-    ui.add_space(5.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(18.0, 4.0);
-        ui.add(Label::new(RichText::new(note.0).size(12.5).color(note.1)).wrap());
-        did.choose = theme::quiet(ui, choose, 13.5, true).clicked();
-        if let Some(dir) = open {
-            if theme::quiet(ui, "Open", 13.5, true).clicked() {
-                let _ = open::that(dir);
+    let full = ui.available_width();
+    const RIGHT: f32 = 190.0;
+    ui.allocate_ui_with_layout(vec2(full, 52.0), Layout::left_to_right(Align::Center), |ui| {
+        ui.set_min_height(52.0);
+        ui.allocate_ui_with_layout(vec2(full - RIGHT - 18.0, 52.0), Layout::top_down(Align::Min), |ui| {
+            ui.add_space(7.0);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            ui.add(Label::new(RichText::new(label).size(14.0).color(TEXT())).selectable(false));
+            did.typed = cards::typed_path(ui, name, shown.0, value, FontId::proportional(12.5), shown.1, full - RIGHT - 18.0);
+            if let Some((words, color)) = note {
+                ui.add(Label::new(RichText::new(words).size(12.5).color(color)).wrap());
             }
-        }
-        if remove {
-            did.remove = theme::quiet(ui, "Remove", 13.5, true).clicked();
-        }
+            ui.add_space(6.0);
+        });
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            if remove {
+                did.remove = theme::quiet(ui, "Remove", 13.5, true).clicked();
+            }
+            if let Some(dir) = open {
+                if theme::quiet(ui, "Open", 13.5, true).clicked() {
+                    let _ = open::that(dir);
+                }
+            }
+            did.choose = theme::quiet(ui, choose, 13.5, true).clicked();
+        });
     });
     did
 }
@@ -369,97 +393,78 @@ fn folder_card(ui: &mut Ui, caption: &str, name: &str, shown: (&str, Color32), v
 fn files(app: &mut App, ui: &mut Ui, left: f32, wide: f32, now: f64) -> bool {
     let ctx = ui.ctx().clone();
     let mut changed = false;
-    let cols = if wide >= TWO { 2 } else { 1 };
-    theme::card_row(ui, "settings-folders", left, wide, cols, 2, GAP, PAD, 0.0, false, |i, ui| {
-        if i == 0 {
-            let dir = app.cfg.downloads_dir.clone();
-            let there = app.path_found("downloads", &dir, now);
-            let note = if there { "Where Soulseek downloads arrive" } else { "Not there yet. It is made the first time something is downloaded." };
-            let did = folder_card(ui, "DOWNLOADS FOLDER", "downloads", (&dir, TEXT()), &mut app.cfg.downloads_dir, (note, FAINT()), "Change", there.then_some(dir.as_str()), false);
-            changed |= did.typed;
-            if did.choose {
-                app.pick("downloads", &dir, true, &ctx);
-            }
-        } else {
-            // where the backup script lives (none: no backup tool, and no Backup page)
-            let dir = backup::tool_dir_for(&app.cfg.backup_tool_dir).map(|d| d.to_string_lossy().to_string());
-            let found = dir.as_ref().is_some_and(|d| app.path_found("backup-tool", &format!("{d}\\Backup-Music.ps1"), now));
-            let there = dir.as_ref().is_some_and(|d| app.path_found("backup-dir", d, now));
-            let shown = match &dir {
-                Some(d) => (d.as_str(), TEXT()),
-                None => ("None chosen", DIM()),
-            };
-            let note = if dir.is_some() && !found { ("Backup-Music.ps1 was not found there.", WARN()) } else { ("The folder that holds Backup-Music.ps1", FAINT()) };
-            let open = dir.as_deref().filter(|_| there);
-            let did = folder_card(ui, "BACKUP TOOL", "backup-tool", shown, &mut app.cfg.backup_tool_dir, note, if dir.is_some() { "Change" } else { "Choose" }, open, dir.is_some());
-            changed |= did.typed;
-            if did.remove {
-                app.cfg.backup_tool_dir.clear();
-                changed = true;
-            }
-            if did.choose {
-                app.pick("backup-tool", dir.as_deref().unwrap_or(""), true, &ctx);
-            }
+    rows_card(ui, left, wide, "settings-folders", Some("FOLDERS"), |ui| {
+        let dir = app.cfg.downloads_dir.clone();
+        let there = app.path_found("downloads", &dir, now);
+        let note = (!there).then_some(("Not there yet. It is made the first time something is downloaded.", FAINT()));
+        let did = folder_row(ui, "downloads", "Downloads", (&dir, DIM()), &mut app.cfg.downloads_dir, note, "Change", there.then_some(dir.as_str()), false);
+        changed |= did.typed;
+        if did.choose {
+            app.pick("downloads", &dir, true, &ctx);
         }
-        None
+        // where the backup script lives (none: no backup tool, and no Backup page)
+        let dir = backup::tool_dir_for(&app.cfg.backup_tool_dir).map(|d| d.to_string_lossy().to_string());
+        let found = dir.as_ref().is_some_and(|d| app.path_found("backup-tool", &format!("{d}\\Backup-Music.ps1"), now));
+        let there = dir.as_ref().is_some_and(|d| app.path_found("backup-dir", d, now));
+        let shown = match &dir {
+            Some(d) => (d.as_str(), DIM()),
+            None => ("None chosen", FAINT()),
+        };
+        let note = (dir.is_some() && !found).then_some(("Backup-Music.ps1 was not found there.", WARN()));
+        let open = dir.as_deref().filter(|_| there);
+        let did = folder_row(ui, "backup-tool", "Backup tool", shown, &mut app.cfg.backup_tool_dir, note, if dir.is_some() { "Change" } else { "Choose" }, open, dir.is_some());
+        changed |= did.typed;
+        if did.remove {
+            app.cfg.backup_tool_dir.clear();
+            changed = true;
+        }
+        if did.choose {
+            app.pick("backup-tool", dir.as_deref().unwrap_or(""), true, &ctx);
+        }
     });
     ui.add_space(GAP);
-    theme::card_row(ui, "settings-names", left, wide, cols, 2, GAP, PAD, 0.0, false, |i, ui| {
-        let quiet_line = |ui: &mut Ui, words: &str| drop(ui.add(Label::new(RichText::new(words).size(12.5).color(FAINT())).selectable(false)));
-        if i == 0 {
-            theme::caption(ui, "ARTIST NAMES");
-            ui.add_space(10.0);
-            quiet_line(ui, "Folders in the library that are not artists");
-            ui.add_space(4.0);
-            let w = ui.available_width();
-            changed |= ui.add(TextEdit::multiline(&mut app.cfg.skip_folders).desired_rows(2).desired_width(w).hint_text("Names, with commas between them")).changed();
-            ui.add_space(12.0);
-            quiet_line(ui, "Other spellings of the same artist");
-            ui.add_space(2.0);
-            // the list is a text file. The app starts its own the first time an import learns a spelling,
-            // so one that is not there yet is no fault
-            let file = app.cfg.alias_file.clone();
-            let there = app.path_found("alias", &file, now);
-            let own = Path::new(file.trim()) == crate::config::app_dir().join("artist-aliases.txt");
-            let none = !there && (own || file.trim().is_empty());
-            let name = Path::new(file.trim()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| file.clone());
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(18.0, 4.0);
-                let shown = if none { ("None yet", DIM()) } else { (name.as_str(), TEXT()) };
-                changed |= cards::typed_path(ui, "alias", shown.0, &mut app.cfg.alias_file, FontId::proportional(14.0), shown.1, (ui.available_width() - 150.0).max(120.0));
-                if !there && !none {
-                    ui.label(RichText::new("Not found").size(13.0).color(WARN()));
-                }
-                if theme::quiet(ui, if none { "Choose" } else { "Change" }, 13.5, true).clicked() {
-                    app.pick("alias", &file, false, &ctx);
-                }
-                if there && theme::quiet(ui, "Open", 13.5, true).clicked() {
-                    let _ = open::that(file.trim());
-                }
-            });
-            own.then(|| ("The app adds a spelling when an import teaches it one.".to_string(), FAINT()))
-        } else {
-            theme::caption(ui, "LYRICS");
-            ui.add_space(10.0);
-            quiet_line(ui, "Save");
-            ui.add_space(2.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(14.0, 4.0);
-                if theme::word(ui, "Timed lyrics when there are any", 14.0, !app.cfg.lyrics_plain)
-                    .on_hover_text("Each line carries its time, written in front of it in the lyrics. A player that knows such lyrics follows the song with them; one that does not shows the times as text.")
-                    .clicked()
-                    && app.cfg.lyrics_plain
-                {
-                    app.cfg.lyrics_plain = false;
-                    changed = true;
-                }
-                if theme::word(ui, "Plain words only", 14.0, app.cfg.lyrics_plain).on_hover_text("The words alone, for players that show lyrics as they are written.").clicked() && !app.cfg.lyrics_plain {
-                    app.cfg.lyrics_plain = true;
-                    changed = true;
-                }
-            });
-            Some(("Songs without lyrics get them from LRCLIB, a free lyrics library, when an album is imported or when you ask for it on the Health page. Only a song's artist, title and length are sent.".to_string(), FAINT()))
-        }
+    rows_card(ui, left, wide, "settings-names", Some("ARTIST NAMES"), |ui| {
+        ui.add_space(10.0);
+        ui.add(Label::new(RichText::new("Folders that are not artists").size(14.0).color(TEXT())).selectable(false));
+        ui.add_space(6.0);
+        let w = ui.available_width();
+        changed |= ui.add(TextEdit::multiline(&mut app.cfg.skip_folders).desired_rows(1).desired_width(w).hint_text("Names, with commas between them")).changed();
+        ui.add_space(4.0);
+        // the list is a text file. The app starts its own the first time an import learns a spelling,
+        // so one that is not there yet is no fault
+        let file = app.cfg.alias_file.clone();
+        let there = app.path_found("alias", &file, now);
+        let own = Path::new(file.trim()) == crate::config::app_dir().join("artist-aliases.txt");
+        let none = !there && (own || file.trim().is_empty());
+        let name = Path::new(file.trim()).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_else(|| file.clone());
+        let hint = own.then_some("The app adds a spelling when an import teaches it one");
+        rows::row(ui, "alias", "Other spellings of the same artist", hint, |ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            if there && theme::quiet(ui, "Open", 13.5, true).clicked() {
+                let _ = open::that(file.trim());
+            }
+            if theme::quiet(ui, if none { "Choose" } else { "Change" }, 13.5, true).clicked() {
+                app.pick("alias", &file, false, &ctx);
+            }
+            if !there && !none {
+                ui.label(RichText::new("Not found").size(13.0).color(WARN()));
+            }
+            let shown = if none { ("None yet", DIM()) } else { (name.as_str(), TEXT()) };
+            changed |= cards::typed_path(ui, "alias", shown.0, &mut app.cfg.alias_file, FontId::proportional(14.0), shown.1, 180.0);
+        });
+    });
+    ui.add_space(GAP);
+    rows_card(ui, left, wide, "settings-lyrics", Some("LYRICS"), |ui| {
+        const WAYS: [rows::Item; 2] = [
+            rows::Item { name: "Timed when there are any", about: "Lines that follow the song, in players that show them." },
+            rows::Item { name: "Plain words only", about: "The words alone, for players that show lyrics as written." },
+        ];
+        rows::row(ui, "lyrics", "Lyrics to save", Some("From LRCLIB, a free library; only a song's artist, title and length are sent"), |ui| {
+            if let Some(n) = rows::pick_one(ui, "pick:lyrics", &WAYS, usize::from(app.cfg.lyrics_plain)) {
+                app.cfg.lyrics_plain = n == 1;
+                changed = true;
+            }
+        });
     });
     changed
 }
@@ -480,20 +485,6 @@ fn number<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::
         ui.spacing_mut().button_padding = vec2(8.0, 3.0);
         ui.spacing_mut().interact_size = vec2(44.0, 26.0);
         ui.add(egui::DragValue::new(value).range(range)).changed()
-    })
-    .inner
-}
-
-/// One line of a card with a number in it: "Look back [9] months".
-fn number_line<N: egui::emath::Numeric>(ui: &mut Ui, before: &str, value: &mut N, range: std::ops::RangeInclusive<N>, after: &str) -> bool {
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(8.0, 4.0);
-        // (as high as the number's box from the start, so the words before and after stand on one line)
-        ui.set_row_height(26.0);
-        ui.add(Label::new(RichText::new(before).size(14.0).color(TEXT())).wrap_mode(egui::TextWrapMode::Extend).selectable(false));
-        let changed = number(ui, value, range);
-        ui.add(Label::new(RichText::new(after).size(14.0).color(TEXT())).wrap_mode(egui::TextWrapMode::Extend).selectable(false));
-        changed
     })
     .inner
 }
@@ -536,113 +527,125 @@ fn list_line(ui: &mut Ui, name: &str, more: &str, word: &str) -> bool {
 /// What the Recs page looks for, how it refreshes, and the artists muted and pinned.
 fn recs(app: &mut App, ui: &mut Ui, left: f32, wide: f32, now: f64) -> bool {
     let mut changed = false;
-    let cols = if wide >= THREE { 3 } else { 1 };
-    theme::card_row(ui, "settings-recs", left, wide, cols, 3, GAP, PAD, 0.0, false, |i, ui| match i {
-        0 => {
-            theme::caption(ui, "NEW RELEASES");
-            ui.add_space(12.0);
-            changed |= number_line(ui, "Look back", &mut app.cfg.months_back, 1..=24, "months");
-            ui.add_space(6.0);
-            changed |= number_line(ui, "Check your top", &mut app.cfg.check_artists, 10..=800, "artists");
-            ui.add_space(10.0);
-            ui.add(Label::new(RichText::new("Show").size(12.5).color(FAINT())).selectable(false));
-            ui.add_space(2.0);
-            // (the words the Recs page uses for its kinds: bright and underlined is on)
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(6.0, 6.0);
-                changed |= theme::toggle(ui, &mut app.cfg.include_albums, "Albums and mixtapes").clicked();
-                changed |= theme::toggle(ui, &mut app.cfg.include_eps, "EPs").clicked();
-                changed |= theme::toggle(ui, &mut app.cfg.include_singles, "Singles").clicked();
-                changed |= theme::toggle(ui, &mut app.cfg.include_live_comp, "Live albums, compilations, remixes").clicked();
-                changed |= theme::toggle(ui, &mut app.cfg.include_features, "Songs they are only featured on").clicked();
-            });
-            ui.add_space(8.0);
-            ui.horizontal_wrapped(|ui| {
-                changed |= theme::toggle(ui, &mut app.cfg.use_itunes, "Also check Apple Music").on_hover_text("Finds more, but the first run is slower.").clicked();
-            });
-            let minutes = ((app.cfg.check_artists as f64 * if app.cfg.use_itunes { 3.1 } else { 1.5 }) / 60.0).ceil();
-            Some((format!("A first run with these choices takes about {minutes} minutes. Later runs are quick."), FAINT()))
-        }
-        1 => {
-            theme::caption(ui, "ARTISTS TO TRY");
-            ui.add_space(12.0);
-            changed |= number_line(ui, "Start from your top", &mut app.cfg.similar_seeds, 5..=300, "artists");
-            ui.add_space(6.0);
-            changed |= number_line(ui, "Leave out artists you have played", &mut app.cfg.hide_listened_plays, 0..=10000, "times or more");
-            Some(("0 keeps them in. Artists already in your library are always left out.".to_string(), FAINT()))
-        }
-        _ => {
-            theme::caption(ui, "REFRESHING");
-            ui.add_space(12.0);
-            ui.horizontal_wrapped(|ui| {
-                changed |= theme::toggle(ui, &mut app.cfg.auto_refresh, "Refresh when the app opens").clicked();
-            });
-            ui.add_space(1.0);
-            ui.add(Label::new(RichText::new("if the last refresh is over 12 hours old").size(12.5).color(FAINT())).selectable(false));
-            ui.add_space(10.0);
-            changed |= number_line(ui, "Saved lookups last", &mut app.cfg.cache_days, 1..=60, "days");
-            ui.add_space(10.0);
-            if theme::quiet(ui, "Forget saved lookups", 13.5, true).clicked() {
+    rows_card(ui, left, wide, "settings-new-releases", Some("NEW RELEASES"), |ui| {
+        changed |= number_row(ui, "months-back", "How far back", None, None, &mut app.cfg.months_back, 1..=24, "months");
+        changed |= number_row(ui, "check-artists", "Artists to check", None, Some("top"), &mut app.cfg.check_artists, 10..=800, "artists");
+        // the kinds of release: a menu where any of them can be on
+        const KINDS: [rows::Item; 5] = [
+            rows::Item { name: "Albums and mixtapes", about: "" },
+            rows::Item { name: "EPs", about: "" },
+            rows::Item { name: "Singles", about: "" },
+            rows::Item { name: "Live albums, compilations, remixes", about: "" },
+            rows::Item { name: "Songs they are only featured on", about: "" },
+        ];
+        let c = &mut app.cfg;
+        let mut on = [c.include_albums, c.include_eps, c.include_singles, c.include_live_comp, c.include_features];
+        let shown = rows::summary(&["Albums", "EPs", "Singles", "Live and compilations", "Features"], &on, "All kinds");
+        rows::row(ui, "kinds", "Kinds", None, |ui| {
+            if rows::pick_many(ui, "pick:kinds", &shown, &KINDS, &mut on) {
+                [c.include_albums, c.include_eps, c.include_singles, c.include_live_comp, c.include_features] = on;
+                changed = true;
+            }
+        });
+        let minutes = ((app.cfg.check_artists as f64 * if app.cfg.use_itunes { 3.1 } else { 1.5 }) / 60.0).ceil();
+        let hint = format!("Finds more; a first run takes about {minutes} minutes");
+        rows::row(ui, "itunes", "Also check Apple Music", Some(&hint), |ui| changed |= rows::mark(ui, "mark:itunes", &mut app.cfg.use_itunes));
+    });
+    ui.add_space(GAP);
+    rows_card(ui, left, wide, "settings-artists-to-try", Some("ARTISTS TO TRY"), |ui| {
+        changed |= number_row(ui, "seeds", "Start from", None, Some("top"), &mut app.cfg.similar_seeds, 5..=300, "artists");
+        changed |= number_row(ui, "played", "Leave out artists you have played", Some("0 keeps them all in; your library's artists are always left out"), None, &mut app.cfg.hide_listened_plays, 0..=10000, "times or more");
+    });
+    ui.add_space(GAP);
+    rows_card(ui, left, wide, "settings-refreshing", Some("REFRESHING"), |ui| {
+        rows::row(ui, "auto-refresh", "Refresh when the app opens", Some("When the last one is over 12 hours old"), |ui| changed |= rows::mark(ui, "mark:auto-refresh", &mut app.cfg.auto_refresh));
+        // (for a moment after "Forget them now", the hint says it was done)
+        let cleared = app.cache_cleared_at.is_some_and(|t| now - t < 3.0);
+        let hint = cleared.then_some("Done. The next refresh looks everything up again");
+        rows::row(ui, "cache-days", "Keep lookups for", hint, |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            if theme::quiet(ui, "Forget them now", 13.5, true).clicked() {
                 app.net.clear_cache();
                 app.cache_cleared_at = Some(now);
             }
-            ui.add_space(6.0);
-            ui.horizontal_wrapped(|ui| {
-                ui.spacing_mut().item_spacing = vec2(16.0, 4.0);
-                let n = app.cfg.dismissed.len();
-                ui.label(RichText::new(if n == 1 { "1 hidden release or artist".to_string() } else { format!("{n} hidden releases and artists") }).size(12.5).color(FAINT()));
-                if n > 0 && theme::quiet(ui, "Show them all again", 13.5, true).clicked() {
-                    app.cfg.dismissed.clear();
-                    changed = true;
-                }
-            });
-            Some(if app.cache_cleared_at.is_some_and(|t| now - t < 3.0) {
-                ("Done. The next refresh looks everything up again.".to_string(), GREEN())
-            } else {
-                ("A forgotten lookup is made again at the next refresh.".to_string(), FAINT())
-            })
-        }
+            ui.add_space(8.0);
+            rows::unit(ui, "days");
+            changed |= number(ui, &mut app.cfg.cache_days, 1..=60);
+        });
+        let n = app.cfg.dismissed.len();
+        rows::row(ui, "hidden", "Hidden releases and artists", None, |ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
+            if n > 0 && theme::quiet(ui, "Show them again", 13.5, true).clicked() {
+                app.cfg.dismissed.clear();
+                changed = true;
+            }
+            rows::unit(ui, &commas(n));
+        });
     });
     ui.add_space(GAP);
-    let cols = if wide >= TWO { 2 } else { 1 };
-    theme::card_row(ui, "settings-lists", left, wide, cols, 2, GAP, PAD, 0.0, false, |i, ui| {
-        let none = |ui: &mut Ui, words: &str| drop(ui.add(Label::new(RichText::new(words).size(12.5).color(FAINT())).wrap()));
-        if i == 0 {
-            list_head(ui, "MUTED ARTISTS", "their new releases are not shown");
-            if app.cfg.muted.is_empty() {
-                none(ui, "None. Mute an artist from Hide on one of their releases.");
-            }
-            let mut unmute = None;
-            for (k, name) in &app.cfg.muted {
-                if list_line(ui, name, "", "Unmute") {
-                    unmute = Some(k.clone());
-                }
-            }
-            if let Some(k) = unmute {
-                app.cfg.muted.remove(&k);
-                changed = true;
-            }
-        } else {
-            list_head(ui, "PINNED ARTISTS", "matched by hand, where a name is shared");
-            if app.cfg.pins.is_empty() {
-                none(ui, "None. Open an artist and choose \"Wrong artist?\" to pin the right one.");
-            }
-            let mut unpin = None;
-            for (k, p) in &app.cfg.pins {
-                let what = if p.mbid.is_empty() { "not using MusicBrainz".to_string() } else { p.label.clone() };
-                if list_line(ui, &p.artist, &format!("\u{2192}  {what}"), "Unpin") {
-                    unpin = Some(k.clone());
-                }
-            }
-            if let Some(k) = unpin {
-                app.cfg.pins.remove(&k);
-                app.detail_cache.remove(&k);
-                changed = true;
+    let none = |ui: &mut Ui, words: &str| {
+        ui.add_space(8.0);
+        ui.add(Label::new(RichText::new(words).size(13.0).color(FAINT())).wrap());
+        ui.add_space(6.0);
+    };
+    rows_card(ui, left, wide, "settings-muted", None, |ui| {
+        ui.add_space(2.0);
+        list_head(ui, "MUTED ARTISTS", "their new releases are not shown");
+        if app.cfg.muted.is_empty() {
+            none(ui, "None. Mute an artist from Hide on one of their releases.");
+        }
+        let mut unmute = None;
+        for (k, name) in &app.cfg.muted {
+            if list_line(ui, name, "", "Unmute") {
+                unmute = Some(k.clone());
             }
         }
-        None
+        if let Some(k) = unmute {
+            app.cfg.muted.remove(&k);
+            changed = true;
+        }
+        ui.add_space(4.0);
+    });
+    ui.add_space(GAP);
+    rows_card(ui, left, wide, "settings-pinned", None, |ui| {
+        ui.add_space(2.0);
+        list_head(ui, "PINNED ARTISTS", "matched by hand, where a name is shared");
+        if app.cfg.pins.is_empty() {
+            none(ui, "None. Open an artist and choose \"Wrong artist?\" to pin the right one.");
+        }
+        let mut unpin = None;
+        for (k, p) in &app.cfg.pins {
+            let what = if p.mbid.is_empty() { "not using MusicBrainz".to_string() } else { p.label.clone() };
+            if list_line(ui, &p.artist, &format!("\u{2192}  {what}"), "Unpin") {
+                unpin = Some(k.clone());
+            }
+        }
+        if let Some(k) = unpin {
+            app.cfg.pins.remove(&k);
+            app.detail_cache.remove(&k);
+            changed = true;
+        }
+        ui.add_space(4.0);
     });
     changed
+}
+
+/// A row with a number in it: `label` at the left, and at the right "[150] artists" (with `before` in
+/// front of the box when there is one: "top [150] artists"). True when the number was changed.
+#[allow(clippy::too_many_arguments)]
+fn number_row<N: egui::emath::Numeric>(ui: &mut Ui, id: &str, label: &str, hint: Option<&str>, before: Option<&str>, value: &mut N, range: std::ops::RangeInclusive<N>, after: &str) -> bool {
+    rows::row(ui, id, label, hint, |ui| {
+        rows::unit(ui, after);
+        let changed = number(ui, value, range);
+        if let Some(b) = before {
+            rows::unit(ui, b);
+        }
+        changed
+    })
+}
+
+fn commas(n: usize) -> String {
+    crate::library_page::commas(n as u64)
 }
 
 // ------------------------------------------------------------------ Look
@@ -652,37 +655,38 @@ fn look(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now: f
     let mut changed = false;
     theme::panel(ui, left, wide, PAD, "settings-theme", |ui| changed = themes(app, st, ui, now));
     ui.add_space(GAP);
-    theme::panel(ui, left, wide, PAD, "settings-size", sizes);
+    rows_card(ui, left, wide, "settings-size", None, sizes);
     changed
 }
 
 /// One theme as a small picture of a page in its colors (the top row, a card, two lines of text, the
 /// accent and a link), with its name under it. The whole tile is the control; the one in use has the
 /// accent line under its name. True when it was clicked.
-fn theme_tile(ui: &mut Ui, name: &str, colors: &[u32; theme::ROLES], on: bool) -> bool {
-    const SIZE: egui::Vec2 = egui::Vec2::new(142.0, 88.0);
-    let (rect, r) = ui.allocate_exact_size(SIZE + vec2(0.0, 28.0), Sense::click());
+fn theme_tile(ui: &mut Ui, name: &str, colors: &[u32; theme::ROLES], on: bool, s: f32) -> bool {
+    // (drawn at 142 by 88, or `s` times that so a row of them fits)
+    let size = egui::Vec2::new(142.0, 88.0) * s;
+    let (rect, r) = ui.allocate_exact_size(size + vec2(0.0, 28.0), Sense::click());
     script::seen(&format!("theme:{name}"), rect);
     let color = |role: usize| {
         let c = colors[role];
         Color32::from_rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
     };
-    let picture = Rect::from_min_size(rect.min, SIZE);
+    let picture = Rect::from_min_size(rect.min, size);
     let p = ui.painter();
     p.rect_filled(picture, 8.0, color(0));
-    p.rect_filled(Rect::from_min_size(picture.min, vec2(SIZE.x, 12.0)), egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, color(1));
-    p.rect_filled(Rect::from_min_size(picture.min + vec2(10.0, 22.0), vec2(54.0, 54.0)), 5.0, color(2));
+    p.rect_filled(Rect::from_min_size(picture.min, vec2(size.x, 12.0 * s)), egui::CornerRadius { nw: 8, ne: 8, sw: 0, se: 0 }, color(1));
+    p.rect_filled(Rect::from_min_size(picture.min + vec2(10.0, 22.0) * s, vec2(54.0, 54.0) * s), 5.0, color(2));
     for (y, w, h, role) in [(26.0, 52.0, 5.0, 5), (38.0, 36.0, 4.0, 6), (56.0, 26.0, 5.0, 8), (68.0, 44.0, 3.0, 9)] {
-        p.rect_filled(Rect::from_min_size(picture.min + vec2(74.0, y), vec2(w, h)), 2.0, color(role));
+        p.rect_filled(Rect::from_min_size(picture.min + vec2(74.0, y) * s, vec2(w, h) * s), 2.0, color(role));
     }
-    p.rect_stroke(picture, 8.0, Stroke::new(1.0, if on || r.hovered() { TEXT() } else { theme::BORDER() }), egui::StrokeKind::Inside);
+    // the one in use: a coral edge round it (the one mark of what is chosen, as everywhere in Settings)
+    if on {
+        p.rect_stroke(picture.expand(3.0), 10.0, Stroke::new(1.5, ACCENT()), egui::StrokeKind::Inside);
+    }
+    p.rect_stroke(picture, 8.0, Stroke::new(1.0, if r.hovered() && !on { TEXT() } else { theme::BORDER() }), egui::StrokeKind::Inside);
     let words = p.layout_no_wrap(name.to_string(), FontId::proportional(13.0), Color32::PLACEHOLDER);
     let at = pos2(rect.left(), picture.bottom() + 6.0);
-    let (wide, high) = (words.size().x, words.size().y);
     p.galley(at, words, if on { TEXT() } else { DIM() });
-    if on {
-        p.hline(at.x..=at.x + wide, at.y + high + 1.0, Stroke::new(1.5, ACCENT()));
-    }
     r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
 
@@ -740,22 +744,31 @@ fn themes(app: &mut App, st: &mut State, ui: &mut Ui, now: f64) -> bool {
     ui.add_space(12.0);
     let mine = theme::from_saved(&app.cfg.my_theme);
     ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = if st.beside { vec2(14.0, 8.0) } else { vec2(18.0, 8.0) };
+        let gap = if st.beside { 14.0 } else { 18.0 };
+        ui.spacing_mut().item_spacing = vec2(gap, 8.0);
+        // as many to a row as fit at 104 wide or more, then as wide as that row allows (142 at most)
+        let n = theme::THEMES.len() + usize::from(mine.is_some());
+        let room = ui.available_width();
+        let per_row = (((room + gap) / (104.0 + gap)).floor() as usize).clamp(1, n);
+        let s = (((room - gap * (per_row - 1) as f32) / per_row as f32 - 1.0) / 142.0).min(1.0);
         for (name, colors) in theme::THEMES.iter().map(|t| (t.0, t.1)).chain(mine.map(|m| ("Mine", m))) {
             let on = colors == before;
-            if theme_tile(ui, name, &colors, on) && !on {
+            if theme_tile(ui, name, &colors, on, s) && !on {
                 theme::set_all(&colors);
                 changed = true;
             }
         }
     });
-    ui.add_space(6.0);
+    ui.add_space(2.0);
     let mut undone = false;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(18.0, 4.0);
-        if theme::quiet(ui, if app.colors_open { "Hide the single colors" } else { "Adjust colors" }, 13.5, true).clicked() {
+    // each color by itself, folded under one row until asked for
+    rows::row(ui, "single-colors", "Single colors", None, |ui| {
+        if theme::quiet(ui, if app.colors_open { "Hide them" } else { "Show them" }, 13.5, true).clicked() {
             app.colors_open = !app.colors_open;
         }
+    });
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = vec2(18.0, 4.0);
         if !app.color_undo.is_empty() && theme::quiet(ui, "Undo the last change", 13.5, true).clicked() {
             if let Some(was) = app.color_undo.pop() {
                 theme::set_all(&was);
@@ -806,22 +819,16 @@ fn themes(app: &mut App, st: &mut State, ui: &mut Ui, now: f64) -> bool {
     changed
 }
 
-/// How large everything is drawn. The size in use is the bright one.
+/// How large everything is drawn: a row with a menu of the sizes.
 fn sizes(ui: &mut Ui) {
-    theme::caption(ui, "SIZE");
-    ui.add_space(10.0);
     let at = ui.ctx().zoom_factor();
+    let names: Vec<String> = theme::SIZES.iter().map(|s| format!("{}%", (s * 100.0).round() as u32)).collect();
+    let items: Vec<rows::Item> = names.iter().map(|n| rows::Item { name: n, about: "" }).collect();
+    let chosen = theme::SIZES.iter().position(|s| (at - s).abs() < 0.01).unwrap_or(1);
     let mut pick = None;
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(20.0, 6.0);
-        for size in theme::SIZES {
-            let on = (at - size).abs() < 0.01;
-            let words = format!("{}%", (size * 100.0).round() as u32);
-            let r = theme::word(ui, &words, 14.0, on);
-            script::seen(&format!("size:{words}"), r.rect);
-            if r.clicked() && !on {
-                pick = Some(size);
-            }
+    rows::row(ui, "size", "Size", None, |ui| {
+        if let Some(n) = rows::pick_one(ui, "pick:size", &items, chosen) {
+            pick = theme::SIZES.get(n).copied();
         }
     });
     if let Some(size) = pick {
@@ -844,53 +851,21 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
     let chosen = Policy::from_saved(&app.cfg.updates);
     let busy = app.busy();
     let mut changed = false;
-    theme::panel(ui, left, wide, PAD, "settings-version", |ui| {
-        ui.horizontal(|ui| {
-            theme::caption(ui, "VERSION");
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 18.0;
-                // (from the right: the word for the updater first, then what is new)
-                match &state {
-                    Up::Fetching(..) => {
-                        if theme::quiet(ui, "Stop", 13.0, true).clicked() {
-                            update::stop_fetch();
-                        }
-                    }
-                    Up::Ready(_) | Up::Checking => {}
-                    Up::Out(_, Why::Stopped) => {
-                        // (the part that arrived is still there: the fetch carries on from it)
-                        if theme::quiet(ui, "Carry on", 13.0, true).clicked() {
-                            update::check_now();
-                        }
-                    }
-                    _ if can => {
-                        if theme::quiet(ui, "Check now", 13.0, true).clicked() {
-                            update::check_now();
-                        }
-                    }
-                    _ => {}
-                }
-                let (words, page) = match &state {
-                    Up::Fetching(v, ..) | Up::Ready(v) | Up::Out(v, _) => (format!("What's new in {v}"), format!("{}/releases/tag/v{v}", update::REPO)),
-                    _ => ("What's new".to_string(), format!("{}/releases", update::REPO)),
-                };
-                if theme::quiet(ui, &words, 13.0, true).clicked() {
-                    crate::util::open_url(&page);
-                }
-            });
-        });
+    theme::panel(ui, left, wide, vec2(PAD.x, 26.0), "settings-version", |ui| {
+        // the name and version: the page's one large line, in the middle
+        theme::centered(ui, &format!("Bradley's Music Tool {}", update::current()), theme::display(30.0), TEXT());
         ui.add_space(8.0);
-        ui.add(Label::new(RichText::new(format!("Bradley's Music Tool {}", update::current())).font(theme::display(26.0)).color(TEXT())).selectable(false));
-        ui.add_space(4.0);
         let say = |ui: &mut Ui, text: &str, color: Color32| {
-            ui.add(Label::new(RichText::new(text).size(14.0).color(color)).selectable(false));
+            ui.add(Label::new(RichText::new(text).size(13.5).color(color)).selectable(false));
         };
         let faint = |ui: &mut Ui, text: &str| {
             ui.add(Label::new(RichText::new(text).size(12.5).color(FAINT())).selectable(false));
         };
+        // under it, one line: how it stands, then the words that act on it (they act on what is said)
         ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 16.0;
             ui.set_min_height(21.0);
+            theme::centered_row(ui, "about-state", 0.0, |ui| {
+            ui.spacing_mut().item_spacing.x = 16.0;
             match &state {
                 _ if !can => say(ui, "This copy is a test run or a build from source, and does not update itself.", DIM()),
                 Up::Idle if chosen == Policy::Off => say(ui, "Not checking for new versions.", DIM()),
@@ -931,25 +906,60 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
                     faint(ui, "It tries again in 30 minutes.");
                 }
             }
+            // the word for the updater, then what is new
+            match &state {
+                Up::Fetching(..) => {
+                    if theme::quiet(ui, "Stop", 13.5, true).clicked() {
+                        update::stop_fetch();
+                    }
+                }
+                Up::Ready(_) | Up::Checking => {}
+                Up::Out(_, Why::Stopped) => {
+                    // (the part that arrived is still there: the fetch carries on from it)
+                    if theme::quiet(ui, "Carry on", 13.5, true).clicked() {
+                        update::check_now();
+                    }
+                }
+                _ if can => {
+                    if theme::quiet(ui, "Check now", 13.5, true).clicked() {
+                        update::check_now();
+                    }
+                }
+                _ => {}
+            }
+            let (words, page) = match &state {
+                Up::Fetching(v, ..) | Up::Ready(v) | Up::Out(v, _) => (format!("What's new in {v}"), format!("{}/releases/tag/v{v}", update::REPO)),
+                _ => ("What's new".to_string(), format!("{}/releases", update::REPO)),
+            };
+            if theme::quiet(ui, &words, 13.5, true).clicked() {
+                crate::util::open_url(&page);
+            }
+            });
         });
         // the thin line: always has its room, filled only while a version is being fetched
         ui.add_space(10.0);
         let (line, _) = ui.allocate_exact_size(vec2(ui.available_width(), 3.0), Sense::hover());
         if let Up::Fetching(_, done, total) = &state {
+            let line = Rect::from_center_size(line.center(), vec2(line.width().min(360.0), 3.0));
             ui.painter().rect_filled(line, 1.5, theme::BORDER());
             let mut filled = line;
             filled.set_width(line.width() * (*done as f32 / (*total).max(1) as f32).clamp(0.0, 1.0));
             ui.painter().rect_filled(filled, 1.5, theme::ACCENT2());
         }
-        ui.add_space(12.0);
-        ui.horizontal_wrapped(|ui| {
-            ui.spacing_mut().item_spacing = vec2(16.0, 6.0);
-            faint(ui, "New versions");
-            for (p, words) in [(Policy::Auto, "Fetch and install by themselves"), (Policy::Tell, "Only tell me"), (Policy::Off, "Never check")] {
-                if theme::word(ui, words, 14.0, chosen == p).clicked() && chosen != p {
-                    app.cfg.updates = p.saved().to_string();
-                    changed = true;
-                }
+    });
+    ui.add_space(GAP);
+    rows_card(ui, left, wide, "settings-new-versions", None, |ui| {
+        const WAYS: [rows::Item; 3] = [
+            rows::Item { name: "Install by themselves", about: "Fetched and checked in the background; put in when you restart." },
+            rows::Item { name: "Only tell me", about: "Says a new version is out; you choose when to get it." },
+            rows::Item { name: "Never check", about: "The app does not look for new versions." },
+        ];
+        let policies = [Policy::Auto, Policy::Tell, Policy::Off];
+        let at = policies.iter().position(|p| *p == chosen).unwrap_or(0);
+        rows::row(ui, "new-versions", "New versions", None, |ui| {
+            if let Some(n) = rows::pick_one(ui, "pick:updates", &WAYS, at) {
+                app.cfg.updates = policies[n].saved().to_string();
+                changed = true;
             }
         });
     });

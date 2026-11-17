@@ -26,6 +26,7 @@ mod panel;
 mod recs_artists;
 mod repair;
 mod replace;
+mod rows;
 mod recs_grid;
 mod recs_top;
 mod script;
@@ -1193,6 +1194,7 @@ impl eframe::App for App {
             Panel::top("pages").frame(Frame::new().fill(BG2()).inner_margin(Margin::ZERO)).show(ui, |ui| self.bare_bar(ui));
             setup::screen(self, ui);
             covers::end_frame(&ctx);
+            rows::note_popups(&ctx); // (whether a menu is open as this frame ends: `rows::popup_until_now`)
             self.debug_screenshot(&ctx);
             return;
         }
@@ -1323,7 +1325,7 @@ impl eframe::App for App {
         // Settings takes the window in place of the pages (`settings::page`). Escape leaves: from the Look
         // card beside the pages back to the whole of Settings, from Settings back to the page. Not while a
         // picker is open, and not the Escape that only leaves a box that was being typed in
-        if self.show_settings && !ctx.any_popup_open() && !theme::typing_until_now(&ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
+        if self.show_settings && !rows::popup_until_now(&ctx) && !theme::typing_until_now(&ctx) && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape)) {
             if self.settings.beside {
                 self.settings.beside = false;
             } else {
@@ -1337,6 +1339,7 @@ impl eframe::App for App {
             settings::page(self, ui);
             self.search_overlay(&ctx);
             covers::end_frame(&ctx);
+            rows::note_popups(&ctx); // (whether a menu is open as this frame ends: `rows::popup_until_now`)
             self.debug_screenshot(&ctx);
             return;
         }
@@ -1361,6 +1364,7 @@ impl eframe::App for App {
             }
             self.search_overlay(&ctx);
             covers::end_frame(&ctx);
+            rows::note_popups(&ctx); // (whether a menu is open as this frame ends: `rows::popup_until_now`)
             self.debug_screenshot(&ctx);
             return;
         }
@@ -1405,6 +1409,7 @@ impl eframe::App for App {
         self.apply(actions, &ctx);
         self.search_overlay(&ctx);
         covers::end_frame(&ctx);
+        rows::note_popups(&ctx); // (whether a menu is open as this frame ends: `rows::popup_until_now`)
         self.debug_screenshot(&ctx);
     }
 

@@ -4,7 +4,7 @@
 use crate::helpers::{self, Helper};
 use crate::library_page::commas;
 use crate::theme::{self, ACCENT2, DIM, FAINT, GREEN, TEXT, WARN};
-use crate::{script, util, App};
+use crate::{rows, script, util, App};
 use crossbeam_channel::Receiver;
 use egui::{pos2, vec2, Align, Color32, FontId, Label, Layout, Margin, Rect, RichText, Sense, TextEdit, Ui};
 use std::path::{Path, PathBuf};
@@ -390,23 +390,18 @@ impl FolderCard {
             });
             // repairs move and rename files: for a library laid out another way they wait for a yes
             match &mut repairs {
+                // a row with a menu, as every named choice in Settings is (`rows::pick_one`)
                 Repairs::First(look_only) if odd => {
-                    ui.add_space(8.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        theme::choice(ui, &mut **look_only, true, "Look only, change nothing");
-                        theme::choice(ui, &mut **look_only, false, "Allow repairs");
+                    ui.add_space(6.0);
+                    ui.allocate_ui_with_layout(vec2(words_w.max(room.width() - art_w), 0.0), Layout::top_down(Align::Min), |ui| {
+                        repairs_row(ui, look_only);
                     });
                 }
                 Repairs::First(_) => {}
                 Repairs::Settings => {
-                    ui.add_space(10.0);
-                    ui.allocate_ui_with_layout(vec2(words_w.max(room.width() - art_w), 0.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
-                        ui.spacing_mut().item_spacing = vec2(6.0, 4.0);
-                        ui.add(Label::new(RichText::new("Repairs on the Health page").size(12.5).color(FAINT())).selectable(false));
-                        ui.add_space(10.0);
-                        changed |= theme::choice(ui, &mut app.cfg.look_only, false, "Allowed").clicked();
-                        changed |= theme::choice(ui, &mut app.cfg.look_only, true, "Look only, change nothing").clicked();
+                    ui.add_space(6.0);
+                    ui.allocate_ui_with_layout(vec2(words_w.max(room.width() - art_w), 0.0), Layout::top_down(Align::Min), |ui| {
+                        changed |= repairs_row(ui, &mut app.cfg.look_only);
                     });
                 }
             }
@@ -520,11 +515,6 @@ fn green_dot(ui: &mut Ui) {
     ui.painter().circle_filled(dot.center() + vec2(0.0, 1.0), 3.5, GREEN());
 }
 
-/// "On this PC", "Installed": a green dot and the word (in a row laid out from the right).
-fn there(ui: &mut Ui, word: &str) {
-    ui.label(RichText::new(word).size(14.0).color(DIM()));
-    green_dot(ui);
-}
 
 /// The card of what the app needs: ffmpeg and PowerShell 7, each with how it stands on this PC or the
 /// word that gets it. `ffmpeg` is whether ffmpeg is there and when that was last looked at.
@@ -554,34 +544,39 @@ pub(crate) fn needs(ui: &mut Ui, ffmpeg: &mut (f64, bool)) -> Foot {
             ffmpeg.0 = -10.0;
         }
         helpers::State::Failed(why) => need(ui, "ffmpeg", why, WARN(), |ui| {
-            if theme::link_sized(ui, "Try again", 14.0, true).clicked() {
+            if theme::main_action_sized(ui, "Try again", 14.0, true).clicked() {
                 helpers::start(Helper::Ffmpeg, &ctx);
             }
         }),
-        helpers::State::Idle if ffmpeg.1 => need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| there(ui, "On this PC")),
+        // there: only a green check. Not there: in its place the word that gets it, and its size
+        helpers::State::Idle if ffmpeg.1 => need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| rows::there(ui, "there:ffmpeg")),
         helpers::State::Idle => {
             let size = format!("{} MB", (Helper::Ffmpeg.pin().size as f64 / 1_000_000.0).round());
-            need(ui, "ffmpeg", &format!("for imports and checks, {size}"), FAINT(), |ui| {
-                if theme::link_sized(ui, Helper::Ffmpeg.word(), 14.0, true).clicked() {
+            need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| {
+                ui.label(RichText::new(size).size(12.5).color(FAINT()));
+                if theme::main_action_sized(ui, "Get it", 14.0, true).clicked() {
                     helpers::start(Helper::Ffmpeg, &ctx);
                 }
             });
         }
     }
     ui.add_space(14.0);
+    // (one loud word a card: while ffmpeg's is there, this one is quiet)
+    let ffmpeg_missing = !ffmpeg.1;
     if crate::importer::tools::pwsh().is_some() {
-        need(ui, "PowerShell 7", "for imports and tag repairs", FAINT(), |ui| there(ui, "Installed"));
+        need(ui, "PowerShell 7", "for imports and tag repairs", FAINT(), |ui| rows::there(ui, "there:pwsh"));
     } else if helpers::pwsh_installing() {
         need(ui, "PowerShell 7", "Installing in its own window", FAINT(), |ui| drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))));
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
     } else {
         need(ui, "PowerShell 7", "for imports and tag repairs", FAINT(), |ui| {
-            if theme::link_sized(ui, "Install PowerShell 7", 14.0, true).clicked() {
+            let clicked = if ffmpeg_missing { theme::quiet(ui, "Install", 14.0, true).clicked() } else { theme::main_action_sized(ui, "Install", 14.0, true).clicked() };
+            if clicked {
                 helpers::install_pwsh();
             }
         });
     }
-    Some(("Fetched from their own release pages and checked before use.".to_string(), FAINT()))
+    None
 }
 
 // ------------------------------------------------------------------ the two logins
@@ -658,6 +653,20 @@ pub(crate) fn lastfm(app: &mut App, ui: &mut Ui) -> bool {
     changed
 }
 
+/// "Repairs on the Health page", with its menu: allowed, or look only. True when it was changed.
+fn repairs_row(ui: &mut Ui, look_only: &mut bool) -> bool {
+    const WAYS: [rows::Item; 2] = [
+        rows::Item { name: "Allowed", about: "Health can repair what it finds; every repair can be undone." },
+        rows::Item { name: "Look only, change nothing", about: "Health reports, and the library is never touched." },
+    ];
+    rows::row(ui, "repairs", "Repairs on the Health page", None, |ui| match rows::pick_one(ui, "pick:repairs", &WAYS, usize::from(*look_only)) {
+        Some(n) => {
+            *look_only = n == 1;
+            true
+        }
+        None => false,
+    })
+}
 /// What the Soulseek card works on.
 pub(crate) struct Slsk<'a> {
     pub user: &'a mut String,
