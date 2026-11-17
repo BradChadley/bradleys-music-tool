@@ -14,7 +14,7 @@ It is for people who keep their own music files, sorted as `Artist\Album (Year)\
 
 ![The Health page after a check](docs/health.png)
 
-**Recs.** With a free Last.fm account it compares what you play with what you own and shows three lists: new releases from artists you like, artists to try, and all of your artists ranked. Click an artist for their albums, best first, with the ones you already have marked.
+**Recs.** With a free Last.fm account it compares what you play with what you own and shows three lists: new releases from artists you like, artists to try, and all of your artists ranked. Click an artist for their albums, best first, with the ones you already have marked. In Settings, choose **Connect Last.fm**, approve access in your browser, and return to the app. You do not need an API key or to give the app your password.
 
 **Downloads.** Files a finished download into the library: reads the tags, fixes names and covers, converts if you want it to, and warns before it replaces a better copy with a worse one. It can also drive [slskd](https://github.com/slskd/slskd), a client for the Soulseek network, to search for an album and fetch it. That part is optional, needs a Soulseek account of your own, and what you download with it is your responsibility.
 
@@ -38,7 +38,7 @@ It needs Windows 10 or 11, 64-bit. Everything else it fetches for itself when yo
 ## What it does on your PC, and what it sends
 
 - Your settings and its saved lookups are in `%LOCALAPPDATA%\music-recs`. Delete that folder and the app is as new.
-- The Last.fm key and the Soulseek login are kept in Windows Credential Manager, not in a file.
+- Your Last.fm session and Soulseek login are kept in Windows Credential Manager. Last.fm's password is entered only on Last.fm's website. Existing username/API-key setups continue to work; Disconnect removes the saved connection on this PC. You can also revoke the app's access in your Last.fm settings.
 - It changes files in your music folder only when you click a repair or an import. If your library is laid out another way, choose "Look only, change nothing" at the first start and it will only report.
 - Nothing is sent to the author. The app goes online to look up music (Last.fm, MusicBrainz, the Cover Art Archive, Apple's music search, Deezer, Bandcamp, LRCLIB for lyrics) and to fetch the helpers above. Those services see the artist and album names it asks about.
 - It keeps itself up to date: twice a day it reads one small file from this repository's releases, and when there is a newer version it fetches it, checks that it carries the author's signature, and puts it in the next time you restart. It never restarts by itself. Settings, About has the choice to be told only, or to never check.
@@ -54,6 +54,8 @@ cargo test --release
 ```
 
 The program file is `target\release\bradleys-music-tool.exe`. A test run that keeps away from your real settings: set the environment variable `MUSIC_RECS_DATA` to an empty folder before starting it.
+
+For browser sign-in, set `BMT_LASTFM_API_KEY` and `BMT_LASTFM_SHARED_SECRET` in the build environment to the credentials of your registered Last.fm application. Cargo embeds them in the desktop executable; end users do not configure them. Keep the values out of source control and build logs. Like other desktop clients, an executable cannot make an embedded application secret unrecoverable. Builds without these values keep existing Last.fm connections but cannot start a new browser sign-in. The release script requires both values.
 
 The source is one Rust program (`src`, drawn with [egui](https://github.com/emilk/egui)), including the tag editor and backup worker. The folder and the data folder are named `music-recs` because the app began as the Recs page alone.
 

@@ -10,6 +10,8 @@
 //!                           "click:~START" the first whose words begin so (for words that count up)
 //!   click:X,Y               click at a point (in the window's points, as in a screenshot at 100%)
 //!   scroll:X,Y,DY           turn the wheel with the pointer at a point (negative = down the page)
+//!   middle:X,Y              click the middle mouse button to toggle autoscroll
+//!   move:X,Y                move the pointer without clicking
 //!   key:NAME                press a key (Escape, ArrowDown, ArrowUp, Enter); "key:Ctrl+2" holds Ctrl with it
 //!   type:TEXT               type these letters into the box that has the keyboard (no ";" in them)
 //!   shot:FILE.png           save a picture of the window
@@ -43,6 +45,8 @@ enum Step {
     /// words to find, which of them, and whether to click (or only point at them)
     ClickWords(String, usize, bool),
     ClickAt(Pos2),
+    MiddleAt(Pos2),
+    MoveAt(Pos2),
     Scroll(Pos2, f32),
     Key(egui::Key, bool),
     Type(String),
@@ -74,6 +78,8 @@ impl Script {
             let nums: Vec<f32> = rest.split(',').filter_map(|n| n.trim().parse().ok()).collect();
             steps.push_back(match verb {
                 "wait" => Step::Wait(rest.trim().parse().unwrap_or(1.0)),
+                "middle" if nums.len() == 2 => Step::MiddleAt(pos2(nums[0], nums[1])),
+                "move" if nums.len() == 2 => Step::MoveAt(pos2(nums[0], nums[1])),
                 "click" if nums.len() == 2 && rest.split(',').count() == 2 => Step::ClickAt(pos2(nums[0], nums[1])),
                 "click" => match rest.rsplit_once('#') {
                     Some((words, n)) if n.parse::<usize>().is_ok() => Step::ClickWords(words.to_string(), n.parse().unwrap_or(1), true),
@@ -153,6 +159,12 @@ impl Script {
                 self.say(format!("{now:7.2}  click at {:.0},{:.0}", at.x, at.y));
                 self.click(at);
             }
+            Step::MiddleAt(at) => {
+                self.say(format!("{now:7.2}  middle click at {:.0},{:.0}", at.x, at.y));
+                let button = |pressed| Event::PointerButton { pos: at, button: egui::PointerButton::Middle, pressed, modifiers: Default::default() };
+                self.queue.extend([vec![Event::PointerMoved(at)], vec![button(true)], vec![button(false)], vec![]]);
+            }
+            Step::MoveAt(at) => { self.queue.extend([vec![Event::PointerMoved(at)], vec![]]); }
             Step::Scroll(at, dy) => {
                 self.say(format!("{now:7.2}  scroll {dy} at {:.0},{:.0}", at.x, at.y));
                 let wheel = Event::MouseWheel { unit: egui::MouseWheelUnit::Point, delta: egui::vec2(0.0, dy), phase: egui::TouchPhase::Move, source: egui::MouseWheelSource::Wheel, modifiers: Default::default() };

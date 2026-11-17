@@ -60,10 +60,10 @@ pub fn fit_path(dir: &Path, rel: &str) -> PathBuf {
 
 /// Rough size of the album once converted (lossless shrinks to roughly a third as 320kbps MP3; where
 /// lossless downloads are kept, it is counted at the size it has).
-pub fn output_bytes(u: &Unit, keep_lossless: bool) -> u64 {
+pub fn output_bytes(u: &Unit, keep_lossless: bool, quality: crate::import_quality::Mp3Quality) -> u64 {
     let mut sum = 0u64;
     for t in &u.tracks {
-        sum += if t.lossless && !keep_lossless { (t.size as f64 * 0.4) as u64 } else { t.size };
+        sum += if t.lossless && !keep_lossless { if t.duration.is_finite() && t.duration > 0.0 { (t.duration * quality.reserve_kbps() as f64 * 125.0 * 1.05) as u64 + 1024 * 1024 } else { (t.size as f64 * 0.4) as u64 } } else { t.size };
     }
     for f in u.files.iter().filter(|f| IMAGE_EXT.contains(&ext_lower(&f.path).as_str())) {
         sum += f.size;
@@ -617,7 +617,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         }
     }
 
-    let need = output_bytes(u, ctx.keep_lossless);
+    let need = output_bytes(u, ctx.keep_lossless, ctx.mp3_quality);
     let free = free_bytes(&ctx.library);
     if free < need + 500 * 1024 * 1024 {
         report(&format!("Not enough space on the library drive ({:.1} GB free, needs about {:.1} GB)", free as f64 / 1073741824.0, need as f64 / 1073741824.0), 1.0);
@@ -717,7 +717,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
                 None => format!("{}.mp3", t.rel),
             };
             out = fit_path(&build, &mp3_rel);
-            argv.extend(["-c:a", "libmp3lame", "-b:a", "320k"].iter().map(|s| s.into()));
+            argv.extend(ctx.mp3_quality.encoder_args().iter().map(|s| s.into()));
             if t.sample_rate > 48000 || t.codec.starts_with("dsd_") {
                 argv.extend(["-ar", "44100"].iter().map(|s| s.into())); // MP3 tops out at 48kHz
             }

@@ -268,6 +268,28 @@ fn with_the_setting_off_lossless_downloads_still_become_320_mp3() {
 }
 
 #[test]
+fn quality_presets_control_real_imports_and_keep_existing_mp3_audio() {
+    for quality in crate::import_quality::Mp3Quality::ALL {
+        let mut l = lab("quality-preset");
+        l.ctx.mp3_quality = quality;
+        let dir = l.ctx.source.join("Test Artist - Presets (2020)");
+        quiet(&l, &dir.join("01 One.flac"), 3.0, 0, &[("artist", "Test Artist"), ("album", "Presets"), ("title", "One"), ("track", "1")]);
+        quiet(&l, &dir.join("02 Two.mp3"), 3.0, 128, &[("artist", "Test Artist"), ("album", "Presets"), ("title", "Two"), ("track", "2")]);
+        let original = sound(&l, &dir.join("02 Two.mp3"));
+        settle(&dir);
+        let u = scan(&l, &dir);
+        // Album estimates round to the nearest kbps, including odd VBR averages.
+        assert_eq!(u.kbps, (quality.kbps() + 128).div_ceil(2));
+        assert!(super::lossless_words_at(&u, false, true, quality)[0].0.contains(&format!("MP3 {}", quality.label())));
+        let lib = import_with(&l, &dir, &[], super::lyrics::Choice::Replace);
+        let p = super::probe::probe(&l.ctx.ffprobe, &lib.join("01 One.mp3"));
+        assert_eq!(p.codec, "mp3");
+        if quality.vbr().is_none() { assert!(p.kbps.abs_diff(quality.kbps()) < 10, "{quality:?}: {}", p.kbps); } else { assert!((8..=320).contains(&p.kbps)); }
+        assert_eq!(sound(&l, &lib.join("02 Two.mp3")), original);
+    }
+}
+
+#[test]
 fn a_flac_that_ffmpeg_had_to_rewrite_keeps_its_sound_and_its_tags() {
     // the import's fallback when the tag editor refuses a file: ffmpeg writes it again (the sound copied,
     // not encoded again), and the carry step follows

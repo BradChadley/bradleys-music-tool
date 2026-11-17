@@ -54,6 +54,7 @@ pub struct Ctx {
     /// lossless downloads stay lossless (a FLAC as it is, any other kind as FLAC) instead of becoming
     /// 320 kbps MP3s: the choice in Settings
     pub keep_lossless: bool,
+    pub mp3_quality: crate::import_quality::Mp3Quality,
     /// pending-cleanup.txt is read, changed and rewritten, so one album at a time
     pending_lock: Mutex<()>,
 }
@@ -108,6 +109,7 @@ impl Ctx {
             net_failures: Default::default(),
             lyrics: crate::importer::lyrics::Lookup { dir: cache_dir.join("lyrics"), online: !no_online, timed: true, agent: mk(20) },
             keep_lossless: false,
+            mp3_quality: Default::default(),
             api: mk(20),
             dl: mk(90),
             pending_lock: Mutex::new(()),

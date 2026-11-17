@@ -365,6 +365,7 @@ impl ImportTab {
         ctx.genre_folders = cfg.skip_folders.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty() && crate::library::is_genre_folder(s)).collect();
         ctx.lyrics.timed = !cfg.lyrics_plain;
         ctx.keep_lossless = cfg.keep_lossless;
+        ctx.mp3_quality = cfg.mp3_quality;
         let ctx = Arc::new(ctx);
         quality::load_cache(&ctx.quality_cache);
         unwrap::clean_old(&ctx.work_dir);
@@ -453,7 +454,7 @@ impl ImportTab {
         let (source, library) = Self::folders(cfg);
         // (the kind of lyrics to save, and whether lossless downloads stay lossless, are fixed when the list is
         // set up, so a change to either starts the list over too)
-        source != self.ctx.source || library != self.ctx.library || cfg.lyrics_plain == self.ctx.lyrics.timed || cfg.keep_lossless != self.ctx.keep_lossless
+        source != self.ctx.source || library != self.ctx.library || cfg.lyrics_plain == self.ctx.lyrics.timed || cfg.keep_lossless != self.ctx.keep_lossless || cfg.mp3_quality != self.ctx.mp3_quality
     }
 
     fn selected_count(&self) -> usize {
@@ -566,7 +567,7 @@ impl ImportTab {
             self.status = "Tick at least one album to import.".into();
             return;
         }
-        let need: u64 = todo.iter().map(|&i| import::output_bytes(&self.rows[i].unit, self.ctx.keep_lossless)).sum();
+        let need: u64 = todo.iter().map(|&i| import::output_bytes(&self.rows[i].unit, self.ctx.keep_lossless, self.ctx.mp3_quality)).sum();
         let free = import::free_bytes(&self.ctx.library);
         if !force && free < need + 500 * 1024 * 1024 {
             self.confirm = Some(Confirm {
@@ -1105,6 +1106,7 @@ impl ImportTab {
             self.rows.iter_mut().for_each(|r| r.held = false);
         }
         let head_rect = rect;
+        let quality = self.ctx.mp3_quality;
         let (timed, keep) = (self.ctx.lyrics.timed, self.ctx.keep_lossless);
         let ImportTab { rows, images, selected, list_rect, scroll_to_sel, .. } = self;
         let list = ScrollArea::vertical().id_salt("imp-rows").auto_shrink([false, false]).show(ui, |ui| {
@@ -1114,7 +1116,7 @@ impl ImportTab {
                 let bg = ui.painter().add(egui::Shape::Noop);
                 let fr = Frame::new().inner_margin(Margin { left: ROW_INSET as i8, right: 0, top: 10, bottom: 10 }).show(ui, |ui| {
                     ui.set_width(total - ROW_INSET);
-                    row_ui(ui, &mut rows[i], images, &widths, busy, timed, keep);
+                    row_ui(ui, &mut rows[i], images, &widths, busy, timed, keep, quality);
                 });
                 let rect = fr.response.rect;
                 let is_sel = *selected == Some(i);
@@ -1148,6 +1150,7 @@ impl ImportTab {
     fn details(&mut self, ui: &mut Ui, across: bool) {
         let lib = self.ctx.library.clone();
         // (what happens to flagged lyrics can be chosen until the album is imported)
+        let quality = self.ctx.mp3_quality;
         let (timed, idle, keep) = (self.ctx.lyrics.timed, self.phase == Phase::Idle, self.ctx.keep_lossless);
         let ImportTab { rows, images, selected, .. } = self;
         let quiet_words = |ui: &mut Ui, text: &str| {
@@ -1180,7 +1183,7 @@ impl ImportTab {
                         ui.set_width(w);
                         ScrollArea::vertical().id_salt(("imp-details", n)).auto_shrink([false, false]).show(ui, |ui| {
                             if n == 0 {
-                                details_sound(ui, row, images, keep);
+                                details_sound(ui, row, images, keep, quality);
                             } else {
                                 details_changes(ui, row, &lib, true, timed, idle);
                             }
@@ -1195,7 +1198,7 @@ impl ImportTab {
             // (a square for the picture; an album with no picture at all gets a short strip instead)
             details_cover(ui, row, images, w, if row.thumb_key().is_empty() { 84.0 } else { w });
             ui.add_space(12.0);
-            details_sound(ui, row, images, keep);
+            details_sound(ui, row, images, keep, quality);
             details_changes(ui, row, &lib, false, timed, idle);
             ui.add_space(16.0);
         });
@@ -1218,7 +1221,7 @@ fn details_cover(ui: &mut Ui, row: &Row, images: &mut images::Images, w: f32, h:
 
 /// The side card's first words: whose album it is, which cover it gets, and how it sounds (with the
 /// picture of one track's sound).
-fn details_sound(ui: &mut Ui, row: &Row, images: &mut images::Images, keep: bool) {
+fn details_sound(ui: &mut Ui, row: &Row, images: &mut images::Images, keep: bool, quality: crate::import_quality::Mp3Quality) {
     let w = ui.available_width();
     ui.add(Label::new(RichText::new(&row.artist).size(17.0).strong().color(TEXT())).wrap());
     ui.add(Label::new(RichText::new(&row.folder).size(14.0).color(DIM())).wrap());
@@ -1228,7 +1231,7 @@ fn details_sound(ui: &mut Ui, row: &Row, images: &mut images::Images, keep: bool
     side_caption(ui, "QUALITY", false);
     ui.add(Label::new(RichText::new(&row.unit.verdict.summary).size(12.5).color(TEXT())).wrap());
     // what the import makes of a lossless album: in blue when it becomes something else, quietly when it stays
-    for (words, change) in lossless_words(&row.unit, keep, true) {
+    for (words, change) in lossless_words_at(&row.unit, keep, true, quality) {
         ui.add_space(2.0);
         ui.add(Label::new(RichText::new(words).size(12.5).color(if change { ACCENT() } else { FAINT() })).wrap());
     }
@@ -1254,7 +1257,11 @@ fn details_sound(ui: &mut Ui, row: &Row, images: &mut images::Images, keep: bool
 /// What the import makes of an album's lossless tracks, in a few words: (the words, whether they say a
 /// change). Nothing for an album with no lossless track. `keep`: lossless downloads are kept (the choice in
 /// Settings). `side`: the words for the side card; the list keeps the words it has always had for MP3.
-fn lossless_words(u: &Unit, keep: bool, side: bool) -> Vec<(String, bool)> {
+#[cfg(test)]
+fn lossless_words(u: &Unit, keep: bool, side: bool) -> Vec<(String, bool)> { lossless_words_at(u, keep, side, Default::default()) }
+
+fn lossless_words_at(u: &Unit, keep: bool, side: bool, quality: crate::import_quality::Mp3Quality) -> Vec<(String, bool)> {
+    let rate = quality.label();
     if u.convert == 0 {
         return vec![];
     }
@@ -1266,8 +1273,8 @@ fn lossless_words(u: &Unit, keep: bool, side: bool) -> Vec<(String, bool)> {
         let words = match (side, mp3 == n) {
             (false, true) => "All converted to MP3".to_string(),
             (false, false) => format!("{mp3} converted to MP3"),
-            (true, true) => "Becomes MP3 320".to_string(),
-            (true, false) => format!("{mp3} of {n} {} MP3 320", if mp3 == 1 { "becomes" } else { "become" }),
+            (true, true) => format!("Becomes MP3 {rate}"),
+            (true, false) => format!("{mp3} of {n} {} MP3 {rate}", if mp3 == 1 { "becomes" } else { "become" }),
         };
         out.push((words, true));
     }
@@ -1664,7 +1671,7 @@ fn name_edit(ui: &mut Ui, text: &mut String, size: f32, color: Color32, editable
 
 /// One album, read left to right: import it or not, what it is, which cover, what happens to the tracks,
 /// how good it is, where it stands.
-fn row_ui(ui: &mut Ui, row: &mut Row, images: &mut images::Images, widths: &[f32; 5], busy: bool, timed: bool, keep: bool) {
+fn row_ui(ui: &mut Ui, row: &mut Row, images: &mut images::Images, widths: &[f32; 5], busy: bool, timed: bool, keep: bool, quality: crate::import_quality::Mp3Quality) {
     let editable = !row.done && !busy;
     // albums that will be imported are bright; the rest step back
     let name_color = if row.left_out.is_some() { FAINT() } else if row.include { TEXT() } else { DIM() };
@@ -1796,7 +1803,7 @@ fn row_ui(ui: &mut Ui, row: &mut Row, images: &mut images::Images, widths: &[f32
             say(&row.unit.verdict.short, if row.quality_bad() { RED() } else { GREEN() });
             ui.add(Label::new(line).wrap());
             // (a FLAC that stays as it is is said quietly: nothing happens to it)
-            for (words, change) in lossless_words(&row.unit, keep, false) {
+            for (words, change) in lossless_words_at(&row.unit, keep, false, quality) {
                 ui.label(RichText::new(words).size(11.5).color(if change { DIM() } else { FAINT() }));
             }
             if !row.unit.fixes.is_empty() {

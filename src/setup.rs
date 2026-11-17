@@ -13,7 +13,7 @@ use egui::{vec2, FontId, Label, Rect, RichText, ScrollArea, Sense, Ui};
 /// The page's one stretch of the window.
 const PAGE: f32 = 1000.0;
 /// The two login cards, side by side, are never lower than this.
-const CARD_H: f32 = 252.0;
+
 
 pub(crate) struct Setup {
     /// the card that asks for the music folder and says what is in it
@@ -23,6 +23,7 @@ pub(crate) struct Setup {
     /// lossless downloads stay lossless; for someone new they become MP3 320 (a third of the room, and they
     /// play on anything), the choice shown first on the card
     keep_lossless: bool,
+    mp3_quality: crate::import_quality::Mp3Quality,
     slsk_user: String,
     slsk_pass: String,
     slsk_show: bool,
@@ -36,7 +37,7 @@ impl Setup {
         // (a test run can start with a made-up Soulseek login typed in, since a script cannot type:
         // `MUSIC_RECS_SETUP_LOGIN=name:password`)
         let (slsk_user, slsk_pass) = cards::test_switch("MUSIC_RECS_SETUP_LOGIN").and_then(|l| l.split_once(':').map(|(n, p)| (n.to_string(), p.to_string()))).unwrap_or_default();
-        Self { folder: FolderCard::default(), look_only: true, keep_lossless: false, slsk_user, slsk_pass, slsk_show: false, slsk_trouble: None, ffmpeg: (-10.0, false) }
+        Self { folder: FolderCard::default(), look_only: true, keep_lossless: false, mp3_quality: Default::default(), slsk_user, slsk_pass, slsk_show: false, slsk_trouble: None, ffmpeg: (-10.0, false) }
     }
 
     /// A Soulseek login was typed in: both parts are there.
@@ -60,6 +61,7 @@ impl Setup {
         }
         self.folder.stop();
         app.cfg.keep_lossless = self.keep_lossless;
+        app.cfg.mp3_quality = self.mp3_quality;
         app.cfg.look_only = self.folder.found().is_some_and(|f| f.odd()) && self.look_only;
         app.cfg.setup_done = true;
         app.cfg.last_page = "home".to_string();
@@ -96,31 +98,40 @@ pub(crate) fn screen(app: &mut App, ui: &mut Ui) {
             // A shallow needs card, followed by the two login cards.
             // Faint, and nothing in them takes a click, until there is a folder
             let ready = s.folder.ready();
-            theme::card_row(ui, "setup-needs", left, wide, 1, 1, GAP, vec2(PAD.x, 16.0), 0.0, !ready, |_, ui| cards::needs(ui, &mut s.ffmpeg));
-            ui.add_space(GAP);
-            let cols = if wide >= 820.0 { 2 } else { 1 };
-            // (one under the other, each is only as tall as what it holds)
-            theme::card_row(ui, "setup-card", left, wide, cols, 2, GAP, PAD, if cols == 2 { CARD_H } else { 0.0 }, !ready, |i, ui| match i {
+            cards::needs(ui, &mut s.ffmpeg, left, wide, !ready);
+            theme::card_row(ui, "setup-card", left, wide, 1, 1, 8.0, vec2(PAD.x, 16.0), 0.0, !ready, |_, ui| {
+                theme::caption(ui, "ACCOUNTS");
+                ui.add_space(12.0);
+                cards::accounts(ui, |ui, i| {
+                    let _: Option<(String, egui::Color32)> = match i {
                 0 => {
                     cards::lastfm(app, ui);
-                    Some(("Your listening history makes Recs better. It works without it.".to_string(), FAINT()))
+                    None
                 }
                 _ => {
-                    let login = cards::Slsk { user: &mut s.slsk_user, pass: &mut s.slsk_pass, show: &mut s.slsk_show, saved: false, optional: true };
+                    let login = cards::Slsk { user: &mut s.slsk_user, pass: &mut s.slsk_pass, show: &mut s.slsk_show, saved: false };
                     cards::soulseek(ui, login, None);
                     let fetched = format!("The Soulseek client ({} MB) is fetched when you start.", (Helper::Soulseek.pin().size as f64 / 1_000_000.0).round());
-                    match &s.slsk_trouble {
+                    let note = match &s.slsk_trouble {
                         Some(why) => Some((why.clone(), WARN())),
                         None if s.has_login() && !slskd::exe().exists() => Some((fetched, FAINT())),
-                        None => Some(("Use an account of its own, not the one you chat with.".to_string(), FAINT())),
+                        None => Some(("Optional. Your Soulseek login is saved when you choose Start.".to_string(), FAINT())),
+                    };
+                    if let Some((words, color)) = note.filter(|_| ui.data(|d| d.get_temp::<String>(egui::Id::unique("soulseek-edit"))).is_some()) {
+                        ui.add_space(8.0);
+                        cards::module_note(ui, &words, color);
                     }
+                    None
                 }
+                    };
+                });
+                None
             });
 
             // what an import does with a lossless album: a card of its own, the full width, faint like the three
             ui.add_space(GAP);
-            theme::card_row(ui, "setup-lossless", left, wide, 1, 1, GAP, PAD, 0.0, !ready, |_, ui| {
-                cards::lossless(ui, &mut s.keep_lossless);
+            theme::card_row(ui, "setup-lossless", left, wide, 1, 1, 8.0, vec2(PAD.x, 12.0), 0.0, !ready, |_, ui| {
+                cards::lossless(ui, &mut s.keep_lossless, &mut s.mp3_quality);
                 None
             });
 

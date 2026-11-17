@@ -30,7 +30,7 @@ const ROWS: f32 = 680.0;
 /// How wide the Look card's strip is beside the pages.
 pub(crate) const BESIDE: f32 = 392.0;
 /// Basics' three cards stand side by side from this width of the page's stretch.
-const THREE: f32 = 820.0;
+
 
 /// What Settings keeps between frames beyond the settings themselves.
 pub(crate) struct State {
@@ -71,6 +71,7 @@ pub(crate) fn page(app: &mut App, ui: &mut Ui) {
     changed |= st.folder.tick(app, &ctx).picked;
     egui::CentralPanel::default().frame(theme::page_frame()).show(ui, |ui| {
         ScrollArea::vertical().id_salt(("settings-scroll", app.settings_tab)).auto_shrink([false, false]).show(ui, |ui| {
+            if !egui::Popup::is_any_open(ui.ctx()) { crate::auto_scroll(ui, app.auto); }
             // (Basics keeps the first-start screen's cards side by side; the other sections are one column of rows)
             let (left, wide) = theme::column(ui, if app.settings_tab == BASICS { PAGE } else { ROWS });
             top(app, ui, now);
@@ -97,6 +98,7 @@ pub(crate) fn beside(app: &mut App, ui: &mut Ui) {
     st.shown = true;
     let mut changed = false;
     ScrollArea::vertical().id_salt("look-beside-scroll").auto_shrink([false, false]).show(ui, |ui| {
+        if !egui::Popup::is_any_open(ui.ctx()) { crate::auto_scroll(ui, app.auto); }
         let (left, wide) = (ui.max_rect().left(), ui.available_width());
         theme::panel(ui, left, wide, PAD, "look-beside", |ui| {
             changed |= themes(app, &mut st, ui, now);
@@ -222,13 +224,15 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
     };
     let mut save = false;
 
-    theme::card_row(ui, "settings-needs", left, wide, 1, 1, GAP, vec2(PAD.x, 16.0), 0.0, false, |_, ui| cards::needs(ui, &mut st.ffmpeg));
-    ui.add_space(GAP);
-    let cols = if wide >= THREE { 2 } else { 1 };
-    theme::card_row(ui, "settings-basics", left, wide, cols, 2, GAP, PAD, if cols == 2 { 220.0 } else { 0.0 }, false, |i, ui| match i {
+    cards::needs(ui, &mut st.ffmpeg, left, wide, false);
+    theme::card_row(ui, "settings-basics", left, wide, 1, 1, 8.0, vec2(PAD.x, 16.0), 0.0, false, |_, ui| {
+        theme::caption(ui, "ACCOUNTS");
+        ui.add_space(12.0);
+        cards::accounts(ui, |ui, i| {
+            let _: Option<(String, egui::Color32)> = match i {
         0 => {
             changed |= cards::lastfm(app, ui);
-            Some(("Your listening history makes Recs better. It works without it.".to_string(), FAINT()))
+            None
         }
         _ => {
             let mut row = |ui: &mut Ui| {
@@ -246,7 +250,7 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
                 };
                 if typed || !has_saved {
                     // a login to save: the card's one loud word, gray until a name and a password are there
-                    save = theme::main_action(ui, "Save login and sign in", ready).clicked();
+                    save = cards::account_action(ui, "Sign in", ready).clicked();
                     if let Some(why) = &trouble {
                         small(ui, why, WARN());
                     }
@@ -291,22 +295,28 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
                     },
                 }
             };
-            let login = cards::Slsk { user: &mut app.slsk_user, pass: &mut app.slsk_pass, show: &mut app.slsk_show, saved: has_saved, optional: !has_saved };
+            let login = cards::Slsk { user: &mut app.slsk_user, pass: &mut app.slsk_pass, show: &mut app.slsk_show, saved: has_saved };
             cards::soulseek(ui, login, Some(&mut row));
-            Some(if typed && !client {
+            let (note, color) = if typed && !client {
                 (format!("The Soulseek client ({} MB) is fetched when you save.", (Helper::Soulseek.pin().size as f64 / 1_000_000.0).round()), FAINT())
             } else if has_saved {
                 ("Nothing is shared with other Soulseek users.".to_string(), FAINT())
             } else {
-                ("Use an account of its own, not the one you chat with.".to_string(), FAINT())
-            })
+                ("Use a separate Soulseek account for this app.".to_string(), FAINT())
+            };
+            if ui.data(|d| d.get_temp::<String>(egui::Id::unique("soulseek-edit"))).is_some() { ui.add_space(8.0); cards::module_note(ui, &note, color); }
+            None
         }
+            };
+        });
+        None
     });
     if save {
         app.slsk_msg = match slskd::save_login(&app.slsk_user, &app.slsk_pass) {
             Ok(()) => {
                 // the password is not kept on the page once it is in Credential Manager
                 app.slsk_pass.clear();
+                ctx.data_mut(|d| d.remove::<String>(egui::Id::unique("soulseek-edit")));
                 app.slsk_show = false;
                 app.path_ok.remove("slsk-login");
                 app.attention_cache.0 = -10.0;
@@ -321,12 +331,10 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
             Err(e) => Some(Err(e)),
         };
     }
-    ui.add_space(14.0);
-    theme::centered_wrapped(ui, "Both logins are kept in Windows Credential Manager on this PC, not in a file and not in the backups.", 12.5, FAINT(), wide);
-    // what an import does with a lossless album: a card of its own, the full width
-    ui.add_space(GAP);
-    theme::card_row(ui, "settings-lossless", left, wide, 1, 1, GAP, PAD, 0.0, false, |_, ui| {
-        changed |= cards::lossless(ui, &mut app.cfg.keep_lossless);
+
+    ui.add_space(8.0);
+    theme::card_row(ui, "settings-lossless", left, wide, 1, 1, 8.0, vec2(PAD.x, 12.0), 0.0, false, |_, ui| {
+        changed |= cards::lossless(ui, &mut app.cfg.keep_lossless, &mut app.cfg.mp3_quality);
         None
     });
     changed

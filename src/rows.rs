@@ -177,9 +177,14 @@ fn menu(opener: &Response, name: &str, items: &[Item], is_on: &dyn Fn(usize) -> 
         .gap(4.0)
         .frame(frame)
         .width(width)
-        .close_behavior(if many { egui::PopupCloseBehavior::CloseOnClickOutside } else { egui::PopupCloseBehavior::CloseOnClick });
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside);
     popup
         .show(|ui| {
+            egui::ScrollArea::vertical().id_salt(("choices-scroll", name))
+                .max_height(400.0_f32.min((ui.ctx().content_rect().height() - 40.0).max(80.0)))
+                .show(ui, |ui| {
+            let auto = ui.ctx().data(|d| d.get_temp::<(egui::Pos2, f32)>(egui::Id::unique("menu-autoscroll")));
+            crate::auto_scroll(ui, auto);
             ui.spacing_mut().item_spacing.y = 2.0;
             let mut picked = None;
             for (n, it) in items.iter().enumerate() {
@@ -206,9 +211,11 @@ fn menu(opener: &Response, name: &str, items: &[Item], is_on: &dyn Fn(usize) -> 
                 }
                 if r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
                     picked = Some(n);
+                    if !many { ui.close(); }
                 }
             }
             picked
+            }).inner
         })
         .and_then(|r| r.inner)
 }

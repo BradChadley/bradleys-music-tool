@@ -5,6 +5,8 @@ mod albumlink;
 mod backup;
 mod cards;
 mod config;
+mod import_quality;
+mod lastfm_auth;
 mod covers;
 mod dl_facts;
 mod downloads;
@@ -269,9 +271,8 @@ struct App {
     incomplete: bool,
     /// Your artists filter: 0 all, 1 played but not owned, 2 owned but never played
     art_filter: u8,
-    /// "Test Last.fm" button result
-    test_rx: Option<Receiver<Result<String, String>>>,
-    test_result: Option<Result<String, String>>,
+    /// Browser authorization, including an in-flight request that can be cancelled.
+    lastfm_auth: lastfm_auth::Flow,
     pin_ui: Option<PinUi>,
     pin_rx: Option<Receiver<Result<Vec<engine::Candidate>, String>>>,
     cfg: Config,
@@ -287,7 +288,6 @@ struct App {
     errors: Vec<String>,
     tab: Tab,
     show_settings: bool,
-    show_key: bool,
     filter: String,
     show_hidden: bool,
     rel_sort: RelSort,
@@ -422,8 +422,7 @@ impl App {
             album_sort: 0,
             incomplete: false,
             art_filter: 0,
-            test_rx: None,
-            test_result: None,
+            lastfm_auth: lastfm_auth::Flow::default(),
             pin_ui: None,
             pin_rx: None,
             errors: cfg.load_error.clone().into_iter().collect(),
@@ -439,7 +438,6 @@ impl App {
             warnings: vec![],
             tab,
             show_settings,
-            show_key: false,
             filter: String::new(),
             show_hidden: false,
             rel_sort: RelSort::Newest,
@@ -496,12 +494,17 @@ impl App {
         let (mid, left, esc, pos, dt) = ctx.input(|i| {
             (i.pointer.button_pressed(PointerButton::Middle), i.pointer.button_pressed(PointerButton::Primary), i.key_pressed(egui::Key::Escape), i.pointer.hover_pos(), i.stable_dt)
         });
+        if self.autoscroll.is_some() && esc {
+            // Stopping autoscroll must not also close Settings or the open menu.
+            ctx.input_mut(|i| { i.consume_key(egui::Modifiers::NONE, egui::Key::Escape); });
+        }
         match self.autoscroll {
             Some(_) if mid || left || esc => self.autoscroll = None,
             None if mid => self.autoscroll = pos,
             _ => {}
         }
         self.auto = None;
+        ctx.data_mut(|d| d.remove::<(egui::Pos2, f32)>(egui::Id::unique("menu-autoscroll")));
         let Some(anchor) = self.autoscroll else { return };
         ctx.request_repaint();
         ctx.set_cursor_icon(egui::CursorIcon::AllScroll);
@@ -510,6 +513,7 @@ impl App {
         let d = (dy.abs() - 8.0).max(0.0);
         let speed = (d * 18.0 + d * d * 1.5) * dy.signum(); // points per second
         self.auto = Some((anchor, speed * dt.min(0.05)));
+        ctx.data_mut(|d| d.insert_temp(egui::Id::unique("menu-autoscroll"), self.auto.unwrap()));
         // a small marker where it started
         let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::unique("autoscroll")));
         painter.circle_filled(anchor, 13.0, Color32::from_black_alpha(170));
@@ -640,15 +644,10 @@ impl App {
         }
     }
 
-    /// Results from the Settings "Test" button and the "Wrong artist?" picker. Kept separate from
+    /// Results from Last.fm sign-in and the "Wrong artist?" picker. Kept separate from
     /// `poll`, which only runs while a refresh is in progress.
-    fn poll_side_tasks(&mut self) {
-        if let Some(rx) = &self.test_rx {
-            if let Ok(r) = rx.try_recv() {
-                self.test_result = Some(r);
-                self.test_rx = None;
-            }
-        }
+    fn poll_side_tasks(&mut self, ctx: &egui::Context) {
+        if self.lastfm_auth.tick(&mut self.cfg, ctx) { self.lastfm_changed(); }
         if let Some(rx) = &self.pin_rx {
             if let Ok(r) = rx.try_recv() {
                 if let Some(p) = &mut self.pin_ui {
@@ -699,17 +698,22 @@ impl App {
         }
     }
 
-    /// Settings → "Test": checks the username and API key right away.
-    fn test_lastfm(&mut self, ctx: &egui::Context) {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        self.test_rx = Some(rx);
-        self.test_result = None;
-        let (cfg, net, ctx) = (self.cfg.clone(), self.net.clone(), ctx.clone());
-        std::thread::spawn(move || {
-            let r = sources::lfm_user_info(&net, &cfg.lastfm_user, &cfg.lastfm_api_key);
-            let _ = tx.send(r);
-            ctx.request_repaint();
-        });
+    /// Personal recommendations must be refreshed after changing the Last.fm account.
+    fn lastfm_changed(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.rx = None;
+        self.running = false;
+        self.more = false;
+        self.progress.clear();
+        self.status.clear();
+        self.warnings.clear();
+        self.errors.clear();
+        (self.detail_tx, self.detail_rx) = crossbeam_channel::unbounded();
+        self.results = Default::default();
+        self.detail_cache.clear();
+        self.detail = None;
+        let _ = std::fs::remove_file(engine::results_path());
+        self.attention_cache.0 = -10.0;
     }
 
     fn open_artist(&mut self, name: String, because: Vec<String>, ctx: &egui::Context) {
@@ -1189,7 +1193,7 @@ impl eframe::App for App {
         self.update_autoscroll(&ctx);
         self.poll();
         self.poll_detail();
-        self.poll_side_tasks();
+        self.poll_side_tasks(&ctx);
         self.images.poll(&ctx);
         // the first start: one screen in place of the pages, until "Start" is clicked there
         if self.setup.is_some() {

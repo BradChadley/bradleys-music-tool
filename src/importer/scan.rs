@@ -305,12 +305,12 @@ pub fn update_unit_action(ctx: &Ctx, u: &mut Unit) {
     // (a download that stays lossless and passed its own check as real lossless: only where lossless downloads are kept)
     let lossless = stays_lossless(ctx, u) && u.verdict.fake == Fake::None;
     let mut better: Vec<String> = vec![];
-    if !have.lossless && have.kbps > 0 && have.kbps < 200 && u.kbps >= have.kbps + 64 {
+    if !(u.convert > 0 && !ctx.keep_lossless && ctx.mp3_quality.vbr().is_some()) && !have.lossless && have.kbps > 0 && have.kbps < 200 && u.kbps >= have.kbps + 64 {
         better.push(if lossless { format!("your copy is {}kbps, this one is lossless", have.kbps) } else { format!("your copy is {}kbps, this one will be {}kbps", have.kbps, u.kbps) });
     }
     // more tracks only wins if the sound is not worse: never trade a lossless or clearly higher-bitrate copy for a longer one
     // (a lossless copy is only matched by a download that stays lossless)
-    let not_worse = if have.lossless { lossless } else { have.kbps == 0 || u.kbps + 32 >= have.kbps };
+    let not_worse = if u.convert > 0 && !ctx.keep_lossless && ctx.mp3_quality.vbr().is_some() { false } else if have.lossless { lossless } else { have.kbps == 0 || u.kbps + 32 >= have.kbps };
     if have.tracks > 0 && u.tracks.len() > have.tracks && u.include && not_worse {
         better.push(format!("your copy has {} tracks, this has {}", have.tracks, u.tracks.len()));
     }
@@ -1113,7 +1113,7 @@ pub fn read_unit(ctx: &Ctx, item: &Path, stage: &dyn Fn(&'static str)) -> Result
 
     // quality of this download as it will end up (lossless becomes 320kbps MP3; a lossless track that is
     // kept counts as 320 too, since a lossless file's own bitrate says nothing about how it sounds)
-    let new_kbps = (tracks.iter().map(|t| if t.lossless { 320.0 } else { t.kbps as f64 }).sum::<f64>() / tracks.len().max(1) as f64).round() as u32;
+    let new_kbps = (tracks.iter().map(|t| if t.lossless { if ctx.keep_lossless { 320.0 } else { ctx.mp3_quality.kbps() as f64 } } else { t.kbps as f64 }).sum::<f64>() / tracks.len().max(1) as f64).round() as u32;
 
     let convert = tracks.iter().filter(|t| t.lossless).count();
     let mut u = Unit {

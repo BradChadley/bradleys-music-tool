@@ -4,7 +4,7 @@
 use crate::helpers::{self, Helper};
 use crate::library_page::commas;
 use crate::theme::{self, ACCENT2, DIM, FAINT, GREEN, TEXT, WARN};
-use crate::{rows, script, util, App};
+use crate::{rows, script, App};
 use crossbeam_channel::Receiver;
 use egui::{pos2, vec2, Align, Color32, FontId, Label, Layout, Margin, Rect, RichText, Sense, TextEdit, Ui};
 use std::path::{Path, PathBuf};
@@ -516,83 +516,89 @@ fn green_dot(ui: &mut Ui) {
 }
 
 
-/// The card of what the app needs: ffmpeg, with how it stands on this PC and the
-/// word that gets it. `ffmpeg` is whether ffmpeg is there and when that was last looked at.
-pub(crate) fn needs(ui: &mut Ui, ffmpeg: &mut (f64, bool)) -> Foot {
+/// A compact notice only while ffmpeg or ffprobe is missing. The caller allocates no empty card.
+pub(crate) fn needs(ui: &mut Ui, ffmpeg: &mut (f64, bool), left: f32, wide: f32, faint: bool) {
     let ctx = ui.ctx().clone();
     let now = ui.input(|i| i.time);
-    // (looked for at most every two seconds, and again as soon as a fetch has put it in place)
     if now - ffmpeg.0 > 2.0 {
         *ffmpeg = (now, crate::importer::tools::find_tool("ffmpeg").is_ok() && crate::importer::tools::find_tool("ffprobe").is_ok());
     }
-    let horizontal = ui.available_width() >= 520.0;
-    ui.horizontal_top(|ui| {
-        if horizontal {
-            ui.allocate_ui_with_layout(vec2(150.0, 34.0), Layout::top_down(Align::Min), |ui| {
-                ui.add_space(9.0);
-                theme::caption(ui, "WHAT IT NEEDS");
-            });
+    ctx.request_repaint_after(std::time::Duration::from_secs(2));
+    if ffmpeg.1 { return; }
+    theme::card_row(ui, "missing-ffmpeg", left, wide, 1, 1, GAP, vec2(PAD.x, 14.0), 0.0, faint, |_, ui| {
+        match helpers::state(Helper::Ffmpeg) {
+            helpers::State::Getting(done, total) => {
+                need(ui, "Getting ffmpeg", &helpers::amount(done, total), FAINT(), |ui| {
+                    if theme::quiet(ui, "Stop", 14.0, true).clicked() { helpers::stop(Helper::Ffmpeg); }
+                });
+                ui.add_space(4.0);
+                theme::progress(ui, done as f32 / total.max(1) as f32, ui.available_width(), ACCENT2());
+                ffmpeg.0 = -10.0;
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            helpers::State::Unpacking => {
+                need(ui, "Setting up ffmpeg", "Imports and checks will be ready shortly.", FAINT(), |ui| { ui.add(egui::Spinner::new().size(13.0).color(DIM())); });
+                ffmpeg.0 = -10.0;
+                ctx.request_repaint_after(std::time::Duration::from_millis(200));
+            }
+            helpers::State::Failed(why) => need(ui, "Could not get ffmpeg", &why, WARN(), |ui| {
+                if theme::main_action_sized(ui, "Try again", 14.0, true).clicked() { helpers::start(Helper::Ffmpeg, &ctx); }
+            }),
+            helpers::State::Idle => {
+                let under = format!("ffmpeg is missing. Download once, {} MB.", (Helper::Ffmpeg.pin().size as f64 / 1_000_000.0).round());
+                need(ui, "Enable imports and checks", &under, FAINT(), |ui| {
+                    if theme::main_action_sized(ui, "Get ffmpeg", 14.0, true).clicked() { helpers::start(Helper::Ffmpeg, &ctx); }
+                });
+            }
         }
-        ui.vertical(|ui| {
-            ui.set_width(ui.available_width());
-            if !horizontal {
-                theme::caption(ui, "WHAT IT NEEDS");
-                ui.add_space(10.0);
-            }
-            let state = helpers::state(Helper::Ffmpeg);
-            match &state {
-                helpers::State::Getting(done, total) => {
-                    need(ui, "ffmpeg", &helpers::amount(*done, *total), FAINT(), |ui| {
-                        if theme::quiet(ui, "Stop", 14.0, true).clicked() {
-                            helpers::stop(Helper::Ffmpeg);
-                        }
-                    });
-                    ui.add_space(2.0);
-                    theme::progress(ui, *done as f32 / (*total).max(1) as f32, ui.available_width(), ACCENT2());
-                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
-                }
-                helpers::State::Unpacking => {
-                    need(ui, "ffmpeg", "Unpacking", FAINT(), |ui| drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))));
-                    ffmpeg.0 = -10.0;
-                }
-                helpers::State::Failed(why) => need(ui, "ffmpeg", why, WARN(), |ui| {
-                    if theme::main_action_sized(ui, "Try again", 14.0, true).clicked() {
-                        helpers::start(Helper::Ffmpeg, &ctx);
-                    }
-                }),
-                // there: only a green check. Not there: in its place the word that gets it, and its size
-                helpers::State::Idle if ffmpeg.1 => need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| rows::there(ui, "there:ffmpeg")),
-                helpers::State::Idle => {
-                    let size = format!("{} MB", (Helper::Ffmpeg.pin().size as f64 / 1_000_000.0).round());
-                    need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| {
-                        ui.label(RichText::new(size).size(12.5).color(FAINT()));
-                        if theme::main_action_sized(ui, "Get it", 14.0, true).clicked() {
-                            helpers::start(Helper::Ffmpeg, &ctx);
-                        }
-                    });
-                }
-            }
-        });
+        None
     });
-    None
+    ui.add_space(GAP);
 }
 
 // ------------------------------------------------------------------ the two logins
 
-/// A card's small heading, with "optional" at its right end while the card may be left alone.
-fn head(ui: &mut Ui, name: &str, optional: bool) {
-    ui.horizontal(|ui| {
-        theme::caption(ui, name);
-        if optional {
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(RichText::new("optional").size(12.0).color(FAINT())));
-        }
-    });
-}
-
 /// A box to type in, as wide as its card.
 fn box_(ui: &mut Ui, edit: TextEdit) -> egui::Response {
     let w = ui.available_width();
-    ui.add_sized([w, 28.0], edit.clip_text(true).desired_width(w))
+    let r = ui.add_sized([w, 34.0], edit.clip_text(true).desired_width(w).font(FontId::proportional(13.0)).text_color(TEXT())
+        .frame(egui::Frame::new().fill(theme::BG()).stroke(egui::Stroke::new(1.0, theme::BORDER())).corner_radius(6).inner_margin(Margin::symmetric(10, 8))));
+    if r.has_focus() || r.hovered() {
+        ui.painter().rect_stroke(r.rect, 6, egui::Stroke::new(1.0, if r.has_focus() { ACCENT2() } else { DIM() }), egui::StrokeKind::Inside);
+    }
+    r
+}
+
+/// Shared restrained action style for both account cards.
+pub(crate) fn account_action(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    theme::quiet(ui, label, 13.0, enabled)
+}
+
+pub(crate) fn account_divider(ui: &mut Ui) {
+    ui.add_space(10.0);
+    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().hline(r.x_range(), r.top(), egui::Stroke::new(1.0, theme::BORDER().gamma_multiply(0.6)));
+    ui.add_space(10.0);
+}
+
+/// Two quiet account sections share one surface; narrow windows stack them.
+pub(crate) fn accounts(ui: &mut Ui, mut draw: impl FnMut(&mut Ui, usize)) {
+    if ui.available_width() < 620.0 {
+        draw(ui, 0);
+        account_divider(ui);
+        draw(ui, 1);
+    } else {
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.x = 40.0;
+            let top = ui.cursor().top();
+            let middle = ui.available_rect_before_wrap().center().x;
+            ui.columns(2, |cols| {
+                draw(&mut cols[0], 0);
+                draw(&mut cols[1], 1);
+            });
+            ui.painter().vline(middle, top..=ui.min_rect().bottom(), egui::Stroke::new(1.0, theme::BORDER().gamma_multiply(0.6)));
+        });
+    }
 }
 
 /// A box for a password or a key, as wide as its card: its letters are dots until "show" at its right
@@ -603,7 +609,7 @@ fn secret(ui: &mut Ui, name: &str, text: &mut String, hint: &str, show: &mut boo
     // the word is the box's own last part, so the box keeps its look and the typed letters stop short
     // of it; bright under the pointer (as it stood a frame ago: the box is drawn before the word is asked)
     let hot = ui.ctx().read_response(id).is_some_and(|r| r.hovered());
-    let r = box_(ui, TextEdit::singleline(text).hint_text(hint).password(!*show).suffix(RichText::new(format!(" {word}")).size(12.0).color(if hot { TEXT() } else { FAINT() })));
+    let r = box_(ui, TextEdit::singleline(text).hint_text(RichText::new(hint).color(FAINT())).password(!*show).suffix(RichText::new(format!(" {word}")).size(12.0).color(if hot { TEXT() } else { FAINT() })));
     let wide = ui.painter().layout_no_wrap(word.to_string(), FontId::proportional(12.0), FAINT()).size().x;
     let at = Rect::from_min_max(pos2(r.rect.right() - wide - 18.0, r.rect.top()), r.rect.right_bottom());
     let w = ui.interact(at, id, Sense::click());
@@ -614,41 +620,82 @@ fn secret(ui: &mut Ui, name: &str, text: &mut String, hint: &str, show: &mut boo
     r
 }
 
-/// The Last.fm card: the name, the key, and the words that get a key and check the login. True when the
-/// name or the key was changed (Settings saves then; the first-start screen saves at "Start").
+/// Browser sign-in uses the application's credentials. Users never need developer keys.
 pub(crate) fn lastfm(app: &mut App, ui: &mut Ui) -> bool {
-    let ctx = ui.ctx().clone();
-    head(ui, "LAST.FM", !app.cfg.has_lastfm());
-    ui.add_space(8.0);
-    let mut changed = box_(ui, TextEdit::singleline(&mut app.cfg.lastfm_user).hint_text("User name")).changed();
-    ui.add_space(6.0);
-    changed |= secret(ui, "lastfm", &mut app.cfg.lastfm_api_key, "API key", &mut app.show_key).changed();
-    if changed {
-        // what a check said was about the login as it stood
-        app.test_result = None;
+    module_row(ui, "Last.fm", "Listening history & recommendations", |ui| lastfm_controls(app, ui))
+}
+
+/// All three modules share one label column and one control column.
+fn module_row<R>(ui: &mut Ui, title: &str, hint: &str, controls: impl FnOnce(&mut Ui) -> R) -> R {
+    let width = ui.available_width();
+    let label = |ui: &mut Ui| {
+        theme::caption(ui, &title.to_uppercase());
+        ui.add(Label::new(RichText::new(hint).size(12.0).color(FAINT())).wrap());
+    };
+    if width < 580.0 {
+        label(ui);
+        ui.add_space(8.0);
+        controls(ui)
+    } else {
+        let left = (width * 0.28).clamp(170.0, 250.0);
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 24.0;
+            ui.allocate_ui_with_layout(vec2(left, 0.0), Layout::top_down(Align::Min), |ui| { ui.set_min_width(left); ui.set_max_width(left); label(ui); });
+            ui.allocate_ui_with_layout(vec2(width - left - 24.0, 0.0), Layout::top_down(Align::Min), |ui| { ui.set_width(width - left - 24.0); controls(ui) }).inner
+        }).inner
     }
-    ui.add_space(8.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing = vec2(16.0, 4.0);
-        match (&app.test_result, app.test_rx.is_some()) {
-            (_, true) => drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))),
-            (Some(Ok(who)), _) => {
-                green_dot(ui);
-                ui.label(RichText::new(who).size(13.0).color(DIM()));
-            }
-            (Some(Err(why)), _) => drop(ui.add(Label::new(RichText::new(why).size(13.0).color(WARN())).wrap())),
-            _ => {}
-        }
-        if app.test_result.as_ref().is_none_or(|r| r.is_err()) && app.test_rx.is_none() {
-            if theme::quiet(ui, "Get a free API key", 13.0, true).clicked() {
-                util::open_url("https://www.last.fm/api/account/create");
-            }
-            if theme::quiet(ui, "Check this login", 13.0, !app.cfg.lastfm_user.trim().is_empty() && !app.cfg.lastfm_api_key.trim().is_empty()).clicked() {
-                app.test_lastfm(&ctx);
-            }
-        }
+}
+
+pub(crate) fn module_note(ui: &mut Ui, words: &str, color: Color32) {
+    let width = ui.available_width();
+    let indent = if width < 580.0 { 0.0 } else { (width * 0.28).clamp(170.0, 250.0) + 24.0 };
+    ui.horizontal(|ui| {
+        ui.add_space(indent);
+        ui.add(Label::new(RichText::new(words).size(11.5).color(color)).wrap());
     });
-    changed
+}
+
+fn lastfm_controls(app: &mut App, ui: &mut Ui) -> bool {
+    let ctx = ui.ctx().clone();
+    if app.cfg.has_lastfm() {
+        ui.horizontal_wrapped(|ui| {
+            green_dot(ui);
+            let words = if app.cfg.lastfm_connected { format!("Connected as {}", app.cfg.lastfm_user) } else { format!("Using {}", app.cfg.lastfm_user) };
+            ui.add(Label::new(RichText::new(words).size(13.0).color(TEXT())).wrap());
+        });
+        ui.add_space(8.0);
+    }
+    if app.lastfm_auth.active() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(egui::Spinner::new().size(13.0).color(DIM()));
+            ui.label(RichText::new(if app.lastfm_auth.waiting() { "Approve access in your browser." } else { "Opening Last.fm…" }).size(13.0).color(DIM()));
+        });
+        ui.horizontal_wrapped(|ui| {
+            if app.lastfm_auth.waiting() && theme::quiet(ui, "Open Last.fm", 13.0, true).clicked() { app.lastfm_auth.open_browser(); }
+            if theme::quiet(ui, "Cancel", 13.0, true).clicked() { app.lastfm_auth.cancel(); }
+        });
+    } else {
+        let disconnected = ui.horizontal_wrapped(|ui| {
+            let word = if app.cfg.has_lastfm() { "Change account" } else { "Connect Last.fm" };
+            if account_action(ui, word, crate::lastfm_auth::configured()).on_hover_text("Sign in securely in your browser.").on_disabled_hover_text("Last.fm sign-in is unavailable in this build.").clicked() { app.lastfm_auth.start(&ctx); }
+            if app.cfg.has_lastfm() && theme::quiet(ui, "Disconnect", 13.0, true).clicked() {
+                app.lastfm_auth.cancel();
+                if let Err(why) = crate::lastfm_auth::forget(&mut app.cfg) {
+                    app.lastfm_auth.error = Some(why);
+                    return false;
+                }
+                app.lastfm_changed();
+                return true;
+            }
+            false
+        }).inner;
+        if disconnected { return true; }
+    }
+    if let Some(why) = &app.lastfm_auth.error {
+        ui.add_space(6.0);
+        ui.add(Label::new(RichText::new(why).size(13.0).color(WARN())).wrap());
+    }
+    false
 }
 
 /// "Repairs on the Health page", with its menu: allowed, or look only. True when it was changed.
@@ -673,8 +720,7 @@ pub(crate) struct Slsk<'a> {
     pub show: &'a mut bool,
     /// a password is saved already: its box says so
     pub saved: bool,
-    /// "optional" stands at the card's top
-    pub optional: bool,
+
 }
 
 /// The Soulseek card: the login the Downloads page searches with (what happens to a lossless download is
@@ -682,48 +728,119 @@ pub(crate) struct Slsk<'a> {
 /// sign-in stands, or the word that saves the login); `None` leaves that line out (the first start,
 /// where "Start" saves).
 pub(crate) fn soulseek(ui: &mut Ui, s: Slsk, row: Option<&mut dyn FnMut(&mut Ui)>) {
-    head(ui, "SOULSEEK", s.optional);
-    ui.add_space(8.0);
-    box_(ui, TextEdit::singleline(s.user).hint_text("Name"));
-    ui.add_space(6.0);
-    secret(ui, "soulseek", s.pass, if s.saved { "Saved. Type to change it" } else { "Password" }, s.show);
-    if let Some(row) = row {
+    module_row(ui, "Soulseek", "Find & download music", |ui| soulseek_controls(ui, s, row));
+}
+
+fn soulseek_controls(ui: &mut Ui, s: Slsk, row: Option<&mut dyn FnMut(&mut Ui)>) {
+    let edit_id = egui::Id::unique("soulseek-edit");
+    let mut editing = ui.data(|d| d.get_temp::<String>(edit_id));
+    if !s.saved && editing.is_none() {
+        if account_action(ui, "Sign in to Soulseek", true).clicked() {
+            editing = Some(s.user.clone());
+            ui.data_mut(|d| d.insert_temp(edit_id, s.user.clone()));
+        } else {
+            return;
+        }
+    }
+    if s.saved && editing.is_none() {
+        ui.horizontal_wrapped(|ui| {
+            ui.add(Label::new(RichText::new(s.user.as_str()).size(13.0).color(TEXT())).wrap());
+            if account_action(ui, "Change login", true).clicked() {
+                editing = Some(s.user.clone());
+                ui.data_mut(|d| d.insert_temp(edit_id, s.user.clone()));
+            }
+        });
+    }
+    if editing.is_some() {
+        let user_field = |ui: &mut Ui, user: &mut String| {
+            ui.label(RichText::new("Username").size(11.5).color(DIM()));
+            let r = box_(ui, TextEdit::singleline(user).hint_text(RichText::new("Soulseek username").color(FAINT())));
+            script::seen("soulseek:username", r.rect);
+        };
+        let pass_field = |ui: &mut Ui, pass: &mut String, show: &mut bool| {
+            ui.label(RichText::new("Password").size(11.5).color(DIM()));
+            let r = secret(ui, "soulseek", pass, if s.saved { "New password" } else { "Password" }, show);
+            script::seen("soulseek:password", r.rect);
+        };
+        if ui.available_width() >= 400.0 {
+            ui.columns(2, |cols| { user_field(&mut cols[0], s.user); pass_field(&mut cols[1], s.pass, s.show); });
+        } else {
+            user_field(ui, s.user);
+            ui.add_space(6.0);
+            pass_field(ui, s.pass, s.show);
+        }
+    }
+    if row.is_some() || editing.is_some() {
         ui.add_space(8.0);
         // (one height whatever it says, so nothing under it moves)
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 20.0), Layout::left_to_right(Align::Center).with_main_wrap(true), |ui| {
             ui.set_min_height(20.0);
             ui.set_row_height(20.0);
             ui.spacing_mut().item_spacing = vec2(12.0, 4.0);
-            row(ui);
+            if let Some(row) = row { row(ui); }
+            if let Some(original) = editing {
+                if theme::quiet(ui, "Cancel changes", 12.0, true).clicked() {
+                    *s.user = original;
+                    s.pass.clear();
+                    *s.show = false;
+                    ui.data_mut(|d| d.remove::<String>(edit_id));
+                }
+            }
         });
     }
 }
 
 /// One of the two ways a lossless album can come in, as `lossless` draws it.
-struct Way {
+struct Way<'a> {
     keep: bool,
-    from: &'static str,
-    to: &'static str,
     /// the format it comes out as is lossless too (drawn in blue, as FLAC going in is)
-    to_lossless: bool,
-    name: &'static str,
-    why: &'static str,
+    name: &'a str,
+    why: &'a str,
     /// a typical album of this kind, in MB, and how long its bar is
-    size: &'static str,
+    size: &'a str,
     bar: f32,
 }
-
-const WAYS: [Way; 2] = [
-    Way { keep: false, from: "FLAC", to: "MP3 320", to_lossless: false, name: "Convert to MP3 320", why: "About a third of the room, and it plays on anything. Tags, cover and lyrics come along.", size: "about 110 MB an album", bar: 34.0 },
-    Way { keep: true, from: "FLAC", to: "FLAC", to_lossless: true, name: "Keep lossless", why: "The sound exactly as downloaded. WAV, ALAC and APE become FLAC.", size: "about 300 MB an album", bar: 100.0 },
-];
 
 /// The card of its own under the three: what an import does with a lossless album (`keep`: it stays
 /// lossless). Each way is a small picture of what happens, the format going in and coming out, why, and
 /// how much room an album takes; the chosen one is lit and a click on the other chooses it. Side by side,
 /// one under the other in a narrow card, and one faint line under them. True when the choice was changed.
-pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool) -> bool {
-    theme::caption(ui, "WHEN A LOSSLESS ALBUM IS IMPORTED");
+pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool, quality: &mut crate::import_quality::Mp3Quality) -> bool {
+    use crate::import_quality::Mp3Quality as Q;
+    let before = (*keep, *quality);
+    const ITEMS: [rows::Item; 13] = [
+        rows::Item { name: "MP3 192", about: "Constant bitrate · smaller files" },
+        rows::Item { name: "MP3 256", about: "Constant bitrate · balanced" },
+        rows::Item { name: "MP3 320", about: "Constant bitrate · highest bitrate" },
+        rows::Item { name: "MP3 V0", about: "Variable bitrate · highest quality" },
+        rows::Item { name: "MP3 V1", about: "Variable bitrate · high quality" },
+        rows::Item { name: "MP3 V2", about: "Variable bitrate · balanced" },
+        rows::Item { name: "MP3 V3", about: "Variable bitrate · more space saved" },
+        rows::Item { name: "MP3 V4", about: "Variable bitrate · smaller files" },
+        rows::Item { name: "MP3 V5", about: "Variable bitrate · compact" },
+        rows::Item { name: "MP3 V6", about: "Variable bitrate · more detail discarded" },
+        rows::Item { name: "MP3 V7", about: "Variable bitrate · more detail discarded" },
+        rows::Item { name: "MP3 V8", about: "Variable bitrate · very small files" },
+        rows::Item { name: "MP3 V9", about: "Variable bitrate · smallest files" },
+    ];
+    let choices = [Q::Smaller, Q::Balanced, Q::Best, Q::V0, Q::V1, Q::V2, Q::V3, Q::V4, Q::V5, Q::V6, Q::V7, Q::V8, Q::V9];
+    ui.horizontal(|ui| {
+        theme::caption(ui, "WHEN A LOSSLESS ALBUM IS IMPORTED");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if let Some(n) = rows::pick_one(ui, "quality-level", &ITEMS, choices.iter().position(|q| q == quality).unwrap_or(2)) {
+                *quality = choices[n];
+                *keep = false;
+            }
+        });
+    });
+    let output = format!("MP3 {}", quality.label());
+    let name = format!("Convert to {output}");
+    let size = format!("about {:.0} MB per 45 min", quality.album_mb());
+    let why = if quality.vbr().is_some() { "Quality stays consistent; bitrate adapts to the music. Tags, cover and lyrics come along." } else { "A smaller copy that plays widely. Tags, cover and lyrics come along." };
+    let ways = [
+        Way { keep: false, name: &name, why, size: &size, bar: (quality.album_mb() / 304.0 * 100.0) as f32 },
+        Way { keep: true, name: "Keep lossless", why: "The sound exactly as downloaded. Other lossless formats become FLAC.", size: "about 300 MB per 45 min", bar: 100.0 },
+    ];
     ui.add_space(10.0);
     let full = ui.available_width();
     let side = full >= 640.0;
@@ -731,12 +848,12 @@ pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool) -> bool {
     let w = if side { ((full - gap) / 2.0).floor() } else { full };
     // (both are as tall as the taller, so they read across)
     let text_w = w - 2.0 * inset - 25.0;
-    let whys: Vec<_> = WAYS.iter().map(|way| ui.painter().layout(way.why.to_string(), FontId::proportional(12.5), DIM(), text_w)).collect();
+    let whys: Vec<_> = ways.iter().map(|way| ui.painter().layout(way.why.to_string(), FontId::proportional(12.5), DIM(), text_w)).collect();
     let h = (inset + 20.0 + 4.0 + whys.iter().map(|g| g.size().y).fold(0.0, f32::max) + 6.0 + 14.0 + inset).ceil();
     let rows = if side { 1 } else { 2 };
     let (area, _) = ui.allocate_exact_size(vec2(full, h * rows as f32 + if side { 0.0 } else { 8.0 }), Sense::hover());
     let mut changed = false;
-    for (n, (way, why)) in WAYS.iter().zip(whys).enumerate() {
+    for (n, (way, why)) in ways.iter().zip(whys).enumerate() {
         let at = if side { pos2(area.left() + n as f32 * (w + gap), area.top()) } else { pos2(area.left(), area.top() + n as f32 * (h + 8.0)) };
         let rect = Rect::from_min_size(at, vec2(w, h));
         let chosen = *keep == way.keep;
@@ -759,22 +876,8 @@ pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool) -> bool {
         } else {
             p.circle_stroke(dot, 6.0, egui::Stroke::new(1.4, if r.hovered() { DIM() } else { FAINT() }));
         }
-        // the picture: the format going in, an arrow, the format coming out, then its name
-        let mut x = rect.left() + inset + 25.0;
+        let x = rect.left() + inset + 25.0;
         let mid = dot.y;
-        let chip = |p: &egui::Painter, x: f32, words: &str, lossless: bool| -> f32 {
-            let color = if lossless { ACCENT2() } else { TEXT() };
-            let g = p.layout_no_wrap(words.to_string(), FontId::proportional(10.5), color);
-            let r = Rect::from_min_size(pos2(x, (mid - g.size().y / 2.0 - 2.0).round()), g.size() + vec2(12.0, 4.0));
-            p.rect_stroke(r, 4, egui::Stroke::new(1.0, if lossless { ACCENT2().gamma_multiply(0.45) } else { theme::BORDER().lerp_to_gamma(TEXT(), 0.25) }), egui::StrokeKind::Inside);
-            p.galley(pos2(r.left() + 6.0, r.top() + 2.0), g, color);
-            r.right()
-        };
-        x = chip(p, x, way.from, true) + 7.0;
-        let arrow = p.layout_no_wrap("\u{2192}".to_string(), FontId::proportional(12.0), FAINT());
-        p.galley(pos2(x, (mid - arrow.size().y / 2.0).round()), arrow.clone(), FAINT());
-        x += arrow.size().x + 7.0;
-        x = chip(p, x, way.to, way.to_lossless) + 10.0;
         let name_color = if chosen { TEXT() } else { DIM() };
         let name = p.layout_no_wrap(way.name.to_string(), FontId::proportional(14.0), name_color);
         p.galley(pos2(x, (mid - name.size().y / 2.0).round()), name, name_color);
@@ -796,28 +899,16 @@ pub(crate) fn lossless(ui: &mut Ui, keep: &mut bool) -> bool {
     }
     ui.add_space(12.0);
     ui.add(Label::new(RichText::new(LOSSLESS_FOOT).size(12.5).color(FAINT())).wrap());
-    changed
+    changed || before != (*keep, *quality)
 }
 
 /// What the lossless card says at its foot.
 pub(crate) const LOSSLESS_FOOT: &str = "MP3 and other lossy downloads come in as they are.";
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn the_lossless_card_offers_convert_first_and_says_what_each_way_does() {
-        // (the first-start screen starts on the first: MP3 320 for someone new)
-        assert!(!WAYS[0].keep && WAYS[1].keep);
-        assert_eq!((WAYS[0].from, WAYS[0].to, WAYS[1].to), ("FLAC", "MP3 320", "FLAC"));
-        // the bars keep the sizes' proportion (about 110 MB to about 300 MB)
-        assert!((WAYS[0].bar / WAYS[1].bar - 110.0 / 300.0).abs() < 0.05);
-        for w in &WAYS {
-            assert!(!w.why.contains('\u{2014}'), "no em dashes");
-        }
-    }
-
     fn lab(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("music-recs-setup-{name}-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
         std::fs::create_dir_all(&d).unwrap();

@@ -9,6 +9,8 @@ const NAME: &str = "Bradley's Music Tool";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=BMT_LASTFM_API_KEY");
+    println!("cargo:rerun-if-env-changed=BMT_LASTFM_SHARED_SECRET");
     println!("cargo:rerun-if-changed=assets/bradleys-music-tool.ico");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;

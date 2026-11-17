@@ -48,7 +48,7 @@ good: what a repair or an import replaces goes to an undo folder or the Recycle 
 history can put it back. If your library is laid out another way, choose "Look only, change nothing" at
 the first start and the app will only report.
 
-The Last.fm key and the Soulseek login are kept in Windows Credential Manager, not in a file. The Soulseek
+The Last.fm session and Soulseek login are kept in Windows Credential Manager, not in a file. Connect Last.fm in Settings and approve access in your browser; no API key is needed. The Soulseek
 client it sets up shares none of your files and can only be reached from your own PC.
 
 The Backup page copies and checks files in the app itself. Existing backup settings still work. After

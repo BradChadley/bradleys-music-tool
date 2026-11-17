@@ -10,6 +10,10 @@ pub struct Config {
     /// still read from the file, once, to carry over a key from before that.
     #[serde(skip_serializing)]
     pub lastfm_api_key: String,
+    /// Explicit disconnect must not be undone by legacy key recovery or environment variables.
+    pub lastfm_disconnected: bool,
+    #[serde(skip)]
+    pub lastfm_connected: bool,
     pub music_dir: String,
     /// Where finished Soulseek downloads arrive (the Downloads page imports from here).
     pub downloads_dir: String,
@@ -65,6 +69,7 @@ pub struct Config {
     /// lossless downloads stay lossless when they are imported: a FLAC stays as it is with its tags and
     /// cover put right, another lossless kind becomes FLAC (false: every lossless download becomes a 320 MP3)
     pub keep_lossless: bool,
+    pub mp3_quality: crate::import_quality::Mp3Quality,
     /// what to do about new versions of the app: "auto" (fetch them and put them in), "tell" (only say
     /// that one is out) or "off" (never check); see `crate::update::Policy`
     pub updates: String,
@@ -95,6 +100,8 @@ impl Default for Config {
         Self {
             lastfm_user: String::new(),
             lastfm_api_key: String::new(),
+            lastfm_disconnected: false,
+            lastfm_connected: false,
             // (none: the first-start screen asks for it, and a page without one says "Choose a folder")
             music_dir: String::new(),
             downloads_dir: std::path::PathBuf::from(std::env::var_os("USERPROFILE").unwrap_or_default()).join("Downloads").join("SoulSeek").to_string_lossy().into_owned(),
@@ -126,6 +133,7 @@ impl Default for Config {
             backup_tool_dir: String::new(),
             lyrics_plain: false,
             keep_lossless: false,
+            mp3_quality: Default::default(),
             updates: "auto".into(),
             load_error: None,
         }
@@ -250,6 +258,11 @@ impl Config {
                 }
             },
         };
+        if c.lastfm_disconnected {
+            c.lastfm_user.clear();
+            c.lastfm_api_key.clear();
+            return c;
+        }
         // the key: from Credential Manager; one still in the file (from before, or from a restored backup)
         // is moved there first
         if !c.lastfm_api_key.trim().is_empty() {
@@ -264,23 +277,33 @@ impl Config {
         if c.lastfm_api_key.is_empty() {
             c.lastfm_api_key = std::env::var("LASTFM_API_KEY").unwrap_or_default();
         }
+        crate::lastfm_auth::restore(&mut c);
         c
     }
     /// Save settings. A blank Last.fm login never overwrites one that's already on disk: blank
     /// fields here almost always mean this copy of the settings was loaded wrong, not that you
-    /// wanted to log out. (To change account, type the new username/key over the old ones.)
+    /// wanted to log out. The explicit Disconnect action sets lastfm_disconnected instead.
     ///
     /// The key goes to Credential Manager, not into the file. Only if Credential Manager refuses it is it
     /// written to the file as it used to be, so it is never lost.
     pub fn save(&self) {
+        let _ = self.save_checked();
+    }
+
+    /// Account changes must report a failed settings write instead of claiming they were saved.
+    pub fn save_checked(&self) -> Result<(), String> {
         let mut out = self.clone();
         let (user, key_on_disk) = std::fs::read_to_string(config_path()).map(|raw| salvage_login(&raw)).unwrap_or_default();
-        if out.lastfm_user.trim().is_empty() && !user.is_empty() {
+        if !out.lastfm_disconnected && out.lastfm_user.trim().is_empty() && !user.is_empty() {
             out.lastfm_user = user;
             log("save: kept the Last.fm username already on disk instead of blanking it");
         }
         // a blank key here leaves the kept one alone, wherever it is
-        let in_file = if out.lastfm_api_key.trim().is_empty() {
+        let in_file = if out.lastfm_disconnected {
+            out.lastfm_user.clear();
+            out.lastfm_api_key.clear();
+            String::new()
+        } else if out.lastfm_api_key.trim().is_empty() {
             out.lastfm_api_key = crate::secrets::get(crate::secrets::LASTFM).map(|e| e.secret).unwrap_or_default();
             key_on_disk
         } else if crate::secrets::set(crate::secrets::LASTFM, "", &out.lastfm_api_key).is_ok() {
@@ -298,10 +321,12 @@ impl Config {
             }
             v
         });
-        if let Ok(s) = json.and_then(|v| serde_json::to_vec_pretty(&v)) {
-            match crate::util::write_atomic(&config_path(), &s) {
-                Ok(()) => log(&format!("save: ok, {}", describe(&out))),
-                Err(e) => log(&format!("save: FAILED ({e})")),
+        let s = json.and_then(|v| serde_json::to_vec_pretty(&v)).map_err(|_| "Could not prepare settings to save.".to_string())?;
+        match crate::util::write_atomic(&config_path(), &s) {
+            Ok(()) => { log(&format!("save: ok, {}", describe(&out))); Ok(()) }
+            Err(e) => {
+                log(&format!("save: FAILED ({e})"));
+                Err("Could not save your settings. Please check that the app's data folder is writable and try again.".into())
             }
         }
     }
