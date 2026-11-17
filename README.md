@@ -20,6 +20,8 @@ It is for people who keep their own music files, sorted as `Artist\Album (Year)\
 
 **Home.** One page that says where things stand: what is new from your artists, what is on its way, the state of the library and of the last check.
 
+**Backup.** Keeps checked copies of your library on a main drive and an optional second drive. Replaced and removed files are kept for 30 days. Existing backup settings still work, and the Backup page can set up nightly runs of the app.
+
 ## Get it
 
 Download the newest zip from the [Releases page](https://github.com/BradChadley/bradleys-music-tool/releases/latest), unpack it into a folder of its own, and start `bradleys-music-tool.exe`. There is no installer. The app asks where your music is and is ready.
@@ -31,7 +33,6 @@ It needs Windows 10 or 11, 64-bit. Everything else it fetches for itself when yo
 | What | What for | Size |
 |---|---|---|
 | [FFmpeg](https://ffmpeg.org) | Checking and converting music files | 115 MB |
-| [PowerShell 7](https://github.com/PowerShell/PowerShell) | The tag editor (installed by Windows' own `winget`) | about 110 MB |
 | [slskd](https://github.com/slskd/slskd) | Only if you set up Soulseek | 56 MB |
 
 ## What it does on your PC, and what it sends
@@ -54,7 +55,7 @@ cargo test --release
 
 The program file is `target\release\bradleys-music-tool.exe`. A test run that keeps away from your real settings: set the environment variable `MUSIC_RECS_DATA` to an empty folder before starting it.
 
-The source is one Rust program (`src`, drawn with [egui](https://github.com/emilk/egui)) and a small tag editor in PowerShell (`tag-editor`) that is built into the program file. The folder and the data folder are named `music-recs` because the app began as the Recs page alone.
+The source is one Rust program (`src`, drawn with [egui](https://github.com/emilk/egui)), including the tag editor and backup worker. The folder and the data folder are named `music-recs` because the app began as the Recs page alone.
 
 ## Problems and ideas
 

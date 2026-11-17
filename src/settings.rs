@@ -222,10 +222,11 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
     };
     let mut save = false;
 
-    let cols = if wide >= THREE { 3 } else { 1 };
-    theme::card_row(ui, "settings-basics", left, wide, cols, 3, GAP, PAD, if cols == 3 { 252.0 } else { 0.0 }, false, |i, ui| match i {
-        0 => cards::needs(ui, &mut st.ffmpeg),
-        1 => {
+    theme::card_row(ui, "settings-needs", left, wide, 1, 1, GAP, vec2(PAD.x, 16.0), 0.0, false, |_, ui| cards::needs(ui, &mut st.ffmpeg));
+    ui.add_space(GAP);
+    let cols = if wide >= THREE { 2 } else { 1 };
+    theme::card_row(ui, "settings-basics", left, wide, cols, 2, GAP, PAD, if cols == 2 { 220.0 } else { 0.0 }, false, |i, ui| match i {
+        0 => {
             changed |= cards::lastfm(app, ui);
             Some(("Your listening history makes Recs better. It works without it.".to_string(), FAINT()))
         }
@@ -404,15 +405,15 @@ fn files(app: &mut App, ui: &mut Ui, left: f32, wide: f32, now: f64) -> bool {
         }
         // where the backup script lives (none: no backup tool, and no Backup page)
         let dir = backup::tool_dir_for(&app.cfg.backup_tool_dir).map(|d| d.to_string_lossy().to_string());
-        let found = dir.as_ref().is_some_and(|d| app.path_found("backup-tool", &format!("{d}\\Backup-Music.ps1"), now));
+        let found = dir.as_ref().is_some_and(|d| app.path_found("backup-tool", d, now));
         let there = dir.as_ref().is_some_and(|d| app.path_found("backup-dir", d, now));
         let shown = match &dir {
             Some(d) => (d.as_str(), DIM()),
             None => ("None chosen", FAINT()),
         };
-        let note = (dir.is_some() && !found).then_some(("Backup-Music.ps1 was not found there.", WARN()));
+        let note = (dir.is_some() && !found).then_some(("The backup settings folder was not found.", WARN()));
         let open = dir.as_deref().filter(|_| there);
-        let did = folder_row(ui, "backup-tool", "Backup tool", shown, &mut app.cfg.backup_tool_dir, note, if dir.is_some() { "Change" } else { "Choose" }, open, dir.is_some());
+        let did = folder_row(ui, "backup-tool", "Backup settings", shown, &mut app.cfg.backup_tool_dir, note, if dir.is_some() { "Change" } else { "Choose" }, open, dir.is_some());
         changed |= did.typed;
         if did.remove {
             app.cfg.backup_tool_dir.clear();
@@ -471,19 +472,24 @@ fn files(app: &mut App, ui: &mut Ui, left: f32, wide: f32, now: f64) -> bool {
 
 // ------------------------------------------------------------------ Recs
 
-/// A number in a small box: drag it, or click it and type.
+/// A number in a small box: drag it, or click it and type. The same box as a menu's opener (`rows`): a
+/// soft field, a hairline edge that brightens under the pointer and while typing, the same height.
 fn number<N: egui::emath::Numeric>(ui: &mut Ui, value: &mut N, range: std::ops::RangeInclusive<N>) -> bool {
     ui.scope(|ui| {
         let v = ui.visuals_mut();
         for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
-            w.weak_bg_fill = theme::field_bg();
-            w.bg_fill = theme::field_bg();
-            w.bg_stroke = Stroke::new(1.0, theme::BORDER());
-            w.corner_radius = 7.into();
+            w.weak_bg_fill = rows::box_fill();
+            w.bg_fill = rows::box_fill();
+            w.bg_stroke = Stroke::new(1.0, rows::box_edge(false, false));
+            w.corner_radius = rows::BOX_ROUND.into();
+            w.fg_stroke.color = TEXT();
         }
-        v.widgets.hovered.bg_stroke = Stroke::new(1.0, FAINT());
+        v.widgets.hovered.bg_stroke = Stroke::new(1.0, rows::box_edge(true, false));
+        v.widgets.active.bg_stroke = Stroke::new(1.0, rows::box_edge(false, true));
+        v.selection.stroke = Stroke::new(1.0, rows::box_edge(false, true));
         ui.spacing_mut().button_padding = vec2(8.0, 3.0);
-        ui.spacing_mut().interact_size = vec2(44.0, 26.0);
+        ui.spacing_mut().interact_size = vec2(44.0, rows::BOX_H);
+        ui.style_mut().override_font_id = Some(FontId::proportional(13.5));
         ui.add(egui::DragValue::new(value).range(range)).changed()
     })
     .inner
@@ -998,7 +1004,7 @@ pub(crate) fn needs_a_look(music: Option<bool>, soulseek: (bool, bool), backup: 
         out.push(("A Soulseek login is saved, but its client is not installed".to_string(), BASICS));
     }
     if backup == Some(false) {
-        out.push(("The backup tool is not in its folder".to_string(), FILES));
+        out.push(("The backup settings folder was not found".to_string(), FILES));
     }
     out
 }

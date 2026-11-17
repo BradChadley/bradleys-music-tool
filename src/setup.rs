@@ -1,6 +1,6 @@
 //! The first start: one screen in place of the pages, on a PC that has never run the app (no settings
 //! file; see `Config::load`). It asks one thing, where the music is. Under that, three cards that may all
-//! be left alone: what the app needs (ffmpeg, PowerShell 7), Last.fm, and Soulseek with the choice of what
+//! be left alone: what the app needs (ffmpeg), Last.fm, and Soulseek with the choice of what
 //! happens to lossless downloads. They are faint until a folder is chosen, so the page has one thing to
 //! do; "Start" writes the settings and opens Home. Everything here can be changed later in Settings,
 //! whose first section is these same four cards (`cards`).
@@ -12,7 +12,7 @@ use egui::{vec2, FontId, Label, Rect, RichText, ScrollArea, Sense, Ui};
 
 /// The page's one stretch of the window.
 const PAGE: f32 = 1000.0;
-/// The three cards under the folder, side by side, are never lower than this.
+/// The two login cards, side by side, are never lower than this.
 const CARD_H: f32 = 252.0;
 
 pub(crate) struct Setup {
@@ -93,14 +93,15 @@ pub(crate) fn screen(app: &mut App, ui: &mut Ui) {
             s.folder.show(app, ui, left, wide, cards::Repairs::First(&mut s.look_only));
             ui.add_space(GAP);
 
-            // the three cards that may be left alone: in a row, or one under the other in a narrow window.
+            // A shallow needs card, followed by the two login cards.
             // Faint, and nothing in them takes a click, until there is a folder
             let ready = s.folder.ready();
-            let cols = if wide >= 820.0 { 3 } else { 1 };
+            theme::card_row(ui, "setup-needs", left, wide, 1, 1, GAP, vec2(PAD.x, 16.0), 0.0, !ready, |_, ui| cards::needs(ui, &mut s.ffmpeg));
+            ui.add_space(GAP);
+            let cols = if wide >= 820.0 { 2 } else { 1 };
             // (one under the other, each is only as tall as what it holds)
-            theme::card_row(ui, "setup-card", left, wide, cols, 3, GAP, PAD, if cols == 3 { CARD_H } else { 0.0 }, !ready, |i, ui| match i {
-                0 => cards::needs(ui, &mut s.ffmpeg),
-                1 => {
+            theme::card_row(ui, "setup-card", left, wide, cols, 2, GAP, PAD, if cols == 2 { CARD_H } else { 0.0 }, !ready, |i, ui| match i {
+                0 => {
                     cards::lastfm(app, ui);
                     Some(("Your listening history makes Recs better. It works without it.".to_string(), FAINT()))
                 }

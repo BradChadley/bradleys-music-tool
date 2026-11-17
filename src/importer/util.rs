@@ -1,4 +1,4 @@
-//! Name helpers shared by the scan, lookups and import (ports of the PowerShell helpers).
+//! Name helpers shared by the scan, lookups and import.
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -138,7 +138,7 @@ pub fn format_time(sec: f64) -> String {
 
 /// "{:0.#}" - one decimal, dropped when it's .0
 pub fn trim_num(x: f64) -> String {
-    // halves round away from zero, like the PowerShell version ("17.25" -> "17.3")
+    // halves round away from zero ("17.25" -> "17.3")
     let s = format!("{:.1}", (x * 10.0).round() / 10.0);
     s.strip_suffix(".0").map(|s| s.to_string()).unwrap_or(s)
 }

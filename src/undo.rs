@@ -47,40 +47,91 @@ fn hide(dir: &Path) {
     }
 }
 
-/// Moves the old copy of an album into the undo backups and writes down how to put it back.
-///   * `now_at`: where the old copy is at this moment (it has already been moved aside)
-///   * `was_at`: where it was in the library, which is where Undo returns it to
-///   * `new_at`: the album that took its place, which Undo moves out first
-/// Returns where the old copy is kept. On an error nothing has been lost: the old copy is still at `now_at`
-/// or already in the backups.
-pub fn keep_replaced(root: &Path, library: &Path, title: &str, now_at: &Path, was_at: &Path, new_at: &Path) -> Result<PathBuf, String> {
-    let leaf = was_at.file_name().ok_or("the old copy has no folder name")?;
-    let now = chrono::Local::now();
-    let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), rand_hex(6));
-    let dir = root.join(&id);
-    let slot = dir.join("items").join(format!("{}-{}", now.format("%H%M%S%3f"), rand_hex(8)));
-    let fresh_root = !root.exists();
-    std::fs::create_dir_all(&slot).map_err(|e| crate::util::plain_err(format!("couldn't make the undo backup folder: {e}")))?;
-    if fresh_root {
-        hide(root);
+/// An album being replaced by an import, written down before anything moves (Codex's review, H4: the old
+/// album used to move first, and a record that then could not be written left no way back).
+///
+///   1. `begin`: the batch and its first line, synced to the disk: where the old album is, where it will be
+///      set aside in the library for a moment, and where it will be kept. If this cannot be written, nothing
+///      has moved and the import stops.
+///   2. The importer moves the old album to `aside` and the new one into place (`swap_into_place`).
+///   3. `finish`: the second line (the new album, which Undo takes out first), then the old album from
+///      `aside` into the backups.
+///
+/// Undo reads whatever got written: the old album is found in the backups, or still at `aside`, or never
+/// left. With only the first line (the second could not be written), Undo will not move the new album and
+/// says so, and the old album stays safe in the backups.
+pub struct Replacement {
+    dir: PathBuf,
+    was_at: PathBuf,
+    new_at: PathBuf,
+    aside: PathBuf,
+    kept: PathBuf,
+}
+
+impl Replacement {
+    /// Writes down how to undo putting `new_at` in place of the album at `was_at`. Nothing moves here.
+    pub fn begin(root: &Path, library: &Path, title: &str, was_at: &Path, new_at: &Path) -> Result<Replacement, String> {
+        let leaf = was_at.file_name().ok_or("the old copy has no folder name")?;
+        let now = chrono::Local::now();
+        let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), rand_hex(6));
+        let dir = root.join(&id);
+        let slot = dir.join("items").join(format!("{}-{}", now.format("%H%M%S%3f"), rand_hex(8)));
+        let aside = PathBuf::from(format!("{}.replaced-{}", was_at.display(), rand_hex(12)));
+        let fresh_root = !root.exists();
+        std::fs::create_dir_all(&slot).map_err(|e| crate::util::plain_err(format!("couldn't make the undo backup folder: {e}")))?;
+        if fresh_root {
+            hide(root);
+        }
+        let r = Replacement { dir, was_at: was_at.to_path_buf(), new_at: new_at.to_path_buf(), aside, kept: slot.join(leaf) };
+        let batch = serde_json::json!({ "Id": id, "Title": title, "When": now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "Library": library.to_string_lossy() });
+        let removed = serde_json::json!({ "Kind": "removed", "Original": r.was_at.to_string_lossy(), "Backup": r.kept.to_string_lossy(), "Aside": r.aside.to_string_lossy(), "Reason": "replaced by a new import" });
+        let written = std::fs::write(r.dir.join("batch.json"), batch.to_string()).and_then(|_| r.append(&format!("{removed}\n")));
+        if let Err(e) = written {
+            let _ = std::fs::remove_dir_all(&r.dir); // nothing has moved: leave no half record behind
+            return Err(crate::util::plain_err(format!("the undo record couldn't be written, so the old album was not touched: {e}")));
+        }
+        Ok(r)
     }
-    let batch = serde_json::json!({ "Id": id, "Title": title, "When": now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "Library": library.to_string_lossy() });
-    std::fs::write(dir.join("batch.json"), batch.to_string()).map_err(|e| crate::util::plain_err(format!("couldn't write the undo record: {e}")))?;
-    let kept = slot.join(leaf);
-    if let Err(e) = std::fs::rename(now_at, &kept) {
-        let _ = std::fs::remove_dir_all(&dir); // nothing was moved: leave no empty record behind
-        return Err(crate::util::plain_err(format!("couldn't move the old copy into the undo backups: {e}")));
+
+    fn append(&self, lines: &str) -> std::io::Result<()> {
+        #[cfg(test)]
+        test_fault::before_log(&self.dir);
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(self.dir.join("log.jsonl"))?;
+        f.write_all(lines.as_bytes())?;
+        f.sync_all() // on the disk before anything moves
     }
-    let removed = serde_json::json!({ "Kind": "removed", "Original": was_at.to_string_lossy(), "Backup": kept.to_string_lossy(), "Reason": "replaced by a new import" });
-    let created = serde_json::json!({ "Kind": "created", "Path": new_at.to_string_lossy() });
-    let lines = format!("{removed}\n{created}\n");
-    std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("log.jsonl"))
-        .and_then(|mut f| f.write_all(lines.as_bytes()))
-        .map_err(|e| crate::util::plain_err(format!("the old copy is safe at {} but the undo record couldn't be written: {e}", kept.display())))?;
-    Ok(kept)
+
+    /// Where the old album was, and where the importer sets it aside while the new one moves in.
+    pub fn was_at(&self) -> &Path {
+        &self.was_at
+    }
+    pub fn aside(&self) -> &Path {
+        &self.aside
+    }
+
+    /// The new album is in place: the rest of the record, then the old album from `aside` into the backups.
+    /// Returns where the old album is kept. An error is one sentence that says where the old album is now,
+    /// and it is true: both steps are tried, and the record already names both places.
+    pub fn finish(&self) -> Result<PathBuf, String> {
+        let _held = crate::library_lock::hold();
+        let created = serde_json::json!({ "Kind": "created", "Path": self.new_at.to_string_lossy() });
+        let noted = self.append(&format!("{created}\n"));
+        if let Err(e) = std::fs::rename(&self.aside, &self.kept) {
+            return Err(crate::util::plain_err(format!("the old album couldn't be moved into the undo backups ({e}); it is safe at {}{}", self.aside.display(), if noted.is_ok() { ", and Undo in Repair history can still put it back" } else { "" })));
+        }
+        if let Err(e) = noted {
+            return Err(crate::util::plain_err(format!("the old album is safe in the undo backups at {}, but the undo record couldn't be finished ({e}); to put it back, move the new album away first, then use Undo in Repair history", self.kept.display())));
+        }
+        Ok(self.kept.clone())
+    }
+
+    /// The swap did not happen. With the old album back where it was and nothing of it away, the record is
+    /// taken out again (it would undo nothing); otherwise it stays, for Undo.
+    pub fn cancel(self) {
+        if self.was_at.exists() && !self.aside.exists() && !self.kept.exists() {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -101,17 +152,25 @@ mod tests {
     fn a_replaced_album_is_moved_whole_and_written_down() {
         let base = std::env::temp_dir().join(format!("music-recs-undo-{}-{}", std::process::id(), rand_hex(6)));
         let (lib, root) = (base.join("lib"), base.join("backups"));
-        let (was, aside, new) = (lib.join("A").join("Album"), lib.join("A").join("Album.replaced-1"), lib.join("A").join("Album (2020)"));
-        std::fs::create_dir_all(aside.join("CD1")).unwrap();
-        std::fs::write(aside.join("CD1").join("01 old.mp3"), b"old").unwrap();
-        std::fs::create_dir_all(&new).unwrap();
+        let (was, new) = (lib.join("A").join("Album"), lib.join("A").join("Album (2020)"));
+        std::fs::create_dir_all(was.join("CD1")).unwrap();
+        std::fs::write(was.join("CD1").join("01 old.mp3"), b"old").unwrap();
 
-        let kept = keep_replaced(&root, &lib, "Import: replaced A - Album", &aside, &was, &new).unwrap();
+        // the record is written before anything moves: its first line names all three places
+        let r = Replacement::begin(&root, &lib, "Import: replaced A - Album", &was, &new).unwrap();
+        let aside = r.aside().to_path_buf();
+        assert!(was.exists() && aside.starts_with(was.parent().unwrap()) && !aside.exists());
+        let batch_dir = std::fs::read_dir(&root).unwrap().flatten().next().unwrap().path();
+        let first: serde_json::Value = serde_json::from_str(std::fs::read_to_string(batch_dir.join("log.jsonl")).unwrap().trim()).unwrap();
+        assert_eq!((first["Kind"].as_str(), first["Original"].as_str(), first["Aside"].as_str()), (Some("removed"), was.to_str(), aside.to_str()));
+        // the importer's swap, then the rest
+        std::fs::rename(&was, &aside).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let kept = r.finish().unwrap();
         assert!(!aside.exists() && kept.starts_with(&root));
         assert_eq!(kept.file_name(), was.file_name());
         assert_eq!(std::fs::read(kept.join("CD1").join("01 old.mp3")).unwrap(), b"old");
 
-        let batch_dir = std::fs::read_dir(&root).unwrap().flatten().next().unwrap().path();
         let batch: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(batch_dir.join("batch.json")).unwrap()).unwrap();
         assert_eq!(batch["Id"].as_str(), batch_dir.file_name().and_then(|n| n.to_str()));
         assert_eq!(batch["Title"], "Import: replaced A - Album");
@@ -123,9 +182,16 @@ mod tests {
         assert_eq!(lines[0]["Backup"].as_str(), kept.to_str());
         assert_eq!((lines[1]["Kind"].as_str(), lines[1]["Path"].as_str()), (Some("created"), new.to_str()));
 
-        // the old copy can't be moved (it isn't there): an error, and no empty record is left
-        assert!(keep_replaced(&root, &lib, "x", &lib.join("nope"), &was, &new).is_err());
+        // a swap that did not happen (the old album never left): the record is taken out again
+        let other = lib.join("B").join("Album");
+        std::fs::create_dir_all(&other).unwrap();
+        Replacement::begin(&root, &lib, "x", &other, &other).unwrap().cancel();
         assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        // and one where the old album is away is kept, for Undo
+        let r = Replacement::begin(&root, &lib, "y", &other, &other).unwrap();
+        std::fs::rename(&other, r.aside()).unwrap();
+        r.cancel();
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 2);
         let _ = std::fs::remove_dir_all(&base);
     }
 }
@@ -216,6 +282,7 @@ impl Batch {
 
     /// Moves a file or folder out of the library into the batch. Undo puts it back.
     pub fn remove(&self, path: &Path, reason: &str) -> Result<PathBuf, String> {
+        let _held = crate::library_lock::hold();
         let kept = self.slot(path)?;
         self.log(serde_json::json!({ "Kind": "removed", "Original": path.to_string_lossy(), "Backup": kept.to_string_lossy(), "Reason": reason }))?;
         std::fs::rename(path, &kept).map_err(|e| crate::util::plain_err(format!("couldn't move it into the undo backups: {e}")))?;
@@ -226,6 +293,7 @@ impl Batch {
     /// Moves a file or folder to another place in the library, making the folder it goes into if need be.
     /// Never onto something that is already there.
     pub fn moved(&self, from: &Path, to: &Path, reason: &str) -> Result<(), String> {
+        let _held = crate::library_lock::hold();
         if to.exists() {
             return Err(format!("something is already at {}", to.display()));
         }
@@ -248,6 +316,7 @@ impl Batch {
     /// place. `fixed` must be on the same drive (the batch's own folder is). If the copy cannot be put in
     /// place the old file goes straight back.
     pub fn replaced(&self, original: &Path, fixed: &Path, reason: &str) -> Result<(), String> {
+        let _held = crate::library_lock::hold();
         let kept = self.slot(original)?;
         self.log(serde_json::json!({ "Kind": "replaced", "Original": original.to_string_lossy(), "Backup": kept.to_string_lossy(), "Reason": reason }))?;
         std::fs::rename(original, &kept).map_err(|e| crate::util::plain_err(format!("couldn't move the old file into the undo backups: {e}")))?;
@@ -271,6 +340,7 @@ impl Batch {
     /// copy the tag editor has proved to differ from the file in nothing but its lyrics. Undo puts the
     /// old words back (see `repair::undo`). If the copy cannot be put in place the file is as it was.
     pub fn lyrics_changed(&self, original: &Path, fixed: &Path, old: &str, new: &str, reason: &str) -> Result<(), String> {
+        let _held = crate::library_lock::hold();
         self.log(serde_json::json!({ "Kind": "lyrics", "File": original.to_string_lossy(), "Old": old, "New": new, "Reason": reason }))?;
         // (one step: the name is taken from the old file and given to the fixed copy)
         std::fs::rename(fixed, original).map_err(|e| crate::util::plain_err(format!("couldn't put the fixed copy in place, so the file is as it was: {e}")))?;
@@ -284,6 +354,7 @@ impl Batch {
     /// Puts a new file into the library (a cover picture): a copy of `source` at `path`. Never over
     /// something that is there. Undo moves it into the batch.
     pub fn created(&self, path: &Path, source: &Path, reason: &str) -> Result<(), String> {
+        let _held = crate::library_lock::hold();
         if path.exists() {
             return Err(format!("{} is already there", path.display()));
         }
@@ -416,15 +487,30 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
     if dir.join("undone.txt").exists() {
         return Err("This repair was already undone.".into());
     }
-    let mut list = entries(&dir);
+    // one writer to the library at a time (see `library_lock`)
+    let _held = crate::library_lock::hold();
+    let list = entries(&dir);
     if list.is_empty() {
         return Err("There is nothing to undo for this repair.".into());
     }
-    list.reverse();
+    // Each step that is put back is written down (`undo-progress.txt`, the step's place in the log), and a
+    // second run skips it. Without that, a run cut off after the old album was back but before `undone.txt`
+    // was written would take the album that is back for "what the import added" and move it away again
+    // (Codex's review, H3). A step that cannot be written down stops the Undo there, so no step is ever
+    // done without the record that it was.
+    let progress_file = dir.join("undo-progress.txt");
+    let already: std::collections::HashSet<usize> = std::fs::read_to_string(&progress_file).unwrap_or_default().lines().filter_map(|l| l.trim().parse().ok()).collect();
+    let note_done = |n: usize| -> Result<(), String> {
+        let mut f = std::fs::OpenOptions::new().create(true).append(true).open(&progress_file).map_err(|e| crate::util::plain_err(format!("Undo stopped: it could not write down what it had put back, so it can be run again safely: {e}")))?;
+        f.write_all(format!("{n}\n").as_bytes()).and_then(|_| f.sync_all()).map_err(|e| crate::util::plain_err(format!("Undo stopped: it could not write down what it had put back, so it can be run again safely: {e}")))
+    };
     let aside = |p: &Path| dir.join(format!("undone-{}-{}", rand_hex(6), leaf(p)));
     let make_parent = |p: &Path| p.parent().map(std::fs::create_dir_all).transpose().map(|_| ());
     let mut problems = vec![];
-    for e in &list {
+    for (n, e) in list.iter().enumerate().rev() {
+        if already.contains(&n) {
+            continue;
+        }
         let (original, backup) = (PathBuf::from(text(e, "Original")), PathBuf::from(text(e, "Backup")));
         let (from, to, path) = (PathBuf::from(text(e, "From")), PathBuf::from(text(e, "To")), PathBuf::from(text(e, "Path")));
         let done: Result<(), String> = match e["Kind"].as_str().unwrap_or("") {
@@ -446,7 +532,15 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
                 }
             }
             "removed" => {
-                if !backup.exists() {
+                // (an album an import replaced may still be where it was set aside, beside its old place)
+                let set_aside = PathBuf::from(text(e, "Aside"));
+                if !set_aside.as_os_str().is_empty() && set_aside.exists() {
+                    if original.exists() {
+                        Err(format!("Something new is now at {}; the old one is still beside it, at {}", original.display(), set_aside.display()))
+                    } else {
+                        std::fs::rename(&set_aside, &original).map_err(|err| format!("{} could not be put back: {err}", original.display()))
+                    }
+                } else if !backup.exists() {
                     if original.exists() { Ok(()) } else { Err(format!("{} is neither in the library nor in the backups", original.display())) }
                 } else if original.is_dir() && is_empty_dir(&backup) {
                     Ok(()) // a folder that was tidied away empty is there again: nothing of it is missing
@@ -478,12 +572,15 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
             }
             _ => Ok(()),
         };
-        if let Err(why) = done {
-            problems.push(why);
+        match done {
+            Ok(()) => note_done(n)?,
+            Err(why) => problems.push(why),
         }
     }
     // marked undone only when everything is back: with something left over, Undo can be run again
     if problems.is_empty() {
+        #[cfg(test)]
+        test_fault::before_marker(&dir);
         std::fs::write(dir.join("undone.txt"), chrono::Local::now().to_rfc3339()).map_err(|e| crate::util::plain_err(format!("Everything was put back, but that could not be written down: {e}")))?;
     }
     Ok(problems)
@@ -572,6 +669,28 @@ mod journal_tests {
     }
 
     #[test]
+    fn an_undo_waits_while_another_writer_holds_the_library() {
+        let (base, lib, root) = lab("waits");
+        let song = lib.join("A").join("one.mp3");
+        put(&song, "one");
+        let b = Batch::begin(&root, &lib, "x").unwrap();
+        b.remove(&song, "r").unwrap();
+        let id = b.id.clone();
+        b.close();
+        let held = crate::library_lock::hold(); // an import putting an album in place, say
+        let undoing = {
+            let (root, id) = (root.clone(), id.clone());
+            std::thread::spawn(move || undo(&root, &id))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!song.exists() && !undoing.is_finished(), "Undo changed the library while it was held");
+        drop(held);
+        assert_eq!(undoing.join().unwrap().unwrap(), Vec::<String>::new());
+        assert_eq!(read(&song), "one");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn an_undo_that_cannot_finish_says_so_and_can_be_run_again() {
         let (base, lib, root) = lab("again");
         let (one, two) = (lib.join("A").join("one.mp3"), lib.join("A").join("two.mp3"));
@@ -647,7 +766,7 @@ mod journal_tests {
         put(&song, "the fixed copy");
         put(&kept, "the original");
         put(&cover, "a cover the repair added");
-        // as `New-RepairBatch` and `Write-BatchLog` write them, the first with the marker PowerShell adds
+        // as the older repair log wrote them, the first with a byte-order marker
         put(&dir.join("batch.json"), &format!("\u{feff}{}", serde_json::json!({ "Id": "20261107-120000-abcdef", "Title": "Junk in tags (1)", "When": "2026-11-07T12:00:00.0000000-05:00", "Library": lib.to_string_lossy() })));
         let lines = [
             serde_json::json!({ "Kind": "replaced", "Original": song.to_string_lossy(), "Backup": kept.to_string_lossy(), "Reason": "junk" }).to_string(),
@@ -666,5 +785,232 @@ mod journal_tests {
         assert_eq!(parked.len(), 2, "{parked:?}");
         assert!(!cover.exists());
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+/// Fault points for the tests only (never built into the app): a real write error at the moment an undo
+/// record is written, or at the moment Undo writes down that it is done.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    use std::cell::RefCell;
+    use std::path::Path;
+    thread_local! {
+        pub static BEFORE_LOG: RefCell<Option<Box<dyn FnOnce(&Path)>>> = RefCell::new(None);
+        pub static BEFORE_MARKER: RefCell<Option<Box<dyn FnOnce(&Path)>>> = RefCell::new(None);
+    }
+    pub fn before_log(dir: &Path) {
+        if let Some(f) = BEFORE_LOG.with(|h| h.borrow_mut().take()) {
+            f(dir);
+        }
+    }
+    pub fn before_marker(dir: &Path) {
+        if let Some(f) = BEFORE_MARKER.with(|h| h.borrow_mut().take()) {
+            f(dir);
+        }
+    }
+}
+
+/// Codex's review, H3 and H4: an album replaced by an import, with a write that fails at the worst moment.
+#[cfg(test)]
+mod replace_fault_tests {
+    use super::*;
+
+    fn lab(name: &str) -> (PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("music-recs-replfault-{name}-{}-{}", std::process::id(), rand_hex(6)));
+        let (lib, root) = (base.join("lib"), base.join("undo"));
+        std::fs::create_dir_all(&lib).unwrap();
+        (base, lib, root)
+    }
+    fn put(p: &Path, data: &[u8]) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, data).unwrap();
+    }
+    fn read(p: &Path) -> Vec<u8> {
+        std::fs::read(p).unwrap_or_else(|_| b"<gone>".to_vec())
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.file_name().to_string_lossy().to_string()).collect();
+        v.sort();
+        v
+    }
+    /// The importer's own way of putting an album in place of the old one.
+    fn import(root: &Path, lib: &Path, build: &Path, album: &Path) -> Result<crate::importer::import::Placed, String> {
+        crate::importer::import::place_album(root, lib, "Artist", build, album, Some(album))
+    }
+    /// A real write error the next time an undo record is written to (`skip` writes later).
+    fn fail_write(skip: usize) {
+        test_fault::BEFORE_LOG.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |dir: &Path| {
+                let log = dir.join("log.jsonl");
+                if skip == 0 && log.exists() {
+                    // the lines written so far stay; no more can be added
+                    let mut p = std::fs::metadata(&log).unwrap().permissions();
+                    p.set_readonly(true);
+                    std::fs::set_permissions(&log, p).unwrap();
+                } else if skip == 0 {
+                    std::fs::create_dir(&log).unwrap(); // a folder where the log would go
+                } else {
+                    fail_write(skip - 1);
+                }
+            }))
+        });
+    }
+
+    /// H4: the first line of the record cannot be written. Nothing moves, the import says so, and no
+    /// record of a change that never happened is left in Repair history.
+    #[test]
+    fn an_import_whose_undo_record_cannot_be_written_changes_nothing() {
+        let (base, lib, root) = lab("h4-first");
+        let album = lib.join("Artist").join("Album");
+        let build = base.join("built-album");
+        put(&album.join("track.txt"), b"ORIGINAL");
+        put(&build.join("track.txt"), b"REPLACEMENT");
+        fail_write(0);
+        let why = import(&root, &lib, &build, &album).unwrap_err();
+        assert!(why.contains("Nothing in the library was changed"), "{why}");
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        assert_eq!(names(album.parent().unwrap()), vec!["Album"]);
+        assert!(batches(&root).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H4: the record's second line cannot be written after the swap. The new album is in, the old one is in
+    /// the backups where the import says it is, and Undo brings it back once the new one is moved away.
+    #[test]
+    fn an_import_whose_record_cannot_be_finished_says_where_the_old_album_is() {
+        let (base, lib, root) = lab("h4-second");
+        let album = lib.join("Artist").join("Album");
+        let build = base.join("built-album");
+        put(&album.join("track.txt"), b"ORIGINAL");
+        put(&build.join("track.txt"), b"REPLACEMENT");
+        fail_write(1);
+        let placed = import(&root, &lib, &build, &album).unwrap();
+        assert_eq!(read(&album.join("track.txt")), b"REPLACEMENT");
+        let (why, kept) = (placed.problem.unwrap(), placed.old_copy);
+        assert!(kept.is_none(), "{kept:?}");
+        let at = why.split(" at ").nth(1).and_then(|s| s.split(", but").next()).map(PathBuf::from).unwrap();
+        assert_eq!(read(&at.join("track.txt")), b"ORIGINAL", "{why}");
+        // Undo will not take the new album away on its own, and says so; the old one stays safe
+        let id = batches(&root)[0].id.clone();
+        let said = undo(&root, &id).unwrap();
+        assert!(said.len() == 1 && said[0].contains("Something new is now at"), "{said:?}");
+        assert_eq!(read(&at.join("track.txt")), b"ORIGINAL");
+        // moved away by hand: Undo finishes
+        std::fs::rename(&album, base.join("the new one")).unwrap();
+        assert_eq!(undo(&root, &id), Ok(vec![]));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H4: the old album cannot be moved into the backups after the swap. It stays beside the new one, the
+    /// import says where, and Undo from Repair history brings it back from there.
+    #[test]
+    fn an_old_album_that_cannot_go_into_the_backups_is_found_by_undo_where_it_was_set_aside() {
+        let (base, lib, root) = lab("h4-move");
+        let album = lib.join("Artist").join("Album");
+        let build = base.join("built-album");
+        put(&album.join("track.txt"), b"ORIGINAL");
+        put(&build.join("track.txt"), b"REPLACEMENT");
+        // just before the second line is written, a file takes the old album's place in the backups
+        test_fault::BEFORE_LOG.with(|h| {
+            *h.borrow_mut() = Some(Box::new(|_: &Path| {
+                test_fault::BEFORE_LOG.with(|h| {
+                    *h.borrow_mut() = Some(Box::new(|dir: &Path| {
+                        let slot = std::fs::read_dir(dir.join("items")).unwrap().flatten().next().unwrap().path();
+                        put(&slot.join("Album").join("in the way.txt"), b"in the way");
+                    }))
+                })
+            }))
+        });
+        let placed = import(&root, &lib, &build, &album).unwrap();
+        assert_eq!(read(&album.join("track.txt")), b"REPLACEMENT");
+        let why = placed.problem.unwrap();
+        let aside = names(album.parent().unwrap()).into_iter().find(|n| n.starts_with("Album.replaced-")).map(|n| album.parent().unwrap().join(n)).unwrap();
+        assert!(why.contains(&aside.display().to_string()) && why.contains("Undo in Repair history can still put it back"), "{why}");
+        assert_eq!(undo(&root, &batches(&root)[0].id), Ok(vec![]));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        assert!(!aside.exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H4: cut off right after the old album was set aside (the app closed, the power went): the record is
+    /// already on the disk, and Undo puts the old album back.
+    #[test]
+    fn an_import_cut_off_after_setting_the_old_album_aside_can_be_undone() {
+        let (base, lib, root) = lab("h4-cut");
+        let album = lib.join("Artist").join("Album");
+        put(&album.join("track.txt"), b"ORIGINAL");
+        let r = Replacement::begin(&root, &lib, "cut off", &album, &album).unwrap();
+        std::fs::rename(&album, r.aside()).unwrap();
+        drop(r);
+        assert_eq!(undo(&root, &batches(&root)[0].id), Ok(vec![]));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        assert_eq!(names(album.parent().unwrap()), vec!["Album"]);
+        // and cut off before anything moved: Undo has nothing to do and changes nothing
+        let r = Replacement::begin(&root, &lib, "cut off sooner", &album, &album).unwrap();
+        drop(r);
+        let id = batches(&root).into_iter().find(|b| b.title == "cut off sooner").unwrap().id;
+        assert_eq!(undo(&root, &id), Ok(vec![]));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H3: Undo put the old album back but could not write down that it was done. Run again, it must
+    /// leave the album that is back where it is (it used to move it away again, as "what the import added").
+    #[test]
+    fn an_undo_run_again_after_its_last_write_failed_leaves_the_restored_album_alone() {
+        let (base, lib, root) = lab("h3");
+        let album = lib.join("Artist").join("Album");
+        let build = base.join("built-album");
+        put(&album.join("track.txt"), b"ORIGINAL");
+        put(&build.join("track.txt"), b"REPLACEMENT");
+        let placed = import(&root, &lib, &build, &album).unwrap();
+        assert!(placed.problem.is_none());
+        let id = batches(&root)[0].id.clone();
+        // a real write error at the last write
+        test_fault::BEFORE_MARKER.with(|h| *h.borrow_mut() = Some(Box::new(|dir: &Path| std::fs::create_dir(dir.join("undone.txt")).unwrap())));
+        assert!(undo(&root, &id).unwrap_err().contains("could not be written down"));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        std::fs::remove_dir(root.join(&id).join("undone.txt")).unwrap(); // only the fault's own empty folder
+        // run again: the album that is back stays, and the repair is now marked undone
+        assert_eq!(undo(&root, &id), Ok(vec![]));
+        assert_eq!(read(&album.join("track.txt")), b"ORIGINAL");
+        assert!(batches(&root)[0].undone);
+        // the new album is in the backups, not lost
+        let kept: Vec<_> = crate::importer::util::walk_files(&root.join(&id)).into_iter().filter(|p| read(p) == b"REPLACEMENT").collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// H3: Undo cut off right after a step moved something and before it was written down (the progress
+    /// record one step short; with none written, only the first step can have moved): run again, the old
+    /// album is back and stays back, every time.
+    #[test]
+    fn an_undo_cut_off_between_any_two_steps_finishes_with_the_old_album_back() {
+        for written in 0..=2 {
+            let (base, lib, root) = lab(&format!("h3-cut-{written}"));
+            let album = lib.join("Artist").join("Album");
+            let build = base.join("built-album");
+            put(&album.join("track.txt"), b"ORIGINAL");
+            put(&build.join("track.txt"), b"REPLACEMENT");
+            import(&root, &lib, &build, &album).unwrap();
+            let id = batches(&root)[0].id.clone();
+            test_fault::BEFORE_MARKER.with(|h| *h.borrow_mut() = Some(Box::new(|dir: &Path| std::fs::create_dir(dir.join("undone.txt")).unwrap())));
+            assert!(undo(&root, &id).is_err());
+            let dir = root.join(&id);
+            std::fs::remove_dir(dir.join("undone.txt")).unwrap();
+            // keep only the first `written` steps of the record, as if it was cut off after the rest moved
+            let progress = std::fs::read_to_string(dir.join("undo-progress.txt")).unwrap();
+            let kept: Vec<&str> = progress.lines().take(written).collect();
+            std::fs::write(dir.join("undo-progress.txt"), kept.iter().map(|l| format!("{l}\n")).collect::<String>()).unwrap();
+            if written == 0 {
+                // only the first step (the new album out) had moved: the old one is still in the backups
+                std::fs::rename(&album, text(&entries(&dir)[0], "Backup")).unwrap();
+            }
+            assert_eq!(undo(&root, &id), Ok(vec![]), "with {written} steps written down");
+            assert_eq!(read(&album.join("track.txt")), b"ORIGINAL", "with {written} steps written down");
+            let _ = std::fs::remove_dir_all(&base);
+        }
     }
 }

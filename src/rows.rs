@@ -102,23 +102,48 @@ pub(crate) struct Item<'a> {
     pub about: &'a str,
 }
 
-/// The chosen value with a small arrow: what a menu opens from. Bright under the pointer and while open.
+/// The height of a box at a row's end (a menu's opener, a number), so a card's controls stand level.
+pub(crate) const BOX_H: f32 = 26.0;
+/// How round a box's corners are.
+pub(crate) const BOX_ROUND: u8 = 6;
+
+/// A box's fill: a soft field, a little darker than the card it stands on (worked out from the colors in
+/// use, so every theme gets its own).
+pub(crate) fn box_fill() -> Color32 {
+    theme::BG().lerp_to_gamma(theme::CARD(), 0.45)
+}
+
+/// A box's hairline edge: faint at rest, a step brighter under the pointer, brighter again while its menu
+/// is open or it is being typed in.
+pub(crate) fn box_edge(hot: bool, open: bool) -> Color32 {
+    if open {
+        theme::BORDER().lerp_to_gamma(FAINT(), 0.5)
+    } else if hot {
+        theme::BORDER().lerp_to_gamma(FAINT(), 0.3)
+    } else {
+        theme::CARD().lerp_to_gamma(theme::BORDER(), 0.5)
+    }
+}
+
+/// The chosen value in a box with a small arrow: what a menu opens from. A box at rest too, so it reads
+/// as one; the same fill, edge and height as the number boxes, so a card's right edge is one column.
 fn opener(ui: &mut Ui, name: &str, shown: &str) -> Response {
-    let font = FontId::proportional(14.0);
+    let font = FontId::proportional(13.5);
     let words = ui.painter().layout_no_wrap(shown.to_string(), font, TEXT());
-    let size = vec2(words.size().x + 8.0 + 10.0 + 20.0, 28.0);
+    let size = vec2(11.0 + words.size().x + 10.0 + 8.0 + 9.0, BOX_H);
     let (rect, r) = ui.allocate_exact_size(size, Sense::click());
     script::seen(name, rect);
     let open = egui::Popup::is_id_open(ui.ctx(), egui::Popup::default_response_id(&r));
+    let hot = r.hovered();
     let p = ui.painter();
-    if open || r.hovered() {
-        p.rect_filled(rect, 6, theme::CARD_HOVER());
-    }
-    p.galley(pos2(rect.left() + 10.0, (rect.center().y - words.size().y / 2.0).round()), words, TEXT());
-    // the arrow: down when shut, up while open
-    let a = pos2(rect.right() - 15.0, rect.center().y);
-    let (w, h) = (3.2, if open { -1.8 } else { 1.8 });
-    let stroke = Stroke::new(1.4, DIM());
+    p.rect_filled(rect, BOX_ROUND, if hot || open { box_fill().lerp_to_gamma(theme::CARD(), 0.25) } else { box_fill() });
+    p.rect_stroke(rect, BOX_ROUND, Stroke::new(1.0, box_edge(hot, open)), egui::StrokeKind::Inside);
+    let color = if hot || open { TEXT() } else { TEXT().lerp_to_gamma(DIM(), 0.15) };
+    p.galley_with_override_text_color(pos2(rect.left() + 11.0, (rect.center().y - words.size().y / 2.0).round()), words, color);
+    // the arrow: small and faint, down when shut, up while open
+    let a = pos2(rect.right() - 13.0, rect.center().y);
+    let (w, h) = (2.8, if open { -1.5 } else { 1.5 });
+    let stroke = Stroke::new(1.2, if hot || open { DIM() } else { FAINT() });
     p.line_segment([a + vec2(-w, -h), a + vec2(0.0, h)], stroke);
     p.line_segment([a + vec2(0.0, h), a + vec2(w, -h)], stroke);
     r.on_hover_cursor(egui::CursorIcon::PointingHand)

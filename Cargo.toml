@@ -1,6 +1,6 @@
 [package]
 name = "bradleys-music-tool"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2024"
 
 [dependencies]
@@ -14,7 +14,7 @@ ureq = { version = "3.5.1", features = ["json"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "ico"] }
 md5 = "0.7"
 trash = "5"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_JobObjects", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_IO", "Win32_System_JobObjects", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Globalization"] }
 dirs = "7.0.0"
 chrono = "0.4.45"
 open = "5.4.5"
@@ -23,6 +23,10 @@ regex = "1"
 rfd = "0.18.0"
 # unpacking the helpers the app fetches for itself (see helpers.rs): zip archives, with the deflate it already has
 zip = { version = "9.5.1", default-features = false, features = ["deflate-flate2"] }
+# the tag editor in Rust (src\tagwrite.rs): MP3 tags through id3, which writes ID3v2.3 with every frame kept;
+# FLAC, M4A and the rest, and reading the files a conversion starts from, through lofty
+id3 = "1.17.3"
+lofty = "0.25.5"
 
 [build-dependencies]
 # the program file's icon, name and version (see build.rs)

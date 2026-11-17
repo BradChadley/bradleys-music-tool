@@ -758,9 +758,7 @@ impl HealthPage {
         }
         let wanted = |i: &&Issue| i.sev == *sev && i.cat == *cat && !i.ignored && crate::repair::can_fix_all(&i.fix);
         let n = self.report.issues.iter().filter(wanted).count();
-        // (quiet when these repairs rewrite tags and PowerShell 7 is missing: each finding says why)
-        let can = crate::importer::tools::pwsh().is_some() || !self.report.issues.iter().filter(wanted).any(|i| crate::repair::needs_tag_editor(&i.fix, ""));
-        if n < 2 || !theme::main_action_sized(ui, &format!("Fix all {}", num(n as u64)), 14.0, can).clicked() {
+        if n < 2 || !theme::main_action_sized(ui, &format!("Fix all {}", num(n as u64)), 14.0, true).clicked() {
             return;
         }
         let asks: Vec<crate::repair::Ask> = self
@@ -2224,13 +2222,8 @@ fn issue_block(ui: &mut Ui, i: &Issue, folder: &str, offer: bool, fixable: bool,
             // one word for each way it can be fixed; a single way stands out, a choice is two equal words
             let ways = crate::repair::choices(&i.fix, &i.cat, &i.data, i.files.len());
             let one = ways.len() == 1;
-            // a repair that rewrites tags needs PowerShell 7: without it the word is quiet and says why,
-            // rather than failing after the click
-            let editor = crate::importer::tools::pwsh().is_some();
-            let mut held_back = false;
             for (words, choice) in ways {
-                let can = !looking && (editor || !crate::repair::needs_tag_editor(&i.fix, &choice));
-                held_back |= !can && !looking;
+                let can = !looking;
                 let r = if one { theme::main_action(ui, &words, can) } else { theme::quiet(ui, &words, 14.0, can) };
                 if r.clicked() {
                     click = Click::Fix(choice);
@@ -2238,8 +2231,6 @@ fn issue_block(ui: &mut Ui, i: &Issue, folder: &str, offer: bool, fixable: bool,
             }
             if looking {
                 look_only_line(ui);
-            } else if held_back {
-                no_pwsh_line(ui);
             }
         } else {
             ui.add(Label::new(RichText::new(fix_words(&i.fix)).size(13.0).color(TEXT())).wrap());
@@ -2618,15 +2609,6 @@ fn look_only_line(ui: &mut Ui) {
         if theme::quiet(ui, "Open Settings", 12.5, true).clicked() {
             crate::links::go(crate::links::Go::SettingsBasics);
         }
-    });
-}
-
-/// "PowerShell 7 is not installed ..." with the word that installs it.
-fn no_pwsh_line(ui: &mut Ui) {
-    ui.add_space(2.0);
-    ui.horizontal_wrapped(|ui| {
-        ui.spacing_mut().item_spacing.x = 12.0;
-        crate::helpers::pwsh_line(ui, 12.5, WARN(), false);
     });
 }
 
@@ -3100,7 +3082,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("music-recs-ignore-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("ignored-issues.txt");
-        // a list as Windows PowerShell leaves it: a marker at the start, CRLF line ends, someone else's line
+        // an older Windows list: a marker at the start, CRLF line ends, someone else's line
         std::fs::write(&file, "\u{feff}Missing tags|m:\\music\\other\\album\r\n").unwrap();
         let mut p = page(&[]);
         p.ignore_file = file.clone();

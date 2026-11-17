@@ -233,18 +233,6 @@ impl App {
                     if let Some(page) = top(ui, hello, &now.format("%A, %B %-d").to_string(), lead(&self.facts(today))) {
                         goto = Some(page);
                     }
-                    // imports, tag repairs and backups need PowerShell 7: said here, at the start, when it is
-                    // missing, with the word that installs it
-                    if crate::importer::tools::pwsh().is_none() {
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            theme::centered_row(ui, "home-pwsh", 0.0, |ui| {
-                                ui.spacing_mut().item_spacing.x = 14.0;
-                                crate::helpers::pwsh_line(ui, 14.0, WARN(), false);
-                            });
-                        });
-                    }
-
                     // the same covers and sizes as the Recs grid; the room between them is what is left,
                     // so a full row reaches both edges of the page
                     let (fit, _, side) = recs_grid::columns(wide);

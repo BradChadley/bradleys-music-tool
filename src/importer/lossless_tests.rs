@@ -1,12 +1,20 @@
 //! Tests of what becomes of a lossless download, with "keep lossless downloads as they are" on and off, on
 //! silent made-up files in a scratch folder: never the real downloads or library, and nothing is played.
-//! They need ffmpeg, ffprobe and PowerShell 7 (the app does too).
+//! They need ffmpeg and ffprobe.
 use super::flow_tests::{lab, scan, settle, Lab};
 use super::import::{carry_plan, carry_tags, import_unit, ImportResult};
-use super::lyrics_tests::{found, import_with, same_words, taglib, FOUND_TIMED, WORDS};
+use super::lyrics_tests::{found, import_with, same_words, FOUND_TIMED, WORDS};
 use super::model::{Action, Track};
 use super::scan::{fate, Fate};
 use super::tools;
+use crate::test_tags::{edit_id3, set_lyrics};
+use ::id3::TagLike;
+use lofty::config::{ParseOptions, WriteOptions};
+use lofty::file::AudioFile;
+use lofty::flac::FlacFile;
+use lofty::ogg::OggPictureStorage;
+use lofty::picture::{Picture, PictureType};
+use lofty::prelude::{Accessor, TagExt};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -126,9 +134,11 @@ fn a_flac_album_stays_flac_with_its_tags_put_right_and_its_sound_untouched() {
     }
     // the fifth carries an advert in the comment field itself (ffmpeg writes a comment under FLAC's other
     // name for it), and the sixth a cover of its own
-    taglib(&l, &dir.join("05 Five.flac"), "$f.Tag.Comment = 'Visit https://x.example.com for more'");
+    edit_flac(&dir.join("05 Five.flac"), |f| {
+        f.vorbis_comments_mut().unwrap().insert("COMMENT".into(), "Visit https://x.example.com for more".into());
+    });
     picture(&l, &l.base.join("own.png"), "blue");
-    taglib(&l, &dir.join("06 Six.flac"), &format!("$p = [TagLib.Picture]::new('{}'); $p.Type = 'FrontCover'; $f.Tag.Pictures = [TagLib.IPicture[]]@($p)", l.base.join("own.png").display()));
+    edit_flac(&dir.join("06 Six.flac"), |f| { f.insert_picture(front_cover(&l.base.join("own.png")), None).unwrap(); });
     picture(&l, &dir.join("cover.jpg"), "red");
     settle(&dir);
 
@@ -202,20 +212,7 @@ fn other_lossless_kinds_become_flac_with_the_same_sound_and_their_tags_carried()
     for (i, (ext, title)) in kinds.iter().zip(titles).enumerate() {
         let file = dir.join(format!("0{} {title}.{ext}", i + 1));
         quiet(&l, &file, 1.0 + 0.1 * i as f64, 0, &[]);
-        let mut script = format!(
-            "$f.Tag.Title = '{title}'; $f.Tag.Performers = [string[]]@('Test Artist'); $f.Tag.Album = 'Poured'; $f.Tag.Year = 2022; $f.Tag.Track = {}; $f.Tag.Genres = [string[]]@('Rock')\n\
-             $f.Tag.Lyrics = \"line one`nline two\"; $f.Tag.Comment = 'Bought it'; $f.Tag.BeatsPerMinute = 120; $f.Tag.Composers = [string[]]@('Composer'); $f.Tag.ISRC = 'USABC2200001'\n",
-            i + 1
-        );
-        match *ext {
-            // a rating the way each kind holds one
-            "wav" => script.push_str("$id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $true); $p = [TagLib.Id3v2.PopularimeterFrame]::Get($id3, 'SomePlayer', $true); $p.Rating = 196; $p.PlayCount = 7"),
-            // (and the album artist under WavPack's own name for it, spelled another way than the import will)
-            "wv" => script.push_str("$f.GetTag([TagLib.TagTypes]::Ape, $true).SetValue('Rating', '80'); $f.Tag.AlbumArtists = [string[]]@('test artist')"),
-            // and a cover of its own in the Apple Lossless files
-            _ => script.push_str(&format!("$p = [TagLib.Picture]::new('{}'); $p.Type = 'FrontCover'; $f.Tag.Pictures = [TagLib.IPicture[]]@($p)", l.base.join("own.jpg").display())),
-        }
-        taglib(&l, &file, &script);
+        carry_fixture(&file, ext, title, i as u32 + 1, &l.base.join("own.jpg"));
     }
     picture(&l, &dir.join("cover.jpg"), "red");
     settle(&dir);
@@ -283,7 +280,7 @@ fn a_flac_that_ffmpeg_had_to_rewrite_keeps_its_sound_and_its_tags() {
     assert!(tools::run_limited(&mut c, 60));
     let mut t = Track::default();
     t.set_new("title", "One (fixed)");
-    let failed = carry_tags(&l.ctx, &[carry_plan(&out, &src, &t)], &l.ctx.work_dir);
+    let failed = carry_tags(&l.ctx, &[carry_plan(&out, &src, &t)]);
     assert!(failed.is_empty(), "{failed:?}");
     let (was, now) = (flac_parts(&src), flac_parts(&out));
     assert!(was.0 == now.0 && was.2 == now.2, "the sound changed");
@@ -300,7 +297,7 @@ fn a_tag_edit_of_a_flac_that_is_not_an_import_keeps_the_rating_and_the_sound() {
     quiet(&l, &file, 1.0, 0, &[("ARTIST", "Test Artist"), ("ALBUM", "Mine"), ("TITLE", "One"), ("TRACKNUMBER", "1"), ("RATING", "80"), ("LYRICS", WORDS)]);
     let was = flac_parts(&file);
     let plan = serde_json::json!({ "File": file.to_string_lossy(), "Set": { "title": "One (fixed)", "compilation": "1" }, "Junk": [], "Cover": null, "CoverMode": "missing", "Vbr": false });
-    assert!(carry_tags(&l.ctx, &[plan], &l.ctx.work_dir).is_empty());
+    assert!(carry_tags(&l.ctx, &[plan]).is_empty());
     let now = flac_parts(&file);
     assert!(was.0 == now.0 && was.2 == now.2, "the sound changed");
     let t = tags(&l, &file);
@@ -316,11 +313,11 @@ fn a_cover_found_online_takes_the_place_of_the_one_in_a_flac() {
     quiet(&l, &file, 1.0, 0, &[("ARTIST", "Test Artist"), ("ALBUM", "Covered"), ("TITLE", "One"), ("TRACKNUMBER", "1")]);
     picture(&l, &l.base.join("old.png"), "blue");
     picture(&l, &l.base.join("new.jpg"), "red");
-    taglib(&l, &file, &format!("$p = [TagLib.Picture]::new('{}'); $p.Type = 'FrontCover'; $f.Tag.Pictures = [TagLib.IPicture[]]@($p)", l.base.join("old.png").display()));
+    edit_flac(&file, |f| { f.insert_picture(front_cover(&l.base.join("old.png")), None).unwrap(); });
     let was = flac_parts(&file);
     assert_eq!(was.1, 1);
     let plan = serde_json::json!({ "File": file.to_string_lossy(), "Set": {}, "Junk": [], "Cover": l.base.join("new.jpg").to_string_lossy(), "CoverMode": "all", "Vbr": false, "DropPersonal": true });
-    assert!(carry_tags(&l.ctx, &[plan], &l.ctx.work_dir).is_empty());
+    assert!(carry_tags(&l.ctx, &[plan]).is_empty());
     let now = flac_parts(&file);
     assert!(was.0 == now.0 && was.2 == now.2, "the sound changed");
     assert_eq!(now.1, 1, "one picture, not two");
@@ -492,4 +489,66 @@ fn a_lossless_copy_is_offered_over_a_lossy_one_and_never_gives_way_to_one() {
     let (r, said, at) = import_ticked(&l, &dust);
     assert_eq!(r, ImportResult::Ok, "{said}");
     assert_eq!(names(&at), ["01 One.flac", "02 Two.mp3"]);
+}
+
+/// Native fixture tags, independent of the carry code that the tests exercise.
+fn front_cover(path: &Path) -> Picture {
+    let mut picture = Picture::from_reader(&mut std::fs::File::open(path).unwrap()).unwrap();
+    picture.set_pic_type(PictureType::CoverFront);
+    picture
+}
+
+fn edit_flac(path: &Path, edit: impl FnOnce(&mut FlacFile)) {
+    let mut file = FlacFile::read_from(&mut std::fs::File::open(path).unwrap(), ParseOptions::new()).unwrap();
+    edit(&mut file);
+    file.save_to_path(path, WriteOptions::new()).unwrap();
+}
+
+fn carry_fixture(path: &Path, ext: &str, title: &str, no: u32, cover: &Path) {
+    match ext {
+        "wav" => edit_id3(path, |tag| {
+            tag.set_title(title);
+            tag.set_artist("Test Artist");
+            tag.set_album("Poured");
+            tag.set_year(2022);
+            tag.set_track(no);
+            tag.set_genre("Rock");
+            set_lyrics(tag, "line one\nline two");
+            tag.add_frame(::id3::frame::Comment { lang: "eng".into(), description: String::new(), text: "Bought it".into() });
+            tag.set_text("TBPM", "120");
+            tag.set_text("TCOM", "Composer");
+            tag.set_text("TSRC", "USABC2200001");
+            tag.add_frame(::id3::frame::Popularimeter { user: "SomePlayer".into(), rating: 196, counter: 7 });
+        }),
+        "wv" => {
+            let mut tag = lofty::ape::ApeTag::new();
+            for (key, value) in [
+                ("Title", title), ("Artist", "Test Artist"), ("Album", "Poured"), ("Year", "2022"),
+                ("Track", &no.to_string()), ("Genre", "Rock"), ("Lyrics", "line one\nline two"),
+                ("Comment", "Bought it"), ("BPM", "120"), ("Composer", "Composer"), ("ISRC", "USABC2200001"),
+                ("Rating", "80"), ("Album Artist", "test artist"),
+            ] {
+                tag.insert(lofty::ape::ApeItem::new(key.into(), lofty::tag::ItemValue::Text(value.into())).unwrap());
+            }
+            tag.save_to_path(path, WriteOptions::new()).unwrap();
+        }
+        "m4a" => {
+            use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst};
+            let mut tag = Ilst::new();
+            tag.set_title(title.into());
+            tag.set_artist("Test Artist".into());
+            tag.set_album("Poured".into());
+            tag.insert(Atom::new(AtomIdent::Fourcc(*b"\xa9day"), AtomData::UTF8("2022".into())));
+            tag.set_track(no);
+            tag.set_genre("Rock".into());
+            tag.set_comment("Bought it".into());
+            tag.insert(Atom::new(AtomIdent::Fourcc(*b"\xa9lyr"), AtomData::UTF8("line one\nline two".into())));
+            tag.insert(Atom::new(AtomIdent::Fourcc(*b"\xa9wrt"), AtomData::UTF8("Composer".into())));
+            tag.insert(Atom::new(AtomIdent::Fourcc(*b"tmpo"), AtomData::SignedInteger(120)));
+            tag.insert(Atom::new(AtomIdent::Freeform { mean: "com.apple.iTunes".into(), name: "ISRC".into() }, AtomData::UTF8("USABC2200001".into())));
+            tag.insert_picture(front_cover(cover));
+            tag.save_to_path(path, WriteOptions::new()).unwrap();
+        }
+        _ => panic!("unexpected fixture kind: {ext}"),
+    }
 }

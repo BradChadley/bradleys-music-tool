@@ -82,7 +82,7 @@ fn key(file: &Path, analyze: bool) -> Option<String> {
     Some(format!("{}|{}|{}|{}|{}", CACHE_VERSION, file.to_string_lossy().to_lowercase(), md.len(), ticks, if analyze { 1 } else { 0 }))
 }
 
-// ---------- cache on disk (same file format as the PowerShell version) ----------
+// ---------- cache on disk (keeps the existing file format) ----------
 pub fn load_cache(path: &Path) {
     if LOADED.set(()).is_err() {
         return;

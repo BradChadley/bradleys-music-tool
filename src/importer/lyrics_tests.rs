@@ -1,11 +1,13 @@
 //! Tests of what happens to a download's tags and lyrics on import, on silent made-up files in a scratch
-//! folder: never the real downloads or library, and nothing is played. They need ffmpeg, ffprobe and
-//! PowerShell 7 (the app does too).
+//! folder: never the real downloads or library, and nothing is played. They need ffmpeg and ffprobe.
 use super::flow_tests::{lab, scan, settle, Lab};
 use super::id3::{self, Frame};
 use super::import::{carry_plan, carry_tags, import_unit, ImportResult};
 use super::model::Track;
 use super::tools;
+use crate::test_tags::{edit_id3, personal, set_lyrics, timed};
+use ::id3::TagLike;
+use ::id3::frame::{Comment, ExtendedText, Private, UniqueFileIdentifier};
 use std::path::{Path, PathBuf};
 
 pub(super) const WORDS: &str = "The lamps along the water\nburn a little lower now\nand every boat that leaves the harbor\ntakes a piece of you somehow";
@@ -25,22 +27,6 @@ fn silent(l: &Lab, out: &Path, tags: &[(&str, &str)]) {
     }
     c.arg(out).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
     assert!(tools::run_limited(&mut c, 60), "ffmpeg could not make {}", out.display());
-}
-
-/// Changes a file's tags with the tag library, as a tagger or a player would have written them.
-/// `script` works on `$f` (the open file) and `$id3` (its ID3v2 tag, for an MP3).
-pub(super) fn taglib(l: &Lab, file: &Path, script: &str) {
-    let dll = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tag-editor").join("TagLibSharp.dll");
-    let ps = l.base.join(format!("tag-{:x}.ps1", super::scan::rand_id()));
-    let text = format!(
-        "$ErrorActionPreference = 'Stop'\nAdd-Type -Path '{}'\n$f = [TagLib.File]::Create('{}')\n$id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $false)\n{script}\n$f.Save(); $f.Dispose()\n",
-        dll.display(),
-        file.display()
-    );
-    std::fs::write(&ps, text).unwrap();
-    let mut c = tools::command(&tools::pwsh().expect("PowerShell 7"), false);
-    c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    assert!(tools::run_limited(&mut c, 120), "the tag script failed for {}", file.display());
 }
 
 fn frames(file: &Path) -> Vec<Frame> {
@@ -156,16 +142,15 @@ fn an_mp3_ffmpeg_had_to_rewrite_gets_back_what_ffmpeg_dropped() {
     let l = lab("carry-mp3");
     let src = l.base.join("src.mp3");
     silent(&l, &src, &[("artist", "Test Artist"), ("album", "Kept"), ("title", "One"), ("track", "3/12")]);
-    taglib(
-        &l,
-        &src,
-        "$f.Tag.Lyrics = \"line one`nline two\"; $f.Tag.Comment = 'A comment'; $f.Tag.Grouping = 'Group'; $f.Tag.BeatsPerMinute = 120\n\
-         $id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $true)\n\
-         $p = [TagLib.Id3v2.PopularimeterFrame]::Get($id3, 'SomePlayer', $true); $p.Rating = 196; $p.PlayCount = 7\n\
-         $u = [TagLib.Id3v2.UniqueFileIdentifierFrame]::Get($id3, 'http://example.org', $true); $u.Identifier = [TagLib.ByteVector]::FromString('abc', [TagLib.StringType]::Latin1)\n\
-         $g = [TagLib.Id3v2.AttachmentFrame]::Get($id3, 'Cue points', [TagLib.PictureType]::NotAPicture, $true); $g.Type = [TagLib.PictureType]::NotAPicture; $g.MimeType = 'application/octet-stream'; $g.Data = [TagLib.ByteVector]::FromString('cue points', [TagLib.StringType]::Latin1)\n\
-         $s = [TagLib.Id3v2.SynchronisedLyricsFrame]::Get($id3, '', 'eng', [TagLib.Id3v2.SynchedTextType]::Lyrics, $true); $s.Format = [TagLib.Id3v2.TimestampFormat]::AbsoluteMilliseconds; $s.Text = @([TagLib.Id3v2.SynchedText]::new(1000, 'line one'))",
-    );
+    edit_id3(&src, |tag| {
+        set_lyrics(tag, "line one\nline two");
+        tag.add_frame(Comment { lang: "eng".into(), description: String::new(), text: "A comment".into() });
+        tag.set_text("TIT1", "Group");
+        tag.set_text("TBPM", "120");
+        personal(tag);
+        tag.add_frame(UniqueFileIdentifier { owner_identifier: "http://example.org".into(), identifier: b"abc".to_vec() });
+        timed(tag, "", &[(1000, "line one")]);
+    });
     let before = frames(&src);
     for id in ["USLT", "SYLT", "COMM", "POPM", "GEOB", "UFID", "TIT1", "TBPM"] {
         assert!(has(&before, id), "the made-up file lacks {id}");
@@ -181,7 +166,7 @@ fn an_mp3_ffmpeg_had_to_rewrite_gets_back_what_ffmpeg_dropped() {
     // the carry: what is about the music is back, the import's own change to the title stays
     let mut t = Track::default();
     t.set_new("title", "One (fixed)");
-    let failed = carry_tags(&l.ctx, &[carry_plan(&out, &src, &t)], &l.ctx.work_dir);
+    let failed = carry_tags(&l.ctx, &[carry_plan(&out, &src, &t)]);
     assert!(failed.is_empty(), "{failed:?}");
     let fr = frames(&out);
     for id in ["USLT", "SYLT", "COMM", "UFID", "TIT1", "TBPM"] {
@@ -198,7 +183,7 @@ fn an_mp3_ffmpeg_had_to_rewrite_gets_back_what_ffmpeg_dropped() {
     c.args(["-hide_banner", "-v", "error", "-y", "-i"]).arg(&src).args(["-map", "0:a:0", "-c:a", "copy", "-map_metadata", "0", "-metadata", "comment=", "-id3v2_version", "3"]).arg(&out2);
     assert!(tools::run_limited(&mut c, 60));
     t.junk.push(("comment".into(), "A comment".into(), "web link".into()));
-    assert!(carry_tags(&l.ctx, &[carry_plan(&out2, &src, &t)], &l.ctx.work_dir).is_empty());
+    assert!(carry_tags(&l.ctx, &[carry_plan(&out2, &src, &t)]).is_empty());
     let fr = frames(&out2);
     assert!(!has(&fr, "COMM") && !has(&fr, "POPM") && has(&fr, "USLT"));
 }
@@ -213,7 +198,11 @@ fn every_file_of_a_long_album_is_edited_the_same_way() {
     for i in 1..=9 {
         let src = l.base.join(format!("src-{i}.mp3"));
         silent(&l, &src, &[("artist", "Test Artist"), ("album", "Long"), ("title", "Song")]);
-        taglib(&l, &src, "$f.Tag.Lyrics = \"line one`nline two\"; $f.Tag.BeatsPerMinute = 120; $f.Tag.Grouping = 'Group'");
+        edit_id3(&src, |tag| {
+            set_lyrics(tag, "line one\nline two");
+            tag.set_text("TBPM", "120");
+            tag.set_text("TIT1", "Group");
+        });
         // ffmpeg rewrites it the way the import's fallback does, which hides the lyrics
         let out = l.base.join(format!("out-{i}.mp3"));
         let mut c = tools::command(&l.ctx.ffmpeg, false);
@@ -223,7 +212,7 @@ fn every_file_of_a_long_album_is_edited_the_same_way() {
         plans.push(carry_plan(&out, &src, &Track::default()));
         outs.push(out);
     }
-    let failed = carry_tags(&l.ctx, &plans, &l.ctx.work_dir);
+    let failed = carry_tags(&l.ctx, &plans);
     assert!(failed.is_empty(), "{failed:?}");
     for out in &outs {
         let fr = frames(out);
@@ -235,17 +224,14 @@ fn every_file_of_a_long_album_is_edited_the_same_way() {
 /// own private entry beside another program's.
 fn played_mp3(l: &Lab, file: &Path, tags: &[(&str, &str)]) {
     silent(l, file, tags);
-    taglib(
-        l,
-        file,
-        "$f.Tag.Lyrics = \"line one`nline two\"; $f.Tag.BeatsPerMinute = 120\n\
-         $id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $true)\n\
-         $p = [TagLib.Id3v2.PopularimeterFrame]::Get($id3, 'SomePlayer', $true); $p.Rating = 196; $p.PlayCount = 7\n\
-         $g = [TagLib.Id3v2.AttachmentFrame]::Get($id3, 'Cue points', [TagLib.PictureType]::NotAPicture, $true); $g.Type = [TagLib.PictureType]::NotAPicture; $g.MimeType = 'application/octet-stream'; $g.Data = [TagLib.ByteVector]::FromString('cue points', [TagLib.StringType]::Latin1)\n\
-         $d = [TagLib.Id3v2.PrivateFrame]::Get($id3, 'TRAKTOR4', $true); $d.PrivateData = [TagLib.ByteVector]::FromString('deck data', [TagLib.StringType]::Latin1)\n\
-         $o = [TagLib.Id3v2.PrivateFrame]::Get($id3, 'SomeEncoder', $true); $o.PrivateData = [TagLib.ByteVector]::FromString('settings', [TagLib.StringType]::Latin1)\n\
-         $r = [TagLib.Id3v2.UserTextInformationFrame]::Get($id3, 'FMPS_RATING', $true); $r.Text = @('0.8')",
-    );
+    edit_id3(file, |tag| {
+        set_lyrics(tag, "line one\nline two");
+        tag.set_text("TBPM", "120");
+        personal(tag);
+        tag.add_frame(Private { owner_identifier: "TRAKTOR4".into(), private_data: b"deck data".to_vec() });
+        tag.add_frame(Private { owner_identifier: "SomeEncoder".into(), private_data: b"settings".to_vec() });
+        tag.add_frame(ExtendedText { description: "FMPS_RATING".into(), value: "0.8".into() });
+    });
     let fr = frames(file);
     for id in ["USLT", "POPM", "GEOB", "TBPM"] {
         assert!(has(&fr, id), "the made-up file lacks {id}");
@@ -278,7 +264,7 @@ fn a_tag_edit_that_is_not_an_import_keeps_the_rating() {
     let file = l.base.join("mine.mp3");
     played_mp3(&l, &file, &[("artist", "Test Artist"), ("album", "Mine"), ("title", "One"), ("track", "1")]);
     let plan = serde_json::json!({ "File": file.to_string_lossy(), "Set": { "title": "One (fixed)" }, "Junk": [], "Cover": null, "CoverMode": "missing", "Vbr": false });
-    assert!(carry_tags(&l.ctx, &[plan], &l.ctx.work_dir).is_empty());
+    assert!(carry_tags(&l.ctx, &[plan]).is_empty());
     let fr = frames(&file);
     assert_eq!(text(&fr, "TIT2"), "One (fixed)");
     assert!(has(&fr, "POPM") && has(&fr, "GEOB") && stand_ins(&fr).contains(&"fmps_rating".to_string()), "{:?}", fr.iter().map(|f| f.id.as_str()).collect::<Vec<_>>());
@@ -296,11 +282,12 @@ fn mixed_album(l: &Lab, folder: &str, album: &str) -> PathBuf {
         let n = no.to_string();
         silent(l, &dir.join(format!("0{no} {title}.mp3")), &[("artist", "Test Artist"), ("album", album), ("title", title), ("track", n.as_str()), ("date", "2021")]);
     }
-    let words = WORDS.replace('\n', "`n");
-    taglib(l, &dir.join("02 Good.mp3"), &format!("$f.Tag.Lyrics = \"{words}\""));
-    taglib(l, &dir.join("03 Address.mp3"), "$f.Tag.Lyrics = 'www.t.me/pmedia_music'");
-    taglib(l, &dir.join("04 Credit.mp3"), &format!("$f.Tag.Lyrics = \"{words}`nLyrics provided by SomeSite.com\""));
-    taglib(l, &dir.join("05 Hidden.mp3"), &format!("$id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $true); $id3.SetUserTextAsString('USLT', \"{words}\")"));
+    edit_id3(&dir.join("02 Good.mp3"), |tag| set_lyrics(tag, WORDS));
+    edit_id3(&dir.join("03 Address.mp3"), |tag| set_lyrics(tag, "www.t.me/pmedia_music"));
+    edit_id3(&dir.join("04 Credit.mp3"), |tag| set_lyrics(tag, &format!("{WORDS}\nLyrics provided by SomeSite.com")));
+    edit_id3(&dir.join("05 Hidden.mp3"), |tag| {
+        tag.add_frame(ExtendedText { description: "USLT".into(), value: WORDS.into() });
+    });
     settle(&dir);
     dir
 }

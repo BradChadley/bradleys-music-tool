@@ -1,8 +1,11 @@
 //! The lyric repairs and their Undo, on silent made-up files in a scratch folder: never the real library,
 //! never online (LRCLIB's "answers" are put where the app keeps them), and nothing is played. They need
-//! ffmpeg, ffprobe and PowerShell 7 (the app does too).
+//! ffmpeg and ffprobe.
 use super::*;
 use crate::importer::id3;
+use crate::test_tags::{edit_id3, personal, set_lyrics, timed};
+use ::id3::{Tag, TagLike};
+use ::id3::frame::{ExtendedText, Lyrics};
 use crate::importer::lyrics::{Answer, Lookup};
 
 const WORDS: &str = "The lamps along the water\nburn a little lower now\nand every boat that leaves the harbor\ntakes a piece of you somehow";
@@ -31,9 +34,8 @@ fn lab(name: &str) -> Lab {
 }
 
 impl Lab {
-    /// A one-second silent MP3 of the album "A\Album (2020)". `script` changes its tags with the tag library
-    /// first (`$f`: the open file, `$id3`: its ID3v2 tag).
-    fn track(&self, no: u32, title: &str, script: &str) -> PathBuf {
+    /// A one-second silent MP3 of the album "A\Album (2020)", with a player's tags.
+    fn track(&self, no: u32, title: &str, edit: impl FnOnce(&mut Tag)) -> PathBuf {
         let out = self.lib.join("A").join("Album (2020)").join(format!("0{no} {title}.mp3"));
         std::fs::create_dir_all(out.parent().unwrap()).unwrap();
         let mut c = tools::command(&self.tools.ffmpeg, false);
@@ -42,26 +44,11 @@ impl Lab {
         c.arg(&out).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         assert!(tools::run_limited(&mut c, 60));
         // every file carries what a player or tagger would have left in it, lyrics or not
-        let all = format!(
-            "$p = [TagLib.Id3v2.PopularimeterFrame]::Get($id3, 'SomePlayer', $true); $p.Rating = 196; $p.PlayCount = 7\n\
-             $g = [TagLib.Id3v2.AttachmentFrame]::Get($id3, 'Cue points', [TagLib.PictureType]::NotAPicture, $true); $g.Type = [TagLib.PictureType]::NotAPicture; $g.MimeType = 'application/octet-stream'; $g.Data = [TagLib.ByteVector]::FromString('cue points', [TagLib.StringType]::Latin1)\n{script}"
-        );
-        self.taglib(&out, &all);
+        edit_id3(&out, |tag| {
+            personal(tag);
+            edit(tag);
+        });
         out
-    }
-
-    fn taglib(&self, file: &Path, script: &str) {
-        let dll = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tag-editor").join("TagLibSharp.dll");
-        let ps = self.base.join(format!("tag-{:x}.ps1", crate::importer::scan::rand_id()));
-        let text = format!(
-            "$ErrorActionPreference = 'Stop'\nAdd-Type -Path '{}'\n$f = [TagLib.File]::Create('{}')\n$id3 = $f.GetTag([TagLib.TagTypes]::Id3v2, $true)\n{script}\n$f.Save(); $f.Dispose()\n",
-            dll.display(),
-            file.display()
-        );
-        std::fs::write(&ps, text).unwrap();
-        let mut c = tools::command(&tools::pwsh().expect("PowerShell 7"), false);
-        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&ps).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-        assert!(tools::run_limited(&mut c, 120), "the tag script failed for {}", file.display());
     }
 
     fn keep(&self, title: &str, answer: Answer) {
@@ -100,14 +87,10 @@ fn others(file: &Path) -> Vec<String> {
 fn found() -> Answer {
     Answer::Found { plain: PLAIN.into(), timed: TIMED.into() }
 }
-fn ps(text: &str) -> String {
-    text.replace('\n', "`n")
-}
-
 #[test]
 fn missing_lyrics_are_filled_without_keeping_a_copy_of_the_file_and_undo_takes_them_out_again() {
     let l = lab("fill");
-    let (empty, good, unknown) = (l.track(1, "Empty", ""), l.track(2, "Good", &format!("$f.Tag.Lyrics = \"{}\"", ps(WORDS))), l.track(3, "Unknown", ""));
+    let (empty, good, unknown) = (l.track(1, "Empty", |_| {}), l.track(2, "Good", |tag| set_lyrics(tag, WORDS)), l.track(3, "Unknown", |_| {}));
     l.keep("Empty", found());
     l.keep("Good", found());
     let before = (others(&empty), std::fs::metadata(&empty).unwrap().len());
@@ -135,7 +118,7 @@ fn missing_lyrics_are_filled_without_keeping_a_copy_of_the_file_and_undo_takes_t
     // lyrics somebody changed after the repair are theirs: Undo leaves them and says so
     let done = l.fix("lyrics-fill", "", &[&empty]);
     assert_eq!(lyrics(&empty), TIMED);
-    l.taglib(&empty, "$f.Tag.Lyrics = 'my own words now'");
+    edit_id3(&empty, |tag| set_lyrics(tag, "my own words now"));
     let said = undo(&l.root, &done.batch.unwrap()).unwrap();
     assert!(said.len() == 1 && said[0].contains("changed after the repair"), "{said:?}");
     assert_eq!(lyrics(&empty), "my own words now");
@@ -145,9 +128,9 @@ fn missing_lyrics_are_filled_without_keeping_a_copy_of_the_file_and_undo_takes_t
 fn flagged_lyrics_are_replaced_or_cleaned_and_undo_brings_the_old_words_back() {
     let l = lab("junk");
     let credit_text = format!("{WORDS}\nLyrics provided by SomeSite.com");
-    let address = l.track(1, "Address", "$f.Tag.Lyrics = 'www.t.me/pmedia_music'");
-    let credit = l.track(2, "Credit", &format!("$f.Tag.Lyrics = \"{}\"", ps(&credit_text)));
-    let other = l.track(3, "Other", &format!("$f.Tag.Lyrics = \"{}\"", ps(&credit_text)));
+    let address = l.track(1, "Address", |tag| set_lyrics(tag, "www.t.me/pmedia_music"));
+    let credit = l.track(2, "Credit", |tag| set_lyrics(tag, &credit_text));
+    let other = l.track(3, "Other", |tag| set_lyrics(tag, &credit_text));
     l.keep("Address", Answer::Nothing);
     l.keep("Credit", found());
 
@@ -174,7 +157,9 @@ fn flagged_lyrics_are_replaced_or_cleaned_and_undo_brings_the_old_words_back() {
 #[test]
 fn lyrics_no_player_reads_go_into_the_lyrics_field_and_undo_puts_the_file_back_whole() {
     let l = lab("unhide");
-    let hidden = l.track(1, "Hidden", &format!("$id3.SetUserTextAsString('USLT', \"{}\")", ps(WORDS)));
+    let hidden = l.track(1, "Hidden", |tag| {
+        tag.add_frame(ExtendedText { description: "USLT".into(), value: WORDS.into() });
+    });
     let bytes = std::fs::read(&hidden).unwrap();
     assert_eq!(lyrics(&hidden), "");
 
@@ -186,4 +171,75 @@ fn lyrics_no_player_reads_go_into_the_lyrics_field_and_undo_puts_the_file_back_w
     assert_eq!(l.kept_files(), 1);
     assert_eq!(undo(&l.root, &done.batch.unwrap()).unwrap(), Vec::<String>::new());
     assert_eq!(std::fs::read(&hidden).unwrap(), bytes);
+}
+
+/// Codex's review, H2: an import puts a new copy of the track in place while a lyrics repair is working on a
+/// copy of the old one. The repair must see that its file changed and save nothing, so the import stays.
+#[test]
+fn a_lyrics_repair_never_saves_over_a_track_an_import_replaced_meanwhile() {
+    let l = lab("import-meanwhile");
+    let text = format!("{WORDS}\nLyrics provided by SomeSite.com");
+    let file = l.track(1, "Overlap", |tag| set_lyrics(tag, &text));
+    let album = file.parent().unwrap().to_path_buf();
+    // the import's finished album: the same track, three seconds long
+    let build = l.base.join("import-build");
+    std::fs::create_dir_all(&build).unwrap();
+    let new = build.join(file.file_name().unwrap());
+    let mut c = tools::command(&l.tools.ffmpeg, false);
+    c.args(["-hide_banner", "-nostdin", "-v", "error", "-y", "-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo", "-t", "3", "-c:a", "libmp3lame", "-b:a", "320k", "-metadata", "title=Overlap", "-metadata", "artist=A", "-metadata", "album=Album"]);
+    c.arg(&new).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    assert!(tools::run_limited(&mut c, 60));
+    let imported = std::fs::read(&new).unwrap();
+    let (root, library, installed, expected) = (l.root.clone(), l.lib.clone(), file.clone(), imported.clone());
+    test_pause::AFTER_TAGS.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            let placed = crate::importer::import::place_album(&root, &library, "A", &build, &album, Some(&album)).unwrap();
+            assert!(placed.problem.is_none() && placed.old_copy.is_some());
+            assert_eq!(std::fs::read(&installed).unwrap(), expected);
+        }))
+    });
+    let done = l.fix("lyrics-junk", "cut", &[&file]);
+    // the repair saw the new file and saved nothing: the imported track is in the library, byte for byte
+    assert_eq!(done.changed, 0, "{:?}", done.problems);
+    assert!(done.problems.len() == 1 && done.problems[0].contains("changed by something else"), "{:?}", done.problems);
+    assert!(std::fs::read(&file).unwrap() == imported, "the imported track was written over");
+    // and the import's own Undo still brings the old album back
+    let import = crate::undo::batches(&l.root).into_iter().find(|b| b.title.starts_with("Import: replaced A")).unwrap();
+    assert_eq!(crate::undo::undo(&l.root, &import.id).unwrap(), Vec::<String>::new());
+    assert_eq!(lyrics(&file), text);
+}
+
+/// Codex's review, H1: an MP3 with a second lyrics frame (a translation) and timed lyrics. A lyrics cleanup
+/// takes out every lyrics frame; the light undo record holds one text, so Undo used to bring back only the
+/// first. Such a file keeps its whole old copy, and Undo puts it back byte for byte.
+#[test]
+fn an_mp3_with_more_than_one_lyrics_frame_comes_back_whole_after_undo() {
+    let l = lab("many-frames");
+    let text = format!("{WORDS}\nLyrics provided by SomeSite.com");
+    let file = l.track(1, "Multi", |tag| {
+        set_lyrics(tag, &text);
+        tag.add_frame(Lyrics { lang: "fra".into(), description: "translation".into(), text: "Une traduction a garder".into() });
+        timed(tag, "timed original", &[(100, "The lamps"), (600, "along the water")]);
+    });
+    // one timed frame alone counts too
+    let timed_only = l.track(2, "Timed", |tag| {
+        set_lyrics(tag, &text);
+        timed(tag, "t", &[(100, "The lamps")]);
+    });
+    let count = |f: &Path| {
+        let f = id3::frames(f).unwrap();
+        (f.iter().filter(|x| x.id == "USLT").count(), f.iter().filter(|x| x.id == "SYLT").count())
+    };
+    assert_eq!((count(&file), count(&timed_only)), ((2, 1), (1, 1)));
+    let before = (std::fs::read(&file).unwrap(), std::fs::read(&timed_only).unwrap());
+    let done = l.fix("lyrics-junk", "cut", &[&file, &timed_only]);
+    assert!(done.problems.is_empty(), "{:?}", done.problems);
+    assert_eq!(done.changed, 2);
+    assert!(!lyrics(&file).contains("SomeSite"));
+    // the whole old files are kept, so nothing of them is only in the undo record's words
+    assert_eq!(l.kept_files(), 2);
+    assert_eq!(undo(&l.root, &done.batch.unwrap()).unwrap(), Vec::<String>::new());
+    assert_eq!(count(&file), (2, 1));
+    assert!(std::fs::read(&file).unwrap() == before.0, "the file did not come back byte for byte");
+    assert!(std::fs::read(&timed_only).unwrap() == before.1, "the file did not come back byte for byte");
 }

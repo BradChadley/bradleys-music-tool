@@ -1,6 +1,5 @@
 //! The helper programs the app fetches for itself, so nobody is sent to find them: ffmpeg (with ffprobe),
-//! which imports and checks need, and the Soulseek client (slskd), which Downloads drives. PowerShell 7 is
-//! not fetched: "Install PowerShell 7" runs winget in a window of its own (`install_pwsh`).
+//! which imports and checks need, and the Soulseek client (slskd), which Downloads drives.
 //!
 //! One way in for each helper (`start`): a version pinned below with its size and SHA-256, fetched over
 //! https only, saved under a temporary name beside where it goes, checked, unpacked, then moved into place.
@@ -580,89 +579,6 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-// ------------------------------------------------------------------ PowerShell 7
-
-/// The window "Install PowerShell 7" opened, while it is open (in a test run, which opens none, the time
-/// of the click).
-static PWSH_RUN: Mutex<Option<(Instant, Option<std::process::Child>)>> = Mutex::new(None);
-
-/// winget (Windows' own app installer), where it is: on the PATH or as its app alias.
-fn winget() -> Option<PathBuf> {
-    let there = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-    let on_path = std::env::var_os("PATH").into_iter().flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>()).map(|d| d.join("winget.exe"));
-    let alias = std::env::var_os("LOCALAPPDATA").map(|l| PathBuf::from(l).join("Microsoft").join("WindowsApps").join("winget.exe"));
-    on_path.chain(alias).find(|p| there(p))
-}
-
-/// What "Install PowerShell 7" runs: winget, in a console window of its own (Windows may ask to allow
-/// the install there), which stays open at the end so its last words can be read.
-fn pwsh_install_line(winget: &Path) -> String {
-    format!("/c \"\"{}\" install --id Microsoft.PowerShell --source winget --exact & echo. & pause\"", winget.display())
-}
-
-/// "Install PowerShell 7": runs winget in its own window, or where there is no winget, opens Microsoft's
-/// page on installing it. The app notices the new PowerShell by itself within ten seconds
-/// (`importer::tools::pwsh`). A test run (`MUSIC_RECS_DATA` set) only writes down what it would run.
-pub fn install_pwsh() {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-    let test = std::env::var_os("MUSIC_RECS_DATA").is_some_and(|v| !v.is_empty());
-    if pwsh_installing() {
-        return; // its window is open already
-    }
-    match winget() {
-        Some(w) => {
-            let line = pwsh_install_line(&w);
-            if test {
-                crate::config::log(&format!("helpers: a test run; would run cmd.exe {line}"));
-                *PWSH_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), None));
-                return;
-            }
-            crate::config::log("helpers: installing PowerShell 7 with winget, in its own window");
-            let cmd = std::env::var_os("ComSpec").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("cmd.exe"));
-            match std::process::Command::new(cmd).raw_arg(&line).creation_flags(CREATE_NEW_CONSOLE).spawn() {
-                Ok(child) => *PWSH_RUN.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), Some(child))),
-                Err(e) => {
-                    crate::config::log(&format!("helpers: winget could not be started ({e}); opening Microsoft's page instead"));
-                    let _ = open::that(crate::importer::tools::PWSH_HELP);
-                }
-            }
-        }
-        None if test => crate::config::log("helpers: a test run with no winget; would open Microsoft's page on installing PowerShell 7"),
-        None => {
-            let _ = open::that(crate::importer::tools::PWSH_HELP);
-        }
-    }
-}
-
-/// True while the window "Install PowerShell 7" opened is still open (in a test run, for half a minute
-/// after the click): the pages say so rather than offering the word again.
-pub fn pwsh_installing() -> bool {
-    let mut run = PWSH_RUN.lock().unwrap_or_else(|e| e.into_inner());
-    let open = match run.as_mut() {
-        Some((_, Some(child))) => matches!(child.try_wait(), Ok(None)),
-        Some((at, None)) => at.elapsed() < Duration::from_secs(30),
-        None => false,
-    };
-    if !open {
-        *run = None;
-    }
-    open
-}
-
-/// The words for a missing PowerShell 7, on one line: what is missing and the word that installs it, or
-/// that it is being installed in its own window.
-pub fn pwsh_line(ui: &mut egui::Ui, size: f32, color: egui::Color32, blue: bool) {
-    ui.label(egui::RichText::new(crate::importer::tools::NO_PWSH).size(size).color(color));
-    if pwsh_installing() {
-        ui.label(egui::RichText::new("Installing in its own window").size(size).color(crate::theme::FAINT()));
-        // (the window closing is only seen on a redraw)
-        ui.ctx().request_repaint_after(Duration::from_secs(1));
-    } else if word(ui, "Install PowerShell 7", size, blue).clicked() {
-        install_pwsh();
-    }
-}
-
 /// A word that does something: a blue link on the pages built that way (Health, Settings), a quiet gray
 /// word on the pages in the newer look. Never broken over two lines: in a narrow row it goes to the next
 /// line whole.
@@ -968,12 +884,6 @@ mod tests {
         let port = held.local_addr().unwrap().port();
         let got = free_port([127, 0, 0, 1], port);
         assert!(got > port && got < port.saturating_add(100));
-    }
-
-    #[test]
-    fn powershell_is_installed_by_winget_in_its_own_window() {
-        let line = pwsh_install_line(Path::new(r"C:\Users\x\AppData\Local\Microsoft\WindowsApps\winget.exe"));
-        assert_eq!(line, r#"/c ""C:\Users\x\AppData\Local\Microsoft\WindowsApps\winget.exe" install --id Microsoft.PowerShell --source winget --exact & echo. & pause""#);
     }
 
     #[test]

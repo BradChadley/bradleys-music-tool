@@ -12,7 +12,7 @@
 //! The kinds that rewrite a file's tags (`Step::Tags`): "strip-junk", "garbled", "album-artist",
 //! "album-name", "missing-tags", "tracklist" and "tracklist-titles", "year-genre", "vbr-header", and
 //! "cover" when the picture is already in the folder or in some of the tracks. A file is never edited in
-//! place: a copy is made in the batch's folder, the tag editor (TagLib, `crate::tageditor`)
+//! place: a copy is made in the batch's folder, the Rust tag editor (`crate::tagwrite`)
 //! changes the copy and checks that the audio is byte for byte the same and that the change is there, and
 //! only then the copy takes the file's place and the old file goes into the undo backups.
 //! Not here yet: covers found online, "unwrap", and the repairs that need a choice ("pick-album",
@@ -122,11 +122,6 @@ pub fn can_fix(kind: &str) -> bool {
     matches!(kind, "remove" | "file-loose" | "dupe-tracks" | "strip-junk" | "garbled" | "album-artist" | "album-name" | "missing-tags" | "tracklist" | "tracklist-titles" | "year-genre" | "vbr-header" | "cover" | "pick-album" | "merge-artist" | "artist-mismatch" | "unwrap" | "lyrics-fill" | "lyrics-junk" | "lyrics-unhide")
 }
 
-/// Whether this repair rewrites tags, and so needs the tag editor (PowerShell 7). The ones that only move
-/// things, or take an MP3 out of its wrapper, do not.
-pub fn needs_tag_editor(kind: &str, choice: &str) -> bool {
-    can_fix(kind) && !matches!(kind, "remove" | "file-loose" | "pick-album" | "merge-artist" | "dupe-tracks" | "unwrap") && !(kind == "artist-mismatch" && choice == "move")
-}
 
 /// The words on the control that starts the repair.
 pub fn action_words(kind: &str, cat: &str, files: usize) -> &'static str {
@@ -391,8 +386,12 @@ pub fn plan(ask: &Ask, library: &Path, tools: &Tools) -> Plan {
                     continue;
                 }
                 let hidden = l.place == Place::Hidden;
+                // the light undo record holds the words of one lyrics frame: a file with more (another
+                // language, a timed copy) keeps its whole old copy instead, so Undo brings all of them back
+                // (Codex's review, H1). So does a file whose frames cannot be read here.
+                let one_frame = crate::importer::id3::frames(f).is_some_and(|fr| fr.iter().filter(|x| x.id == "USLT").count() <= 1 && !fr.iter().any(|x| x.id == "SYLT"));
                 let step = |lyrics: Option<String>, mode: &'static str, reason: &str| {
-                    let light = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) && !hidden;
+                    let light = f.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) && !hidden && one_frame;
                     Step::Tags(TagStep { file: f.clone(), lyrics, lyrics_mode: mode, unhide: hidden, light, reason: reason.into(), ..Default::default() })
                 };
                 match lyrics::act(&l, found.as_ref(), choice, lookup.timed) {
@@ -664,14 +663,8 @@ fn folder_cover(folder: &Path) -> Option<PathBuf> {
 
 /// Runs the tag editor over copies of the files. For each copy (by its path, lower case): Ok(true) = it
 /// was changed and checked, Ok(false) = nothing needed changing, Err(why) = it could not be changed safely.
-fn run_tag_editor(items: &[(PathBuf, &TagStep)], ffmpeg: &Path, work: &Path) -> HashMap<String, Result<(bool, String), String>> {
+fn run_tag_editor(items: &[(PathBuf, &TagStep)], ffmpeg: &Path) -> HashMap<String, Result<(bool, String), String>> {
     let mut out = HashMap::new();
-    let all = |why: &str| items.iter().map(|(copy, _)| (copy.to_string_lossy().to_lowercase(), Err(why.to_string()))).collect::<HashMap<_, _>>();
-    let script = match crate::tageditor::script() {
-        Ok(s) => s,
-        Err(why) => return all(&why),
-    };
-    let Some(pwsh) = tools::pwsh() else { return all("PowerShell 7 was not found") };
     let plan: Vec<serde_json::Value> = items
         .iter()
         .map(|(copy, s)| {
@@ -682,22 +675,7 @@ fn run_tag_editor(items: &[(PathBuf, &TagStep)], ffmpeg: &Path, work: &Path) -> 
             })
         })
         .collect();
-    let (plan_file, out_file) = (work.join("tag-plan.json"), work.join("tag-results.json"));
-    if std::fs::write(&plan_file, serde_json::to_vec(&plan).unwrap_or_default()).is_err() {
-        return all("the tag editor's instructions could not be written");
-    }
-    let mut c = tools::command(&pwsh, false);
-    c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script).arg("-Plan").arg(&plan_file).arg("-Out").arg(&out_file).arg("-Ffmpeg").arg(ffmpeg);
-    c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let _ = tools::run_limited(&mut c, 120 + 20 * items.len() as u64);
-    let text = std::fs::read_to_string(&out_file).unwrap_or_default();
-    let res: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or(serde_json::Value::Null);
-    // PowerShell writes a list of one as the thing itself
-    let rows = match res {
-        serde_json::Value::Array(a) => a,
-        v @ serde_json::Value::Object(_) => vec![v],
-        _ => vec![],
-    };
+    let rows = crate::tagwrite::run(&plan, ffmpeg);
     for r in rows {
         let (why, note) = (r["Why"].as_str().unwrap_or(""), r["Note"].as_str().unwrap_or(""));
         let said = if r["Ok"].as_bool() != Some(true) {
@@ -790,22 +768,32 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
             .map(|(file, old, new)| TagStep { file: file.clone(), lyrics: Some(old.clone()).filter(|o| !o.trim().is_empty()), lyrics_mode: if old.trim().is_empty() { "clear" } else { "set" }, light: true, only_if: Some(new.clone()), ..Default::default() })
             .collect();
         let mut items: Vec<(PathBuf, &TagStep)> = vec![];
+        let mut snaps: Vec<crate::library_lock::Snapshot> = vec![];
         let mut problems = vec![];
         for (n, t) in steps.iter().enumerate() {
             let copy = work.join(n.to_string()).join(leaf(&t.file));
             if locked(&t.file) {
                 problems.push(format!("{}: it is open in another program", leaf(&t.file)));
-            } else if let Err(e) = std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| std::fs::copy(&t.file, &copy)) {
-                problems.push(crate::util::plain_err(format!("{}: a working copy could not be made: {e}", leaf(&t.file))));
-            } else {
-                items.push((copy, t));
+                continue;
+            }
+            match std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| crate::library_lock::copy_with_snapshot(&t.file, &copy)) {
+                Err(e) => problems.push(crate::util::plain_err(format!("{}: a working copy could not be made: {e}", leaf(&t.file)))),
+                Ok(snap) => {
+                    items.push((copy, t));
+                    snaps.push(snap);
+                }
             }
         }
-        let said = if items.is_empty() { HashMap::new() } else { run_tag_editor(&items, &ffmpeg, &work) };
-        for (copy, t) in &items {
+        let said = if items.is_empty() { HashMap::new() } else { run_tag_editor(&items, &ffmpeg) };
+        // (the library is held from here to the end of the Undo, and each file must still be what its copy
+        // was made from: a track an import put in place meanwhile is never written over)
+        let _held = crate::library_lock::hold();
+        for ((copy, t), snap) in items.iter().zip(&snaps) {
             match said.get(&copy.to_string_lossy().to_lowercase()) {
                 Some(Ok((true, _))) => {
-                    if let Err(e) = std::fs::rename(copy, &t.file) {
+                    if let Err(why) = crate::library_lock::still(&t.file, snap) {
+                        problems.push(format!("{}: {why}", leaf(&t.file)));
+                    } else if let Err(e) = std::fs::rename(copy, &t.file) {
                         problems.push(crate::util::plain_err(format!("{}: the copy with the old lyrics could not be put in place: {e}", leaf(&t.file))));
                     }
                 }
@@ -876,6 +864,9 @@ fn unwrapped(bytes: &[u8]) -> Result<Vec<u8>, String> {
 
 /// Carries one plan's steps out in a batch that is already open.
 fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &mut Done) {
+    // each step looks at what it changes and changes it with the library held, so nothing (an import, an
+    // Undo) can change it in between
+    let held = crate::library_lock::hold();
     for step in &plan.steps {
         let said = match step {
             Step::Remove { path, reason } => {
@@ -935,12 +926,15 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
             done.problems.push(format!("{}: {why}", leaf(what)));
         }
     }
+    drop(held);
     // the files whose tags change: a copy of each in the batch's folder, the editor over the copies, and
-    // each copy that was changed and checked takes its file's place
+    // each copy that was changed and checked takes its file's place. The library is not held while the
+    // editor works; instead each file must still be what its copy was made from when the copy is saved
     let tag_steps: Vec<&TagStep> = plan.steps.iter().filter_map(|s| if let Step::Tags(t) = s { Some(t) } else { None }).collect();
     if !tag_steps.is_empty() {
         let work = batch.dir.join("work");
         let mut items: Vec<(PathBuf, &TagStep)> = vec![];
+        let mut snaps: HashMap<String, crate::library_lock::Snapshot> = HashMap::new();
         for (n, t) in tag_steps.iter().enumerate() {
             let why = if !t.file.is_file() {
                 Some("it is no longer there".to_string())
@@ -948,8 +942,9 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
                 Some("it is open in another program".to_string())
             } else {
                 let copy = work.join(n.to_string()).join(leaf(&t.file));
-                match std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| std::fs::copy(&t.file, &copy)) {
-                    Ok(_) => {
+                match std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| crate::library_lock::copy_with_snapshot(&t.file, &copy)) {
+                    Ok(snap) => {
+                        snaps.insert(copy.to_string_lossy().to_lowercase(), snap);
                         items.push((copy, t));
                         None
                     }
@@ -964,13 +959,19 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
             if let Some(cache) = &tools.quality_cache {
                 quality::load_cache(cache);
             }
-            let said = run_tag_editor(&items, &tools.ffmpeg, &work);
+            let said = run_tag_editor(&items, &tools.ffmpeg);
+            #[cfg(test)]
+            test_pause::after_tags();
+            let _held = crate::library_lock::hold();
             for (copy, t) in &items {
-                match said.get(&copy.to_string_lossy().to_lowercase()) {
+                let key = copy.to_string_lossy().to_lowercase();
+                match said.get(&key) {
                     Some(Ok((true, old_lyrics))) => {
                         let heard = quality::key_of(&t.file);
                         // a change to the lyrics alone keeps the old words in the undo record, not the old file
-                        let swapped = if t.light { batch.lyrics_changed(&t.file, copy, old_lyrics, t.lyrics.as_deref().unwrap_or(""), &t.reason) } else { batch.replaced(&t.file, copy, &t.reason) };
+                        let swapped = snaps.get(&key).ok_or_else(|| "its working copy was not written down".to_string()).and_then(|snap| crate::library_lock::still(&t.file, snap)).and_then(|_| {
+                            if t.light { batch.lyrics_changed(&t.file, copy, old_lyrics, t.lyrics.as_deref().unwrap_or(""), &t.reason) } else { batch.replaced(&t.file, copy, &t.reason) }
+                        });
                         match swapped {
                             Ok(()) => quality::carry(heard, &t.file), // the audio is the same, so what was heard stands
                             Err(why) => done.problems.push(format!("{}: {why}", leaf(&t.file))),
@@ -995,18 +996,6 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
 mod tests {
     use super::*;
     use crate::importer::tools;
-
-    #[test]
-    fn only_the_repairs_that_rewrite_tags_need_the_tag_editor() {
-        for kind in ["strip-junk", "garbled", "album-artist", "album-name", "missing-tags", "tracklist", "tracklist-titles", "year-genre", "vbr-header", "cover"] {
-            assert!(needs_tag_editor(kind, ""), "{kind}");
-        }
-        for kind in ["remove", "file-loose", "dupe-tracks", "pick-album", "merge-artist", "unwrap", "redownload", ""] {
-            assert!(!needs_tag_editor(kind, ""), "{kind}");
-        }
-        // a wrongly filed album: new tags need it, moving the folder does not
-        assert!(needs_tag_editor("artist-mismatch", "tag") && !needs_tag_editor("artist-mismatch", "move"));
-    }
 
     struct Lab {
         base: PathBuf,
@@ -1173,8 +1162,8 @@ mod tests {
 
 #[cfg(test)]
 mod tag_tests {
-    //! The repairs that rewrite tags, on made-up tracks. They run the real tag editor (PowerShell 7 and
-    //! TagLib, the copy in `tag-editor`) over copies in a scratch folder.
+    //! The repairs that rewrite tags, on made-up tracks. They run the Rust tag editor over copies
+    //! in a scratch folder.
     use super::*;
 
     struct Lab {
@@ -1446,3 +1435,18 @@ mod more_tests {
 
 #[cfg(test)]
 mod lyric_tests;
+
+/// A pause point for the tests only (never built into the app): between the tag editor's answer and the
+/// moment its copies take their files' places, where an import can land in the meantime.
+#[cfg(test)]
+pub(crate) mod test_pause {
+    use std::cell::RefCell;
+    thread_local! {
+        pub static AFTER_TAGS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+    }
+    pub fn after_tags() {
+        if let Some(f) = AFTER_TAGS.with(|h| h.borrow_mut().take()) {
+            f();
+        }
+    }
+}

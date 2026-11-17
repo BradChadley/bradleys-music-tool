@@ -316,29 +316,10 @@ mod tag_tests {
     }
 }
 
-/// Runs the TagLib helper over the copies. Returns, per file: Ok(note) or Err(why it couldn't be edited safely).
-fn run_tag_helper(ctx: &Ctx, plan: &[serde_json::Value], tmp: &Path) -> std::collections::HashMap<String, Result<String, String>> {
+/// Runs the tag editor (`tagwrite`) over the copies. Returns, per file: Ok(note) or Err(why it couldn't be edited safely).
+fn run_tag_helper(ctx: &Ctx, plan: &[serde_json::Value]) -> std::collections::HashMap<String, Result<String, String>> {
     let mut out = std::collections::HashMap::new();
-    let ready = crate::tageditor::script().and_then(|script| tools::pwsh().map(|pwsh| (script, pwsh)).ok_or_else(|| "PowerShell 7 not found".to_string()));
-    let (script, pwsh) = match ready {
-        Ok(r) => r,
-        Err(why) => {
-            for p in plan {
-                out.insert(p["File"].as_str().unwrap_or("").to_lowercase(), Err(why.clone()));
-            }
-            return out;
-        }
-    };
-    let (plan_file, out_file) = (tmp.join("tag-plan.json"), tmp.join("tag-results.json"));
-    let _ = std::fs::write(&plan_file, serde_json::to_vec(plan).unwrap_or_default());
-    let _ = std::fs::remove_file(&out_file); // (an answer left by an earlier call is not this call's)
-    let mut c = tools::command(&pwsh, false);
-    c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script).arg("-Plan").arg(&plan_file).arg("-Out").arg(&out_file).arg("-Ffmpeg").arg(&ctx.ffmpeg);
-    c.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
-    let _ = tools::run_limited(&mut c, 900);
-    let text = std::fs::read_to_string(&out_file).unwrap_or_default();
-    let res: serde_json::Value = serde_json::from_str(text.trim_start_matches('\u{feff}')).unwrap_or(serde_json::Value::Null);
-    for r in res.as_array().cloned().unwrap_or_default() {
+    for r in crate::tagwrite::run(plan, &ctx.ffmpeg) {
         let file = r["File"].as_str().unwrap_or("").to_lowercase();
         let v = if r["Ok"].as_bool() == Some(true) { Ok(r["Note"].as_str().unwrap_or("").to_string()) } else { Err(r["Why"].as_str().unwrap_or("").to_string()) };
         out.insert(file, v);
@@ -361,8 +342,8 @@ pub(crate) fn carry_plan(out: &Path, from: &Path, t: &Track) -> serde_json::Valu
 
 /// Runs the tag editor over files ffmpeg wrote (see `carry_plan`). Returns the ones it could not do, with
 /// why: those keep what ffmpeg gave them, which is what every converted file had before this step existed.
-pub(crate) fn carry_tags(ctx: &Ctx, plans: &[serde_json::Value], tmp: &Path) -> Vec<(String, String)> {
-    let res = run_tag_helper(ctx, plans, tmp);
+pub(crate) fn carry_tags(ctx: &Ctx, plans: &[serde_json::Value]) -> Vec<(String, String)> {
+    let res = run_tag_helper(ctx, plans);
     let mut failed = vec![];
     for p in plans {
         let file = p["File"].as_str().unwrap_or("");
@@ -396,9 +377,14 @@ impl Drop for Drained<'_> {
 /// At no point is the library without a complete copy, and a crash at any step leaves the old copy on disk
 /// under its own or its "aside" name.
 ///
-/// Ok(Some(path)) means the swap worked but the old copy could not be put away and is still at `path`.
-pub fn swap_into_place(build: &Path, final_dir: &Path, existing: Option<&Path>, recycle: &dyn Fn(&Path) -> Result<(), String>) -> Result<Option<PathBuf>, String> {
-    let Some(old) = existing else {
+/// `existing` is the old copy and the place beside it where it is set aside (`undo::Replacement` chooses it
+/// and writes it down before this is called, so a crash at any step leaves a record that finds it).
+///
+/// Ok(Some(why)) means the swap worked but the old copy could not be put away: `why` is `recycle`'s own
+/// words, which say where the old copy is now.
+pub fn swap_into_place(build: &Path, final_dir: &Path, existing: Option<(&Path, &Path)>, recycle: &dyn Fn(&Path) -> Result<(), String>) -> Result<Option<String>, String> {
+    let _held = crate::library_lock::hold();
+    let Some((old, aside)) = existing else {
         return match std::fs::rename(build, final_dir) {
             Ok(()) => Ok(None),
             Err(_) => {
@@ -407,13 +393,12 @@ pub fn swap_into_place(build: &Path, final_dir: &Path, existing: Option<&Path>, 
             }
         };
     };
-    let aside = PathBuf::from(format!("{}.replaced-{:x}", old.display(), rand_id()));
-    if std::fs::rename(old, &aside).is_err() {
+    if std::fs::rename(old, aside).is_err() {
         let _ = std::fs::remove_dir_all(build);
         return Err("Couldn't move the old copy out of the way (is it playing?) - old copy kept, download left in place".into());
     }
     if std::fs::rename(build, final_dir).is_err() {
-        let back = std::fs::rename(&aside, old).is_ok();
+        let back = std::fs::rename(aside, old).is_ok();
         let _ = std::fs::remove_dir_all(build);
         return Err(if back {
             "Couldn't move the finished album into place - old copy put back, download left in place".into()
@@ -421,9 +406,54 @@ pub fn swap_into_place(build: &Path, final_dir: &Path, existing: Option<&Path>, 
             format!("Couldn't move the finished album into place. Your old copy is safe at {}", aside.display())
         });
     }
-    match recycle(&aside) {
+    match recycle(aside) {
         Ok(()) => Ok(None),
-        Err(_) => Ok(Some(aside)),
+        Err(why) => Ok(Some(why)),
+    }
+}
+
+/// What `place_album` did with the old copy, when there was one.
+#[derive(Debug, Default)]
+pub struct Placed {
+    /// where the old copy is kept in the undo backups
+    pub old_copy: Option<PathBuf>,
+    /// the new album is in place, but this went wrong with the old copy; the words say where it is now
+    pub problem: Option<String>,
+}
+
+/// Puts a finished album (`build`) at `final_dir`, in place of the old copy at `existing` if there is one,
+/// the way an import does: how to undo it is written down before the old copy moves at all (see
+/// `undo::Replacement`), then the swap (`swap_into_place`), then the old copy into the undo backups.
+/// Err: nothing in the library was changed, or the words say where the old copy is.
+pub fn place_album(repair_root: &Path, library: &Path, artist: &str, build: &Path, final_dir: &Path, existing: Option<&Path>) -> Result<Placed, String> {
+    let _held = crate::library_lock::hold();
+    let record = match existing {
+        None => None,
+        Some(was) => {
+            let title = format!("Import: replaced {artist} - {}", was.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+            match crate::undo::Replacement::begin(repair_root, library, &title, was, final_dir) {
+                Ok(r) => Some(r),
+                Err(why) => {
+                    let _ = std::fs::remove_dir_all(build);
+                    return Err(format!("Couldn't replace the old copy: {why}. Nothing in the library was changed, download left in place"));
+                }
+            }
+        }
+    };
+    let kept_at = std::cell::RefCell::new(None);
+    let keep_old = |_: &Path| -> Result<(), String> {
+        let r = record.as_ref().ok_or("there is no undo record for the old copy")?;
+        *kept_at.borrow_mut() = Some(r.finish()?);
+        Ok(())
+    };
+    match swap_into_place(build, final_dir, record.as_ref().map(|r| (r.was_at(), r.aside())), &keep_old) {
+        Err(why) => {
+            if let Some(r) = record {
+                r.cancel(); // (kept if any of the old copy is away from its place, so Undo can find it)
+            }
+            Err(why)
+        }
+        Ok(problem) => Ok(Placed { old_copy: kept_at.into_inner(), problem }),
     }
 }
 
@@ -471,7 +501,7 @@ mod swap_tests {
         album(&old, "old.mp3");
         album(&build, "new.mp3");
         let recycled = std::cell::RefCell::new(vec![]);
-        let r = swap_into_place(&build, &fin, Some(&old), &|p| {
+        let r = swap_into_place(&build, &fin, Some((&old, &root.join("Album.replaced-1"))), &|p| {
             recycled.borrow_mut().push(p.to_path_buf());
             std::fs::remove_dir_all(p).map_err(|e| e.to_string())
         });
@@ -481,12 +511,14 @@ mod swap_tests {
 
         // the recycler fails: new copy is in, old copy is still on disk under its aside name
         album(&build, "newer.mp3");
-        let kept = swap_into_place(&build, &fin, Some(&fin), &|_| Err("bin full".into())).unwrap().unwrap();
+        let kept = root.join("Album (2020).replaced-2");
+        let said = swap_into_place(&build, &fin, Some((&fin, &kept)), &|_| Err("bin full, the old copy is at its aside name".into())).unwrap().unwrap();
+        assert!(said.contains("bin full"));
         assert!(fin.join("newer.mp3").exists() && kept.join("new.mp3").exists());
         std::fs::remove_dir_all(&kept).unwrap();
 
         // the new copy can't be moved in (the build is missing): the old copy is put back untouched
-        let r = swap_into_place(&root.join("nope.importing"), &root.join("Other"), Some(&fin), &|_| panic!("must not recycle"));
+        let r = swap_into_place(&root.join("nope.importing"), &root.join("Other"), Some((&fin, &root.join("Album (2020).replaced-3"))), &|_| panic!("must not recycle"));
         assert!(r.is_err());
         assert_eq!(names(&root), vec!["Album (2020)"]);
         assert!(fin.join("newer.mp3").exists());
@@ -605,8 +637,6 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         report("Couldn't create the album folder", 1.0);
         return ImportResult::Failed;
     }
-    let tmp_guard = TempDir::new(ctx, "");
-    let tmp = tmp_guard.0.clone();
     let mut art: Option<Art> = None;
     if let (Some(c), true) = (&u.cover, u.use_cover) {
         match cover {
@@ -874,7 +904,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     if !tag_jobs.is_empty() {
         report(&format!("Fixing tags on {} track(s)...", tag_jobs.len()), 0.99);
         let plans: Vec<serde_json::Value> = tag_jobs.iter().map(|j| if let Mode::Tags(_, p) = &j.mode { p.clone() } else { serde_json::Value::Null }).collect();
-        let res = run_tag_helper(ctx, &plans, &tmp);
+        let res = run_tag_helper(ctx, &plans);
         for j in tag_jobs {
             let Mode::Tags(args, _) = &j.mode else { continue };
             let name = j.out.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -924,11 +954,10 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
                 plan
             })
             .collect();
-        for (file, why) in carry_tags(ctx, &plans, &tmp) {
+        for (file, why) in carry_tags(ctx, &plans) {
             ctx.log(&format!("NOTE {file}: the rest of its tags could not be carried over ({why})"));
         }
     }
-    drop(tmp_guard);
 
     let bad: Vec<&(bool, PathBuf, String)> = results.iter().filter(|r| !r.0).collect();
     if !bad.is_empty() || results.len() != total {
@@ -943,6 +972,10 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         ctx.log(&format!("FAIL {} -> {} : {}", u.name, final_dir.display(), bad.iter().map(|b| b.1.display().to_string()).collect::<Vec<_>>().join("; ")));
         return ImportResult::Failed;
     }
+
+    // from here on the library itself changes: one writer at a time (see `library_lock`), so a Health repair
+    // or an Undo never works on what this import is putting in place, nor this import on what they are
+    let _held = crate::library_lock::hold();
 
     // "Replace only these tracks": the album in the library stays, and only the tracks Health flagged are
     // swapped for the ones just built, each matched by its number and its length
@@ -972,25 +1005,24 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
 
     // swap the finished album into place
     // the old copy is never deleted: it goes to the undo backups, where Repair history can put it back
-    let kept_at = std::cell::RefCell::new(None);
-    let keep_old = |aside: &Path| -> Result<(), String> {
-        let was = existing.as_deref().unwrap_or(aside);
-        let title = format!("Import: replaced {} - {}", u.artist, was.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-        let kept = crate::undo::keep_replaced(&ctx.repair_root, &ctx.library, &title, aside, was, &final_dir)?;
-        crate::replace::done(&ctx.replacements, was); // if Health was waiting for this album, it has its better copy now
-        *kept_at.borrow_mut() = Some(kept);
-        Ok(())
-    };
-    match swap_into_place(&build, &final_dir, existing.as_deref(), &keep_old) {
+    let mut old_copy_note: Option<String> = None;
+    match place_album(&ctx.repair_root, &ctx.library, &u.artist, &build, &final_dir, existing.as_deref()) {
         Err(why) => {
             report(&why, 1.0);
             ctx.log(&format!("FAIL swap {} : {why}", final_dir.display()));
             return ImportResult::Failed;
         }
-        Ok(Some(aside)) => ctx.log(&format!("REPLACED {} (the old copy could not go to the undo backups; it is kept as {})", final_dir.display(), aside.display())),
-        Ok(None) => {
-            if let (Some(e), Some(kept)) = (&existing, kept_at.borrow().as_ref()) {
-                ctx.log(&format!("REPLACED {} (old copy kept in the undo backups: {})", e.display(), kept.display()));
+        Ok(Placed { old_copy, problem }) => {
+            if let Some(e) = &existing {
+                crate::replace::done(&ctx.replacements, e); // if Health was waiting for this album, it has its better copy now
+                match (problem, old_copy) {
+                    (Some(why), _) => {
+                        ctx.log(&format!("REPLACED {} ({why})", e.display()));
+                        old_copy_note = Some(why);
+                    }
+                    (None, Some(kept)) => ctx.log(&format!("REPLACED {} (old copy kept in the undo backups: {})", e.display(), kept.display())),
+                    (None, None) => {}
+                }
             }
         }
     }
@@ -1009,6 +1041,9 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     if let Some(said) = crate::loose::album_arrived(&ctx.loose_wants, &ctx.ffprobe, &ctx.library, &final_dir, &ctx.recycle, ctx.keep_lossless) {
         ctx.log(&format!("LOOSE {said}"));
         cover_note = format!("{cover_note}. Also: {said}");
+    }
+    if let Some(why) = &old_copy_note {
+        cover_note = format!("{cover_note}. But {why}");
     }
     // Health looks at this artist again, now that everything about the import is in place: what it said about
     // the folder is no longer true

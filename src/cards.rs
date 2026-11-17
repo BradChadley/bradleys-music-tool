@@ -516,7 +516,7 @@ fn green_dot(ui: &mut Ui) {
 }
 
 
-/// The card of what the app needs: ffmpeg and PowerShell 7, each with how it stands on this PC or the
+/// The card of what the app needs: ffmpeg, with how it stands on this PC and the
 /// word that gets it. `ffmpeg` is whether ffmpeg is there and when that was last looked at.
 pub(crate) fn needs(ui: &mut Ui, ffmpeg: &mut (f64, bool)) -> Foot {
     let ctx = ui.ctx().clone();
@@ -525,57 +525,55 @@ pub(crate) fn needs(ui: &mut Ui, ffmpeg: &mut (f64, bool)) -> Foot {
     if now - ffmpeg.0 > 2.0 {
         *ffmpeg = (now, crate::importer::tools::find_tool("ffmpeg").is_ok() && crate::importer::tools::find_tool("ffprobe").is_ok());
     }
-    theme::caption(ui, "WHAT IT NEEDS");
-    ui.add_space(12.0);
-    let state = helpers::state(Helper::Ffmpeg);
-    match &state {
-        helpers::State::Getting(done, total) => {
-            need(ui, "ffmpeg", &helpers::amount(*done, *total), FAINT(), |ui| {
-                if theme::quiet(ui, "Stop", 14.0, true).clicked() {
-                    helpers::stop(Helper::Ffmpeg);
-                }
+    let horizontal = ui.available_width() >= 520.0;
+    ui.horizontal_top(|ui| {
+        if horizontal {
+            ui.allocate_ui_with_layout(vec2(150.0, 34.0), Layout::top_down(Align::Min), |ui| {
+                ui.add_space(9.0);
+                theme::caption(ui, "WHAT IT NEEDS");
             });
-            ui.add_space(2.0);
-            theme::progress(ui, *done as f32 / (*total).max(1) as f32, ui.available_width(), ACCENT2());
-            ctx.request_repaint_after(std::time::Duration::from_millis(200));
         }
-        helpers::State::Unpacking => {
-            need(ui, "ffmpeg", "Unpacking", FAINT(), |ui| drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))));
-            ffmpeg.0 = -10.0;
-        }
-        helpers::State::Failed(why) => need(ui, "ffmpeg", why, WARN(), |ui| {
-            if theme::main_action_sized(ui, "Try again", 14.0, true).clicked() {
-                helpers::start(Helper::Ffmpeg, &ctx);
+        ui.vertical(|ui| {
+            ui.set_width(ui.available_width());
+            if !horizontal {
+                theme::caption(ui, "WHAT IT NEEDS");
+                ui.add_space(10.0);
             }
-        }),
-        // there: only a green check. Not there: in its place the word that gets it, and its size
-        helpers::State::Idle if ffmpeg.1 => need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| rows::there(ui, "there:ffmpeg")),
-        helpers::State::Idle => {
-            let size = format!("{} MB", (Helper::Ffmpeg.pin().size as f64 / 1_000_000.0).round());
-            need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| {
-                ui.label(RichText::new(size).size(12.5).color(FAINT()));
-                if theme::main_action_sized(ui, "Get it", 14.0, true).clicked() {
-                    helpers::start(Helper::Ffmpeg, &ctx);
+            let state = helpers::state(Helper::Ffmpeg);
+            match &state {
+                helpers::State::Getting(done, total) => {
+                    need(ui, "ffmpeg", &helpers::amount(*done, *total), FAINT(), |ui| {
+                        if theme::quiet(ui, "Stop", 14.0, true).clicked() {
+                            helpers::stop(Helper::Ffmpeg);
+                        }
+                    });
+                    ui.add_space(2.0);
+                    theme::progress(ui, *done as f32 / (*total).max(1) as f32, ui.available_width(), ACCENT2());
+                    ctx.request_repaint_after(std::time::Duration::from_millis(200));
                 }
-            });
-        }
-    }
-    ui.add_space(14.0);
-    // (one loud word a card: while ffmpeg's is there, this one is quiet)
-    let ffmpeg_missing = !ffmpeg.1;
-    if crate::importer::tools::pwsh().is_some() {
-        need(ui, "PowerShell 7", "for imports and tag repairs", FAINT(), |ui| rows::there(ui, "there:pwsh"));
-    } else if helpers::pwsh_installing() {
-        need(ui, "PowerShell 7", "Installing in its own window", FAINT(), |ui| drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))));
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
-    } else {
-        need(ui, "PowerShell 7", "for imports and tag repairs", FAINT(), |ui| {
-            let clicked = if ffmpeg_missing { theme::quiet(ui, "Install", 14.0, true).clicked() } else { theme::main_action_sized(ui, "Install", 14.0, true).clicked() };
-            if clicked {
-                helpers::install_pwsh();
+                helpers::State::Unpacking => {
+                    need(ui, "ffmpeg", "Unpacking", FAINT(), |ui| drop(ui.add(egui::Spinner::new().size(13.0).color(DIM()))));
+                    ffmpeg.0 = -10.0;
+                }
+                helpers::State::Failed(why) => need(ui, "ffmpeg", why, WARN(), |ui| {
+                    if theme::main_action_sized(ui, "Try again", 14.0, true).clicked() {
+                        helpers::start(Helper::Ffmpeg, &ctx);
+                    }
+                }),
+                // there: only a green check. Not there: in its place the word that gets it, and its size
+                helpers::State::Idle if ffmpeg.1 => need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| rows::there(ui, "there:ffmpeg")),
+                helpers::State::Idle => {
+                    let size = format!("{} MB", (Helper::Ffmpeg.pin().size as f64 / 1_000_000.0).round());
+                    need(ui, "ffmpeg", "for imports and checks", FAINT(), |ui| {
+                        ui.label(RichText::new(size).size(12.5).color(FAINT()));
+                        if theme::main_action_sized(ui, "Get it", 14.0, true).clicked() {
+                            helpers::start(Helper::Ffmpeg, &ctx);
+                        }
+                    });
+                }
             }
         });
-    }
+    });
     None
 }
 

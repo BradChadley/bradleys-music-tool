@@ -57,7 +57,7 @@ pub struct Config {
     pub look_only: bool,
     /// how large everything is drawn: 1.0 is the usual size (Settings, "Look")
     pub size: f32,
-    /// the folder that holds the backup script (`Backup-Music.ps1`); empty = where it was when the app was built
+    /// the folder that holds backup settings and logs; empty keeps the Backup page hidden
     pub backup_tool_dir: String,
     /// lyrics fetched from LRCLIB are saved as plain words only (false: with a time on every line when
     /// LRCLIB has them, which a player that knows such lyrics follows as the song plays)

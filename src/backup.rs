@@ -1,24 +1,13 @@
-//! The Backup page: copy the library to the backup drive.
-//!
-//! The copying itself is done by `music-backup\Backup-Music.ps1`, the same script the nightly scheduled
-//! task runs. This page only starts it (hidden, with `-Yes`, the task's own no-questions mode) and reads
-//! what it prints. That keeps every safety rule of the script in force: it refuses to write to a disk
-//! whose label is not the saved one, it never writes to the library, and it never deletes from the backup.
-//! Every run moves what is no longer in the library to `_deleted` in the backup, and keeps the old copy of
-//! a changed file in `_changed`; when a great deal would move at once the script leaves it and says so, and
-//! the page then offers a run with `-Mirror`, on a click.
-//!
-//! "Preview" is the script's `-Preview -Yes`, with `-LogDir` pointed at a temp folder so a preview reads
-//! both folders, writes nothing to either, and leaves no entry in the real backup log.
-//!
-//! A test run (`MUSIC_RECS_DATA` set) never reads or writes the real backup's settings or log: see `places`.
+//! The Backup page and its native worker. It only reads the library, keeps changed and removed files,
+//! verifies fresh copies, and refuses a different disk at the saved drive letter. Existing settings
+//! and summary logs are read in place. A lab uses only its own settings, folders, and logs.
 use crate::config::Config;
 use crate::theme::{self, ACCENT2, DIM, FAINT, GREEN, RED, TEXT, WARN};
 use chrono::{Local, NaiveDateTime, NaiveTime};
 use crossbeam_channel::{Receiver, Sender};
 use egui::{vec2, Align, Color32, FontId, Label, Layout, Rect, RichText, ScrollArea, Sense, Stroke, Ui};
 use regex::Regex;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -27,17 +16,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 mod page;
+mod native;
+mod schedule;
+
+pub fn run_if_requested() -> Option<i32> { schedule::requested() }
 
 const TASK_NAME: &str = "Music Backup (nightly)";
-const SCRIPT: &str = "Backup-Music.ps1";
 /// CREATE_NO_WINDOW: the child gets no console window.
 const NO_WINDOW: u32 = 0x0800_0000;
 
-/// The backup script's folder as Settings has it ("Backup tool folder"); empty until the settings were seen,
+/// The backup settings folder; empty until the settings were seen,
 /// and when nothing was chosen there.
 static TOOL_DIR: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
 
-/// The backup script's folder: the one chosen in Settings ("Backup tool folder"). None when nothing is
+/// The backup settings folder: the one chosen in Settings. None when nothing is
 /// chosen there. (It used to fall back on a folder fixed when the app was built, which only exists on
 /// the PC it was built on and put that PC's paths into the exe.)
 fn tool_dir() -> Option<PathBuf> {
@@ -49,20 +41,19 @@ pub fn tool_dir_for(setting: &str) -> Option<PathBuf> {
     (!chosen.is_empty()).then(|| PathBuf::from(chosen))
 }
 
-/// Where the script, its settings and its logs are, and whether this is a test run.
+/// Where backup settings and logs are, and whether this is a test run.
 struct Places {
-    script: PathBuf,
     config: PathBuf,
     logs: PathBuf,
-    /// a test run: the settings and logs are in the test's own folder, and the script is told to leave
+    /// a test run: settings and logs are in the test's own folder, and the worker leaves
     /// MusicBee, the music tool's data and the code alone
     test: bool,
 }
 
-/// The real backup's settings and logs live beside the script. A test run (`MUSIC_RECS_DATA` set) has its
+/// Existing backups keep their settings and logs in their original folder. A test run (`MUSIC_RECS_DATA` set) has its
 /// own in `<that folder>\backup`, so nothing a test does can reach the real backup.
 fn places() -> Places {
-    // nothing chosen: a folder of the app's own that is never there, so nobody can find a script, settings
+    // nothing chosen: a folder of the app's own that is never there, so nobody can find settings
     // or a log by accident in whatever folder the app happened to be started from
     let tool = tool_dir().unwrap_or_else(|| crate::config::app_dir().join("no-backup-tool-chosen"));
     places_for(&tool, std::env::var_os("MUSIC_RECS_DATA"))
@@ -72,9 +63,9 @@ fn places_for(tool: &Path, data: Option<std::ffi::OsString>) -> Places {
     match data.filter(|d| !d.is_empty()) {
         Some(d) => {
             let base = PathBuf::from(d).join("backup");
-            Places { script: tool.join(SCRIPT), config: base.join("config.json"), logs: base.join("logs"), test: true }
+            Places { config: base.join("config.json"), logs: base.join("logs"), test: true }
         }
-        None => Places { script: tool.join(SCRIPT), config: tool.join("config.json"), logs: tool.join("logs"), test: false },
+        None => Places { config: tool.join("config.json"), logs: tool.join("logs"), test: false },
     }
 }
 
@@ -327,7 +318,7 @@ struct Rx {
     cleared_removed: Regex,
     checking: Regex,
     error: Regex,
-    ansi: Regex,
+    #[cfg(test)]
     robocopy_line: Regex,
 }
 
@@ -363,8 +354,8 @@ fn rx() -> &'static Rx {
             // the script's progress while it reads files back: "Checking 120 of 5000 files, 1.2 GB of 40 GB - about 12m 3s left"
             checking: r(r"^Checking (\d+) of (\d+) files, (.+?) of (.+?)(?: - about (.+) left)?$"),
             error: r(r"^ERROR(?: \((\d{4}-\d{2}-\d{2} \d{2}:\d{2})\))?: (.*)$"),
-            ansi: r(r"\x1b\[[0-9;?]*[ -/]*[@-~]"),
             // the same pattern the script uses to read robocopy's log
+            #[cfg(test)]
             robocopy_line: r(r"^\s*(\*?[A-Za-z][A-Za-z ]*?)?\s*(-?\d+)\s+((?:[A-Za-z]:\\|\\\\).*)$"),
         }
     })
@@ -604,6 +595,7 @@ enum Task {
     Missing,
     Found {
         enabled: bool,
+        native: bool,
         running: bool,
         schedule: String,
         next: String,
@@ -614,7 +606,6 @@ enum Task {
 #[derive(Clone, Default)]
 struct Status {
     tool_missing: bool,
-    shell: Option<PathBuf>,
     lib_missing: bool,
     dest: String,
     /// when the script last got to the end of a run (config.json LastRun)
@@ -820,27 +811,22 @@ fn can_eject(folder: &str, test: bool) -> bool {
 /// Asks Windows to let go of the drive that holds this folder, the way "Eject" in File Explorer does, and
 /// then looks whether the drive is really gone. Ok only when it is: nothing is ever claimed that was not
 /// seen. A test run asks Windows for nothing: `MUSIC_RECS_BACKUP_EJECT=gone` stands for a drive that went.
-fn eject(shell: &Path, folder: &str, test: bool) -> Result<(), String> {
+fn eject(folder: &str, test: bool) -> Result<(), String> {
     const BUSY: &str = "Windows did not let go of the drive: something is still using it. Close what has it open and try again, or eject it from the taskbar. Do not pull it out yet.";
-    if test {
-        return if std::env::var("MUSIC_RECS_BACKUP_EJECT").is_ok_and(|v| v == "gone") { Ok(()) } else { Err(BUSY.into()) };
-    }
-    if !can_eject(folder, false) {
-        return Err("This drive is not one that can be ejected.".into());
-    }
-    let letter = &folder[..2];
-    // (the verb is carried out by Explorer a moment later, so the script waits before it ends)
-    let ps = format!("$d = (New-Object -ComObject Shell.Application).NameSpace(17).ParseName('{letter}'); if ($d) {{ $d.InvokeVerb('Eject'); Start-Sleep -Seconds 3 }}");
-    let ran = Command::new(shell).args(["-NoProfile", "-NonInteractive", "-Command", &ps]).stdin(Stdio::null()).creation_flags(NO_WINDOW).output();
-    if ran.is_err() {
-        return Err("PowerShell could not be started, so the drive was not ejected.".into());
-    }
-    // gone means: no disk answers at that letter any more
-    let root = format!("{letter}\\");
+    if test { return if std::env::var("MUSIC_RECS_BACKUP_EJECT").is_ok_and(|v| v == "gone") { Ok(()) } else { Err(BUSY.into()) }; }
+    if !can_eject(folder, false) { return Err("This drive is not one that can be ejected.".into()); }
+    use windows_sys::Win32::{Foundation::{CloseHandle, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE}, Storage::FileSystem::{CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING}, System::IO::DeviceIoControl};
+    let name = wide(&format!(r"\\.\{}", &folder[..2]));
+    let handle = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+    if handle == INVALID_HANDLE_VALUE { return Err(BUSY.into()); }
+    let mut returned = 0;
+    let ok = [0x00090018, 0x00090020, 0x002d4808].into_iter().all(|code| unsafe {
+        DeviceIoControl(handle, code, std::ptr::null(), 0, std::ptr::null_mut(), 0, &mut returned, std::ptr::null_mut()) != 0
+    });
+    unsafe { CloseHandle(handle); }
+    if !ok { return Err(BUSY.into()); }
     for _ in 0..10 {
-        if volume_label(&root).is_none() {
-            return Ok(());
-        }
+        if volume_label(&format!("{}\\", &folder[..2])).is_none() { return Ok(()); }
         std::thread::sleep(Duration::from_millis(500));
     }
     Err(BUSY.into())
@@ -866,7 +852,11 @@ fn room_words(changed: u64, deleted: u64) -> Option<String> {
 
 fn gather_second(at: &Places, saved: &Saved, lib: &str) -> Second {
     let mut s = Second { set_up: !saved.second_id.is_empty() && !saved.second_folder.is_empty(), label: saved.second_label.clone(), last: saved.second_last, ..Default::default() };
-    s.folder = find_second(saved, &drive_roots());
+    s.folder = if at.test {
+        removable_drives(true, lib, &saved.dest).into_iter().map(|d| Path::new(&d.root).join(BACKUP_FOLDER)).find(|d| {
+            !saved.second_id.is_empty() && std::fs::read_to_string(d.join(ID_FILE)).is_ok_and(|id| id.trim() == saved.second_id)
+        }).map(|d| d.to_string_lossy().into_owned())
+    } else { find_second(saved, &drive_roots()) };
     if let Some(folder) = &s.folder {
         s.space = disk_space(folder);
     }
@@ -887,7 +877,7 @@ fn check_drive(dest: &str, want: &str) -> Drive {
         let drive = dest[..2].to_uppercase();
         return match volume_label(&format!("{drive}\\")) {
             None => Drive::Missing(drive),
-            // PowerShell's -ne ignores case
+            // Existing saved labels are compared without case.
             Some(found) if !want.is_empty() && found.to_lowercase() != want.to_lowercase() => Drive::Wrong { drive, found, want: want.to_string() },
             Some(found) => Drive::Good { drive, label: found },
         };
@@ -941,6 +931,7 @@ fn query_task() -> Task {
     };
     let status = field("Status");
     Task::Found {
+        native: field("Task To Run").contains("--backup-run"),
         enabled: !field("Scheduled Task State").eq_ignore_ascii_case("Disabled"),
         running: status.eq_ignore_ascii_case("Running"),
         schedule,
@@ -949,25 +940,9 @@ fn query_task() -> Task {
     }
 }
 
-/// Is the main backup running somewhere else (the nightly task, a run by hand)? This looks for a
-/// PowerShell whose command line names the script. Previews and the second backup don't count: they do not
-/// write to the main backup. (The script itself refuses a second run to the same folder.)
-fn other_backup_running(shell: &Path) -> bool {
-    let ps = "@(Get-CimInstance Win32_Process | Where-Object { $_.ProcessId -ne $PID -and $_.Name -match '^(pwsh|powershell)' -and $_.CommandLine -like '*Backup-Music.ps1*' -and $_.CommandLine -notlike '*-Preview*' -and $_.CommandLine -notlike '*-Secondary*' -and $_.CommandLine -notlike '*-CheckAll*' }).Count";
-    let out = Command::new(shell)
-        .args(["-NoProfile", "-NonInteractive", "-Command", ps])
-        .stdin(Stdio::null())
-        .creation_flags(NO_WINDOW)
-        .output();
-    match out {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().parse::<u32>().map(|n| n > 0).unwrap_or(false),
-        Err(_) => false,
-    }
-}
-
 fn gather(lib: &str, look_for_script: bool) -> Status {
     let at = places();
-    let mut s = Status { tool_missing: tool_dir().is_none() || !at.script.is_file(), shell: crate::importer::tools::pwsh(), lib_missing: !Path::new(lib).is_dir(), ..Default::default() };
+    let mut s = Status { tool_missing: tool_dir().is_none(), lib_missing: !Path::new(lib).is_dir(), ..Default::default() };
     if s.tool_missing {
         return s;
     }
@@ -983,9 +958,9 @@ fn gather(lib: &str, look_for_script: bool) -> Status {
     s.log_exists = log.is_file();
     (s.runs, s.check) = read_runs(&log);
     s.second = gather_second(&at, &saved, lib);
-    s.task = query_task();
+    s.task = if at.test { Task::Missing } else { query_task() };
     let task_running = matches!(s.task, Task::Found { running: true, .. });
-    s.other_running = task_running || (look_for_script && s.shell.as_deref().map(other_backup_running).unwrap_or(false));
+    s.other_running = task_running || (look_for_script && native::busy(&s.dest));
     s
 }
 
@@ -1158,6 +1133,8 @@ fn bring_back(library: &Path, backup: &Path, undo_root: &Path, rels: &[String], 
         return Ok(done);
     }
     let title = format!("Backup: brought back {} the library had damaged", if pairs.len() == 1 { "1 file".to_string() } else { format!("{} files", pairs.len()) });
+    // one writer to the library at a time (see `library_lock`): an import or a repair waits until these are back
+    let _held = crate::library_lock::hold();
     let batch = crate::undo::Batch::begin(undo_root, library, &title)?;
     for (n, (rel, original, source)) in pairs.into_iter().enumerate() {
         let said = (|| -> Result<PathBuf, String> {
@@ -1286,36 +1263,12 @@ enum Phase {
     Finishing,
 }
 
-/// The arguments the script is started with, after `-File <script>`.
-fn script_args(at: &Places, which: Which, kind: &Kind, lib: &str) -> Vec<std::ffi::OsString> {
-    let mut a: Vec<std::ffi::OsString> = vec!["-Yes".into(), "-Source".into(), lib.into()];
-    if at.test {
-        // a test run: its own settings, and nothing of MusicBee, the music tool or the code is read
-        a.extend(["-ConfigPath".into(), at.config.clone().into_os_string(), "-SkipMusicBee".into(), "-SkipAppData".into(), "-SkipCode".into()]);
-    }
-    if which == Which::Second {
-        a.push("-Secondary".into());
-    }
-    match kind {
-        // A preview writes its summary to a throwaway folder, so the log only lists real backups.
-        Kind::Preview => a.extend(["-Preview".into(), "-LogDir".into(), std::env::temp_dir().join("music-recs-backup-preview").into_os_string()]),
-        Kind::Backup => {}
-        Kind::Mirror => a.push("-Mirror".into()),
-        Kind::CheckAll => a.push("-CheckAll".into()),
-        Kind::Setup(dest) => a.extend(["-Destination".into(), dest.into()]),
-        Kind::Recopy(list) => a.extend(["-Recopy".into(), list.clone().into_os_string()]),
-    }
-    if at.test && *kind != Kind::Preview {
-        a.extend(["-LogDir".into(), at.logs.clone().into_os_string()]);
-    }
-    a
-}
-
 enum Msg {
     Status(Box<Status>),
-    /// a line the script printed
+    Configured(Result<String, String>),
+    /// a line from the backup worker
     Line(String),
-    /// files and bytes robocopy has copied so far
+    /// files and bytes copied and checked so far
     Copied(u64, u64),
     /// how large the library is (asked for once, when a drive is to be chosen for the second backup)
     LibSize(u64),
@@ -1353,110 +1306,27 @@ struct Job {
     read_sizes: (String, String),
     read_left: String,
     /// the running script, so a check of the whole backup can be stopped
-    child: Arc<std::sync::Mutex<Option<std::process::Child>>>,
+    stop: Arc<AtomicBool>,
     stopped: bool,
 }
 
 impl Job {
     fn new(which: Which, kind: Kind) -> Job {
-        Job { which, kind, lines: vec![], phase: Phase::Starting, total_files: 0, total_bytes: 0, total_text: String::new(), done_files: 0, done_bytes: 0, read_files: (0, 0), read_sizes: Default::default(), read_left: String::new(), child: Default::default(), stopped: false }
+        Job { which, kind, lines: vec![], phase: Phase::Starting, total_files: 0, total_bytes: 0, total_text: String::new(), done_files: 0, done_bytes: 0, read_files: (0, 0), read_sizes: Default::default(), read_left: String::new(), stop: Default::default(), stopped: false }
     }
 }
 
-fn clean_line(raw: &[u8]) -> String {
-    let s = String::from_utf8_lossy(raw);
-    rx().ansi.replace_all(s.trim_start_matches('\u{feff}'), "").trim_end().to_string()
-}
-
-/// Starts the script and reports what it prints. Runs on its own thread.
-fn run_job(which: Which, kind: Kind, shell: PathBuf, lib: String, holder: Arc<std::sync::Mutex<Option<std::process::Child>>>, tx: Sender<Msg>, ctx: egui::Context) {
-    let send = |m: Msg| {
-        let _ = tx.send(m);
-        ctx.request_repaint();
-    };
-    let fail = |why: String| send(Msg::Done { code: None, problem: Some(why) });
-    let at = places();
-    let started = Local::now();
-    if which == Which::Main && kind.copies() {
-        // One backup at a time, and never to the wrong disk. (The script checks both again itself.)
-        if other_backup_running(&shell) {
-            return fail("Another backup is already running, so this one did not start.".into());
-        }
-        let saved = read_config(&at.config);
-        if !matches!(check_drive(&saved.dest, &saved.label), Drive::Good { .. }) {
-            return fail("The backup drive is not connected, so nothing was copied.".into());
-        }
-    }
-    let mut cmd = Command::new(&shell);
-    cmd.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&at.script).args(script_args(&at, which, &kind, &lib));
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).creation_flags(NO_WINDOW);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => return fail(crate::util::plain_err(format!("PowerShell could not be started ({e})."))),
-    };
-    let stderr = child.stderr.take();
-    let stdout = child.stdout.take();
-    // the page holds the running script, so "Stop" can end a check of the whole backup
-    *holder.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
-    let err_thread = std::thread::spawn(move || {
-        let mut s = String::new();
-        if let Some(mut e) = stderr {
-            let mut buf = Vec::new();
-            let _ = e.read_to_end(&mut buf);
-            s = String::from_utf8_lossy(&buf).into_owned();
-        }
-        s
-    });
-
-    // While robocopy copies, count the files in its log, the way the script's own progress bar does.
-    let stop = Arc::new(AtomicBool::new(false));
-    let counting = Arc::new(AtomicBool::new(false));
-    let tail = kind.copies().then(|| {
-        let (stop, counting, tx, ctx) = (stop.clone(), counting.clone(), tx.clone(), ctx.clone());
-        let logs = at.logs.clone();
-        let since = format!("robocopy_{}.txt", (started - chrono::Duration::seconds(2)).format("%Y-%m-%d_%H%M%S"));
-        let lib = lib.to_lowercase();
-        std::thread::spawn(move || tail_robocopy(&logs, &since, &lib, &stop, &counting, &tx, &ctx))
-    });
-
-    if let Some(out) = stdout {
-        let mut reader = BufReader::new(out);
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            match reader.read_until(b'\n', &mut buf) {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    let line = clean_line(&buf);
-                    if let Some(c) = rx().to_copy.captures(&line) {
-                        let n = c[1].parse::<u64>().unwrap_or(0) + c[2].parse::<u64>().unwrap_or(0);
-                        counting.store(n > 0, Ordering::Relaxed);
-                    } else if rx().copied.is_match(&line) {
-                        // what robocopy logs after this is the MusicBee copy, not music
-                        counting.store(false, Ordering::Relaxed);
-                    }
-                    send(Msg::Line(line));
-                }
-            }
-        }
-    }
-    // (the script has closed its output: it has ended, or was stopped)
-    let child = holder.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let code = child.and_then(|mut c| c.wait().ok()).and_then(|s| s.code());
-    stop.store(true, Ordering::Relaxed);
-    if let Some(t) = tail {
-        let _ = t.join();
-    }
-    let err = err_thread.join().unwrap_or_default();
-    let problem = (code != Some(0)).then(|| err.lines().map(str::trim).find(|l| !l.is_empty()).map(|l| clean_line(l.as_bytes()))).flatten();
-    if kind != Kind::Preview {
-        crate::links::job_ended("backup");
-    }
-    send(Msg::Done { code, problem });
+/// Runs the native worker on its own thread and gives the page its progress.
+fn run_job(which: Which, kind: Kind, lib: String, stop: Arc<AtomicBool>, tx: Sender<Msg>, ctx: egui::Context) {
+    let mut send = |message| { let _ = tx.send(message); ctx.request_repaint(); };
+    let result = native::execute(&places(), which, &kind, Path::new(&lib), &stop, &mut send);
+    if kind != Kind::Preview { crate::links::job_ended("backup"); }
+    send(Msg::Done { code: Some(if result.is_ok() { 0 } else { 1 }), problem: result.err() });
 }
 
 /// The size of the file a robocopy log line says was copied from the library (`lib` in lower case),
 /// or None for any other line (folders, skipped files, the MusicBee copy that shares the log).
+#[cfg(test)]
 fn copied_file(line: &str, lib: &str) -> Option<u64> {
     let c = rx().robocopy_line.captures(line)?;
     let class = c.get(1).map(|m| m.as_str().trim()).unwrap_or("");
@@ -1466,56 +1336,6 @@ fn copied_file(line: &str, lib: &str) -> Option<u64> {
 }
 
 /// Follows the newest `robocopy_*.txt` (UTF-16) that this run creates and counts copied files.
-fn tail_robocopy(logs: &Path, since: &str, lib: &str, stop: &AtomicBool, counting: &AtomicBool, tx: &Sender<Msg>, ctx: &egui::Context) {
-    let mut file: Option<std::fs::File> = None;
-    let mut bytes: Vec<u8> = vec![];
-    let mut pending = String::new();
-    let (mut files, mut size) = (0u64, 0u64);
-    loop {
-        let stopping = stop.load(Ordering::Relaxed);
-        if file.is_none() {
-            let newest = std::fs::read_dir(logs).ok().and_then(|d| {
-                d.flatten()
-                    .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("robocopy_") && n.ends_with(".txt") && n.as_str() >= since)
-                    .max()
-            });
-            file = newest.and_then(|n| std::fs::File::open(logs.join(n)).ok());
-        }
-        if let Some(f) = &mut file {
-            let mut chunk = Vec::new();
-            let _ = f.read_to_end(&mut chunk);
-            if !chunk.is_empty() && counting.load(Ordering::Relaxed) {
-                bytes.extend_from_slice(&chunk);
-                let even = bytes.len() & !1;
-                let units: Vec<u16> = bytes[..even].chunks_exact(2).map(|p| u16::from_le_bytes([p[0], p[1]])).collect();
-                bytes.drain(..even);
-                pending.push_str(&String::from_utf16_lossy(&units));
-                let before = files;
-                while let Some(i) = pending.find('\n') {
-                    let line: String = pending.drain(..=i).collect();
-                    let line = line.trim_start_matches('\u{feff}').trim_end();
-                    if let Some(bytes) = copied_file(line, lib) {
-                        files += 1;
-                        size += bytes;
-                    }
-                }
-                if files != before {
-                    let _ = tx.send(Msg::Copied(files, size));
-                    ctx.request_repaint();
-                }
-            }
-        }
-        if stopping {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-// ------------------------------------------------------------------ the page
-
-/// The damaged copies of one backup's last whole check, as the page works through them.
 #[derive(Default)]
 struct Pairs {
     /// the check they belong to (a newer check starts this over)
@@ -1561,6 +1381,8 @@ pub struct BackupPage {
     /// Windows is being asked to eject the second drive; then how that ended (the words, and whether it went)
     ejecting: bool,
     eject_note: Option<(String, bool)>,
+    setup_note: Option<(String, bool)>,
+    configuring: bool,
     /// the damaged copies of the main and of the second backup's last whole check
     pairs: [Pairs; 2],
 }
@@ -1568,12 +1390,33 @@ pub struct BackupPage {
 impl BackupPage {
     pub fn new(_egui_ctx: &egui::Context) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
-        Self { tx, rx, status: None, loading: false, refreshed: None, lib: String::new(), job: None, preview: None, finished: None, debug_preview_done: false, choosing: false, chosen: None, lib_bytes: None, lib_bytes_asked: false, asking_check: None, room: [None, None], room_for: Default::default(), ejecting: false, eject_note: None, pairs: Default::default() }
+        Self { tx, rx, status: None, loading: false, refreshed: None, lib: String::new(), job: None, preview: None, finished: None, debug_preview_done: false, choosing: false, chosen: None, lib_bytes: None, lib_bytes_asked: false, asking_check: None, room: [None, None], room_for: Default::default(), ejecting: false, eject_note: None, setup_note: None, configuring: false, pairs: Default::default() }
+    }
+
+    fn choose_main_folder(&mut self, ctx: &egui::Context) {
+        if self.configuring || self.busy() { return; }
+        self.configuring = true;
+        let (tx, ctx, library) = (self.tx.clone(), ctx.clone(), self.lib.clone());
+        std::thread::spawn(move || {
+            let selected = crate::cards::test_switch("MUSIC_RECS_PICK").map(PathBuf::from)
+                .or_else(|| rfd::FileDialog::new().set_title("Choose the main backup folder").pick_folder());
+            let result = match selected {
+                Some(dest) => native::choose_main(&places(), Path::new(&library), &dest),
+                None => Ok("The backup folder was left as it was.".into()),
+            };
+            let _ = tx.send(Msg::Configured(result)); ctx.request_repaint();
+        });
+    }
+    fn set_up_nightly(&mut self, ctx: &egui::Context) {
+        if self.configuring || self.busy() { return; }
+        self.configuring = true;
+        let (tx, ctx, library) = (self.tx.clone(), ctx.clone(), self.lib.clone());
+        std::thread::spawn(move || { let result = schedule::install(&places(), Path::new(&library)); let _ = tx.send(Msg::Configured(result)); ctx.request_repaint(); });
     }
 
     /// True while a backup or preview is running (the app then asks before closing).
     pub fn busy(&self) -> bool {
-        self.job.is_some()
+        self.job.is_some() || self.configuring
     }
 
     /// What the backup is doing, in a few words for the top row (None while nothing runs).
@@ -1677,6 +1520,11 @@ impl BackupPage {
                     // look again at which pairs still differ
                     (p.rels, p.asked) = (None, false);
                 }
+                Msg::Configured(how) => {
+                    self.configuring = false;
+                    self.setup_note = Some(match how { Ok(words) => (words, true), Err(why) => (why, false) });
+                    self.refresh(ctx, false);
+                }
                 Msg::Ejected(how) => {
                     self.ejecting = false;
                     let name = self.status.as_ref().map(|s| s.second.label.clone()).filter(|l| !l.is_empty()).unwrap_or_else(|| "The drive".to_string());
@@ -1759,12 +1607,11 @@ impl BackupPage {
     /// Starts the script. Only ever called from a click on the page (and from `--backup-preview`, which
     /// only previews).
     fn start(&mut self, which: Which, kind: Kind, ctx: &egui::Context) {
-        let Some(shell) = self.status.as_ref().and_then(|s| s.shell.clone()) else { return };
         if self.job.is_some() {
             return;
         }
         let job = Job::new(which, kind.clone());
-        let holder = job.child.clone();
+        let stop = job.stop.clone();
         self.job = Some(job);
         self.finished = None;
         self.eject_note = None;
@@ -1772,7 +1619,7 @@ impl BackupPage {
             self.preview = None; // it describes the backup as it was before this run
         }
         let (tx, ctx, lib) = (self.tx.clone(), ctx.clone(), self.lib.clone());
-        std::thread::spawn(move || run_job(which, kind, shell, lib, holder, tx, ctx));
+        std::thread::spawn(move || run_job(which, kind, lib, stop, tx, ctx));
     }
 
     /// The damaged copies a check of the whole backup found, and what can be done about them. The check
@@ -1939,18 +1786,13 @@ impl BackupPage {
     fn stop_check(&mut self) {
         if let Some(job) = self.job.as_mut().filter(|j| j.kind == Kind::CheckAll) {
             job.stopped = true;
-            if let Some(child) = job.child.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                let _ = child.kill();
-            }
+            job.stop.store(true, Ordering::Relaxed);
         }
     }
 
     /// Why a backup can't start right now, if it can't.
     fn blocked(&self) -> Option<(String, Color32)> {
         let Some(s) = &self.status else { return Some(("Checking the backup drive".into(), DIM())) };
-        if s.shell.is_none() {
-            return Some((crate::importer::tools::NO_PWSH.into(), RED()));
-        }
         if s.lib_missing {
             return Some((format!("{} was not found", self.lib), RED()));
         }
@@ -1998,8 +1840,8 @@ impl BackupPage {
                 if self.status.as_ref().map(|s| s.tool_missing).unwrap_or(false) {
                     // the backup tool is not where it is looked for: say where that is, and where to change it
                     let (what, how) = match tool_dir() {
-                        Some(dir) => (format!("The backup tool (Backup-Music.ps1) was not found in {}", dir.display()), "If the music-backup folder was moved, choose it under Settings, Files."),
-                        None => ("No backup tool folder is chosen".to_string(), "Choose the folder that holds Backup-Music.ps1 under Settings, Files."),
+                        Some(dir) => (format!("The backup settings folder was not found in {}", dir.display()), "Choose its current folder under Settings, Files."),
+                        None => ("No backup tool folder is chosen".to_string(), "Choose a folder for backup settings under Settings, Files."),
                     };
                     theme::empty(ui, &what);
                     ui.vertical_centered(|ui| {
@@ -2020,9 +1862,6 @@ impl BackupPage {
     /// Why the second backup can't start right now, if it can't.
     fn second_blocked(&self) -> Option<(String, Color32)> {
         let s = self.status.as_ref()?;
-        if s.shell.is_none() {
-            return Some((crate::importer::tools::NO_PWSH.into(), RED()));
-        }
         if s.lib_missing {
             return Some((format!("{} was not found", self.lib), RED()));
         }
@@ -2606,24 +2445,6 @@ Log: C:\\x\\backup-log.txt
         assert_eq!(places_for(tool, Some("".into())).config, real.config);
         let test = places_for(tool, Some(r"X:\lab\data".into()));
         assert_eq!((test.config.as_path(), test.logs.as_path(), test.test), (Path::new(r"X:\lab\data\backup\config.json"), Path::new(r"X:\lab\data\backup\logs"), true));
-        assert_eq!(test.script, real.script);
-
-        // what the script is started with: the real run names no settings file, a test run always does,
-        // and leaves MusicBee, the music tool's data and the code alone
-        let words = |at: &Places, which: Which, kind: Kind| script_args(at, which, &kind, r"M:\Music").iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>().join(" ");
-        assert_eq!(words(&real, Which::Main, Kind::Backup), r"-Yes -Source M:\Music");
-        assert_eq!(words(&real, Which::Main, Kind::Mirror), r"-Yes -Source M:\Music -Mirror");
-        assert_eq!(words(&real, Which::Second, Kind::CheckAll), r"-Yes -Source M:\Music -Secondary -CheckAll");
-        assert_eq!(words(&real, Which::Second, Kind::Setup(r"F:\Music Backup".into())), r"-Yes -Source M:\Music -Secondary -Destination F:\Music Backup");
-        assert!(words(&real, Which::Main, Kind::Preview).starts_with(r"-Yes -Source M:\Music -Preview -LogDir "));
-        for kind in [Kind::Preview, Kind::Backup, Kind::Mirror, Kind::CheckAll, Kind::Setup(r"F:\x".into())] {
-            for which in [Which::Main, Which::Second] {
-                let w = words(&test, which, kind.clone());
-                assert!(w.contains(r"-ConfigPath X:\lab\data\backup\config.json") && w.contains("-SkipMusicBee -SkipAppData -SkipCode"), "{w}");
-                assert_eq!(w.matches("-LogDir").count(), 1, "{w}");
-                assert!(kind == Kind::Preview || w.contains(r"-LogDir X:\lab\data\backup\logs"), "{w}");
-            }
-        }
     }
 
     #[test]
@@ -2678,7 +2499,7 @@ Log: C:\\x\\backup-log.txt
     fn says_what_about_the_backups_needs_a_look() {
         let at = |s: &str| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M").unwrap();
         let now = at("2026-11-11 14:00");
-        let nightly = Task::Found { enabled: true, running: false, schedule: "Daily at 3:00 AM".into(), next: String::new(), result: Some(0) };
+        let nightly = Task::Found { native: true, enabled: true, running: false, schedule: "Daily at 3:00 AM".into(), next: String::new(), result: Some(0) };
         let good = Run { when: Some(at("2026-11-11 03:00")), copied: Some((10, "142 MB".into(), "0.3s".into())), closed: true, ..Default::default() };
         let facts = |last_run: Option<&'static Run>, last_ok: Option<NaiveDateTime>, task: &'static Task, second: Option<NaiveDateTime>| Facts { chosen: true, last_run, last_ok, task, second_last: second };
         let leak = |r: Run| -> &'static Run { Box::leak(Box::new(r)) };
@@ -2701,7 +2522,7 @@ Log: C:\\x\\backup-log.txt
         assert_eq!(alerts_for(&facts(None, None, ok, None), now), vec![("No backup has finished yet.".to_string(), true)]);
         // the nightly task is gone, or turned off
         assert_eq!(alerts_for(&facts(Some(leak(good.clone())), Some(at("2026-11-11 03:00")), task(Task::Missing), None), now), vec![("No nightly backup is set up.".to_string(), true)]);
-        let off = task(Task::Found { enabled: false, running: false, schedule: String::new(), next: String::new(), result: None });
+        let off = task(Task::Found { native: true, enabled: false, running: false, schedule: String::new(), next: String::new(), result: None });
         assert!(alerts_for(&facts(Some(leak(good.clone())), Some(at("2026-11-11 03:00")), off, None), now)[0].0.contains("turned off"));
         // the second backup: a gentle word after two weeks, no mark; none when it was never set up
         assert!(alerts_for(&facts(Some(leak(good.clone())), Some(at("2026-11-11 03:00")), ok, Some(at("2026-10-29 09:00"))), now).is_empty(), "13 days is not said");
@@ -2828,9 +2649,6 @@ Log: C:\x\backup-log.txt
         let b = &runs[1];
         assert!(!b.recopy && b.cleared_removed == Some(3));
         assert!(run_notes(b).iter().any(|n| n.starts_with("Removed files older than 30 days sent to the Recycle Bin")));
-        let at = places_for(Path::new(r"X:\dev\music-backup"), None);
-        let args = script_args(&at, Which::Second, &Kind::Recopy(PathBuf::from(r"C:\t\list.txt")), r"M:\Music").iter().map(|a| a.to_string_lossy().to_string()).collect::<Vec<_>>().join(" ");
-        assert_eq!(args, r"-Yes -Source M:\Music -Secondary -Recopy C:\t\list.txt");
     }
 
     #[test]
@@ -2844,7 +2662,7 @@ Log: C:\x\backup-log.txt
         assert_eq!(tool_dir_for(r#" "X:\tools\music-backup\" "#), Some(PathBuf::from(r"X:\tools\music-backup")));
         // and the script, its settings and its logs are looked for there
         let at = places_for(&tool_dir_for(r"X:\tools\music-backup").unwrap(), None);
-        assert_eq!((at.script.as_path(), at.config.as_path()), (Path::new(r"X:\tools\music-backup\Backup-Music.ps1"), Path::new(r"X:\tools\music-backup\config.json")));
+        assert_eq!(at.config.as_path(), Path::new(r"X:\tools\music-backup\config.json"));
     }
 
     #[test]

@@ -37,55 +37,6 @@ fn look_for_tool(name: &str, path: Option<std::ffi::OsString>, own: &Path, local
     local.and_then(|l| search(&Path::new(&l).join("Microsoft").join("WinGet").join("Packages"), &exe, 6))
 }
 
-/// What the app says, on every page that needs it, when PowerShell 7 is not there.
-pub const NO_PWSH: &str = "PowerShell 7 is not installed. Imports, tag repairs and backups need it.";
-/// Microsoft's page that says how to install it.
-pub const PWSH_HELP: &str = "https://learn.microsoft.com/powershell/scripting/install/installing-powershell-on-windows";
-
-/// PowerShell 7 (`pwsh.exe`), which the backup script and the tag editor are run with. Looked for once and
-/// remembered; while it is missing it is looked for again every ten seconds, so installing it shows without
-/// a restart. A test run can make the app believe it is missing (`MUSIC_RECS_NO_PWSH`, only with
-/// `MUSIC_RECS_DATA` set).
-pub fn pwsh() -> Option<PathBuf> {
-    static FOUND: std::sync::Mutex<Option<(std::time::Instant, Option<PathBuf>)>> = std::sync::Mutex::new(None);
-    let mut found = FOUND.lock().unwrap_or_else(|e| e.into_inner());
-    match &*found {
-        Some((_, Some(p))) => return Some(p.clone()),
-        Some((at, None)) if at.elapsed().as_secs() < 10 => return None,
-        _ => {}
-    }
-    let test = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-    let now = if test("MUSIC_RECS_DATA") && test("MUSIC_RECS_NO_PWSH") { None } else { look_for_pwsh(std::env::var_os("PATH"), std::env::var_os("LOCALAPPDATA"), std::env::var_os("ProgramFiles")) };
-    *found = Some((std::time::Instant::now(), now.clone()));
-    now
-}
-
-/// Where PowerShell 7 can be: on the PATH, as the Microsoft Store's app alias, in Program Files, or among
-/// the WinGet packages.
-fn look_for_pwsh(path: Option<std::ffi::OsString>, local: Option<std::ffi::OsString>, programs: Option<std::ffi::OsString>) -> Option<PathBuf> {
-    // symlink_metadata: the Store's pwsh.exe is an app alias, which plain metadata() can't open
-    let there = |p: &Path| std::fs::symlink_metadata(p).is_ok();
-    if let Some(path) = &path {
-        for dir in std::env::split_paths(path) {
-            let p = dir.join("pwsh.exe");
-            if there(&p) {
-                return Some(p);
-            }
-        }
-    }
-    let mut guesses = vec![];
-    if let Some(l) = &local {
-        guesses.push(PathBuf::from(l).join("Microsoft").join("WindowsApps").join("pwsh.exe"));
-    }
-    if let Some(p) = &programs {
-        guesses.push(PathBuf::from(p).join("PowerShell").join("7").join("pwsh.exe"));
-    }
-    if let Some(p) = guesses.into_iter().find(|p| there(p)) {
-        return Some(p);
-    }
-    local.and_then(|l| search(&Path::new(&l).join("Microsoft").join("WinGet").join("Packages"), "pwsh.exe", 6))
-}
-
 fn search(dir: &Path, exe: &str, depth: u32) -> Option<PathBuf> {
     for e in std::fs::read_dir(dir).ok()?.flatten() {
         let p = e.path();
@@ -145,8 +96,7 @@ fn wait_limited(child: &mut std::process::Child, secs: u64) -> Option<std::proce
             Err(_) => return None,
         }
         if std::time::Instant::now() >= end {
-            // stop it and anything it started (PowerShell and cmd start programs of their own)
-            let _ = command(Path::new("taskkill.exe"), false).args(["/PID", &child.id().to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            // Helpers are started directly, so the owned process handle stops the exact helper.
             let _ = child.kill();
             let _ = child.wait();
             return None;
@@ -215,16 +165,23 @@ pub struct Watch {
 }
 
 pub fn watch(child: &std::process::Child, secs: u64) -> Watch {
+    use std::os::windows::io::{AsHandle, AsRawHandle};
     let done = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
     let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (d, f, pid) = (done.clone(), fired.clone(), child.id());
+    let process = child.as_handle().try_clone_to_owned().ok();
     std::thread::spawn(move || {
         let guard = d.0.lock().unwrap_or_else(|e| e.into_inner());
         let (guard, _) = d.1.wait_timeout_while(guard, std::time::Duration::from_secs(secs), |finished| !*finished).unwrap_or_else(|e| e.into_inner());
         if !*guard {
             // still held under the lock, so the watch cannot be called off (and the program's number reused) meanwhile
             f.store(true, std::sync::atomic::Ordering::SeqCst);
-            let _ = command(Path::new("taskkill.exe"), false).args(["/PID", &pid.to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            if let Some(process) = process {
+                // Retaining the handle also prevents a recycled process ID from targeting another app.
+                unsafe { windows_sys::Win32::System::Threading::TerminateProcess(process.as_raw_handle(), 1); }
+            } else {
+                let _ = command(Path::new("taskkill.exe"), false).args(["/PID", &pid.to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+            }
         }
     });
     Watch { done, fired }
@@ -247,29 +204,6 @@ impl Drop for Watch {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn powershell_7_is_found_on_the_path_as_the_store_alias_or_in_program_files() {
-        let dir = std::env::temp_dir().join(format!("music-recs-pwsh-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
-        let (bin, local, programs) = (dir.join("bin"), dir.join("local"), dir.join("programs"));
-        for d in [&bin, &local.join(r"Microsoft\WindowsApps"), &programs.join(r"PowerShell\7"), &dir.join("empty")] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        let os = |p: &Path| Some(p.as_os_str().to_os_string());
-        let path = |dirs: &[&Path]| Some(std::env::join_paths(dirs.iter()).unwrap());
-        // nowhere: missing
-        assert_eq!(look_for_pwsh(path(&[&dir.join("empty")]), os(&local), os(&programs)), None);
-        assert_eq!(look_for_pwsh(None, None, None), None);
-        // in Program Files
-        std::fs::write(programs.join(r"PowerShell\7\pwsh.exe"), b"x").unwrap();
-        assert_eq!(look_for_pwsh(path(&[&dir.join("empty")]), os(&local), os(&programs)), Some(programs.join(r"PowerShell\7\pwsh.exe")));
-        // the Store's alias comes before Program Files, and the PATH before both
-        std::fs::write(local.join(r"Microsoft\WindowsApps\pwsh.exe"), b"x").unwrap();
-        assert_eq!(look_for_pwsh(path(&[&dir.join("empty")]), os(&local), os(&programs)), Some(local.join(r"Microsoft\WindowsApps\pwsh.exe")));
-        std::fs::write(bin.join("pwsh.exe"), b"x").unwrap();
-        assert_eq!(look_for_pwsh(path(&[&dir.join("empty"), &bin]), os(&local), os(&programs)), Some(bin.join("pwsh.exe")));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
 
     #[test]
     fn ffmpeg_on_the_path_comes_before_the_apps_own_copy_and_the_winget_packages() {
@@ -302,8 +236,8 @@ mod tests {
         use std::io::Read;
         let shell = std::path::PathBuf::from(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
         // prints nothing and waits far longer than the limit: the read below would never return by itself
-        let mut c = command(&shell, false);
-        c.args(["/c", "ping -n 60 127.0.0.1 > nul"]).stdout(Stdio::piped());
+        let mut c = command(&find_tool("ffmpeg").unwrap(), false);
+        c.args(["-nostdin", "-v", "quiet", "-re", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "60", "-f", "null", "-"]).stdout(Stdio::piped());
         let mut child = c.spawn().unwrap();
         let dog = watch(&child, 1);
         let t = std::time::Instant::now();
@@ -389,8 +323,8 @@ mod tests {
     fn a_stuck_helper_is_stopped() {
         let shell = std::path::PathBuf::from(std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into()));
         // prints, then waits far longer than the limit
-        let mut slow = command(&shell, false);
-        slow.args(["/c", "echo hi & ping -n 30 127.0.0.1 > nul"]);
+        let mut slow = command(&find_tool("ffmpeg").unwrap(), false);
+        slow.args(["-nostdin", "-v", "quiet", "-re", "-f", "lavfi", "-i", "anullsrc=r=8000:cl=mono", "-t", "30", "-progress", "pipe:1", "-f", "null", "-"]);
         let t = std::time::Instant::now();
         assert!(output_limited(&mut slow, 1).is_empty());
         assert!(t.elapsed() < std::time::Duration::from_secs(10));

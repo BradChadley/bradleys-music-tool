@@ -26,7 +26,6 @@ What it fetches
 Only when you ask for it, from the makers' own release pages, each checked against a known checksum:
 
   FFmpeg          checking and converting music files           115 MB
-  PowerShell 7    the tag editor (installed by Windows' winget)  about 110 MB
   slskd           the Soulseek client, only if you set it up      56 MB
 
 It looks up artist and album names at Last.fm, MusicBrainz, the Cover Art Archive, Apple's music search,
@@ -51,6 +50,10 @@ the first start and the app will only report.
 
 The Last.fm key and the Soulseek login are kept in Windows Credential Manager, not in a file. The Soulseek
 client it sets up shares none of your files and can only be reached from your own PC.
+
+The Backup page copies and checks files in the app itself. Existing backup settings still work. After
+choosing the main backup folder, use "Set up nightly backup" to have this app handle scheduled backups.
+Replaced and removed copies are kept for 30 days, and a second drive can hold another checked copy.
 
 
 Problems and ideas

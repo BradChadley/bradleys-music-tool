@@ -18,6 +18,7 @@ mod images;
 mod importer;
 mod inbox;
 mod library;
+mod library_lock;
 mod library_page;
 mod links;
 mod loose;
@@ -36,7 +37,9 @@ mod settings;
 mod setup;
 mod slskd;
 mod sources;
-mod tageditor;
+mod tagwrite;
+#[cfg(test)]
+mod test_tags;
 mod theme;
 mod undo;
 mod update;
@@ -409,7 +412,7 @@ impl App {
             health: None,
             backup: None,
             setup: (!cfg.setup_done).then(setup::Setup::new),
-            backup_on: backup::tool_dir_for(&cfg.backup_tool_dir).is_some_and(|d| d.join("Backup-Music.ps1").is_file()),
+            backup_on: backup::tool_dir_for(&cfg.backup_tool_dir).is_some(),
             detail: None,
             detail_cache: Default::default(),
             detail_tx,
@@ -829,8 +832,8 @@ impl App {
         let music = (!dir.trim().is_empty()).then(|| self.path_found("music", &dir, now));
         let login = slskd::read_settings().map(|s| s.has_login).unwrap_or(false);
         let client = slskd::exe().exists() || helpers::busy(helpers::Helper::Soulseek);
-        let script = backup::tool_dir_for(&self.cfg.backup_tool_dir).map(|d| d.join("Backup-Music.ps1").to_string_lossy().to_string());
-        let backup = script.map(|s| self.path_found("backup-tool", &s, now));
+        let folder = backup::tool_dir_for(&self.cfg.backup_tool_dir).map(|d| d.to_string_lossy().to_string());
+        let backup = folder.map(|s| self.path_found("backup-tool", &s, now));
         let out = settings::needs_a_look(music, (login, client), backup);
         self.attention_cache = (now, out.clone());
         out
@@ -1198,10 +1201,8 @@ impl eframe::App for App {
             self.debug_screenshot(&ctx);
             return;
         }
-        // is the backup tool there? (asked at most every few seconds; without it there is no Backup page)
-        let now = ctx.input(|i| i.time);
-        let script = backup::tool_dir_for(&self.cfg.backup_tool_dir).map(|d| d.join("Backup-Music.ps1").to_string_lossy().to_string());
-        self.backup_on = script.is_some_and(|s| self.path_found("backup-on", &s, now));
+        // A chosen settings folder enables the Backup page.
+        self.backup_on = backup::tool_dir_for(&self.cfg.backup_tool_dir).is_some();
         if self.page == Page::Backup && !self.backup_on {
             self.page = START_PAGE;
         }
@@ -2470,6 +2471,7 @@ fn main() -> eframe::Result {
     if update::answered_self_check() {
         return Ok(());
     }
+    if let Some(code) = backup::run_if_requested() { std::process::exit(code); }
     install_crash_log();
     // (only a plain launch is held to one window: test and debug runs with flags may sit beside the real one.
     // A start right after an update is a plain launch too, once the copy that made way has gone.)

@@ -360,7 +360,7 @@ mod plain_err_tests {
     fn windows_error_numbers_are_left_out_of_sentences() {
         let e = std::io::Error::from_raw_os_error(5);
         assert_eq!(super::plain_err(format!("The list could not be saved: {e}")), "The list could not be saved: Access is denied.");
-        assert_eq!(super::plain_err(format!("PowerShell could not be started ({e}).")), "PowerShell could not be started (Access is denied.).");
+        assert_eq!(super::plain_err(format!("The helper could not be started ({e}).")), "The helper could not be started (Access is denied.).");
         assert_eq!(super::plain_err("Nothing to strip (here)".into()), "Nothing to strip (here)");
     }
 }

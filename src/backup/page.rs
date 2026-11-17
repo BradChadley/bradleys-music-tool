@@ -9,7 +9,7 @@
 //!   - the albums the most recent copying backup brought, as one row of covers.
 //!
 //! In a narrow window the cards stand one over the other. Everything here only draws and starts what a
-//! click asks for; reading the drives and the log, and running the script, is in `backup.rs`.
+//! click asks for; reading the drives and the log, and starting the worker, is in `backup.rs`.
 use super::*;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{pos2, CornerRadius, UiBuilder};
@@ -145,7 +145,7 @@ impl BackupPage {
     pub fn in_short(&self) -> [(String, Color32); 2] {
         let Some(s) = &self.status else { return [("Checking".to_string(), DIM()), (String::new(), DIM())] };
         if s.tool_missing {
-            return [("Tool not found".to_string(), WARN()), ("The backup tool's folder was not found.".to_string(), DIM())];
+            return [("Settings not found".to_string(), WARN()), ("Choose a backup settings folder in Settings, Files.".to_string(), DIM())];
         }
         if s.dest.is_empty() {
             return [("Not set up yet".to_string(), WARN()), (String::new(), DIM())];
@@ -303,7 +303,7 @@ impl BackupPage {
                 }
                 Drive::NoDest => {
                     head(ui, "No backup folder yet", WARN(), Some(WARN()), "");
-                    line(ui, "Run Backup-Music.ps1 from the backup tool's folder once to choose one; after that this page runs it.", DIM());
+                    line(ui, "Choose a folder on the backup drive. You can preview the changes before copying.", DIM());
                     gauge(ui, None, None);
                 }
             },
@@ -344,11 +344,14 @@ impl BackupPage {
         };
         // letting go of the drive: never while something is being copied to it or read from it
         let ejectable = which == Which::Second && folder.as_ref().is_some_and(|f| can_eject(f, test));
-        let (mut open, mut other, mut let_go) = (false, false, false);
+        let (mut open, mut other, mut let_go, mut main_folder) = (false, false, false, false);
         caption_row(ui, if which == Which::Main { "MAIN BACKUP" } else { "SECOND BACKUP" }, |ui| {
             // (from the right edge inward)
             if folder.is_some() {
                 open = quiet(ui, "Open folder", 12.5, true).clicked();
+            }
+            if which == Which::Main {
+                main_folder = quiet(ui, if folder.is_some() { "Change folder" } else { "Choose folder" }, 12.5, idle && !self.configuring).clicked();
             }
             if which == Which::Second && set_up && !self.choosing {
                 other = quiet(ui, "Use another drive", 12.5, idle).clicked();
@@ -364,17 +367,18 @@ impl BackupPage {
                 });
             }
         }
+        if main_folder { self.choose_main_folder(ctx); }
         if other {
             self.choosing = true;
             self.chosen = None;
         }
         if let_go {
-            if let (Some(shell), Some(folder)) = (self.status.as_ref().and_then(|s| s.shell.clone()), folder) {
+            if let Some(folder) = folder {
                 self.ejecting = true;
                 self.eject_note = None;
                 let (tx, ctx) = (self.tx.clone(), ctx.clone());
                 std::thread::spawn(move || {
-                    let _ = tx.send(Msg::Ejected(eject(&shell, &folder, test)));
+                    let _ = tx.send(Msg::Ejected(eject(&folder, test)));
                     ctx.request_repaint();
                 });
             }
@@ -424,6 +428,16 @@ impl BackupPage {
             Which::Second => ("By hand".to_string(), TEXT(), s.second.last.map(|t| format!("last backed up {}", ago(t))).unwrap_or_else(|| "never backed up".to_string()), DIM()),
         };
         two_tone(ui, &words, color, &more, more_color, 13.5, 10.0);
+        let needs_schedule = which == Which::Main && !matches!(s.task, Task::Found { native: true, .. });
+        if needs_schedule {
+            ui.add_space(6.0);
+            if quiet(ui, if self.configuring { "Saving" } else { "Set up nightly backup" }, 13.5, idle && !self.configuring && !s.dest.is_empty()).clicked() {
+                self.set_up_nightly(ctx);
+            }
+        }
+        if which == Which::Main {
+            if let Some((words, good)) = &self.setup_note { line(ui, words, if *good { DIM() } else { WARN() }); }
+        }
         if let Some(run) = self.last_check(which) {
             check_line(ui, run);
         }
@@ -535,14 +549,6 @@ impl BackupPage {
             ui.add_space(2.0);
         }
         for (text, color) in &notes {
-            if text == crate::importer::tools::NO_PWSH {
-                // with the word that installs it
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 12.0;
-                    crate::helpers::pwsh_line(ui, 12.5, *color, false);
-                });
-                continue;
-            }
             ui.add(Label::new(RichText::new(text).size(12.5).color(*color)).wrap());
         }
     }
@@ -573,7 +579,7 @@ impl BackupPage {
             (Kind::CheckAll, _) => "Reading the library and the backup".to_string(),
             (Kind::Preview, _) | (_, Phase::Comparing) => "Comparing your library with the backup".to_string(),
             (_, Phase::Copying) => {
-                let mut t = format!("Copying {} of {}", commas(job.done_files), plural_commas(job.total_files, "file"));
+                let mut t = format!("Copied and checked {} of {}", commas(job.done_files), plural_commas(job.total_files, "file"));
                 if job.total_bytes > 0 {
                     t.push_str(&format!(", {} of {}", fmt_size(job.done_bytes.min(job.total_bytes)), job.total_text));
                 }

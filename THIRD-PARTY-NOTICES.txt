@@ -9,22 +9,13 @@ It is written by tools\third-party.ps1; change that script, not this file.
 INSIDE THE PROGRAM FILE
 ----------------------------------------------------------------------------------------------------
 
-TagLibSharp 2.3.0
-    Reads and writes the tags of music files. GNU Lesser General Public License, version 2.1.
-    Copyright (c) 2006-2007 Brian Nickel, copyright (c) 2009-2020 other contributors.
-    https://github.com/mono/taglib-sharp
-    The license text is tag-editor\TagLibSharp-LICENSE.txt in the source. The app unpacks the
-    library as TagLibSharp.dll into the folder "tag-editor" in its data folder
-    (%LOCALAPPDATA%\music-recs) and loads it from there, so another build of the library can
-    be put in its place.
-
 Fonts (they come with the egui library, in its package epaint_default_fonts)
     Ubuntu Light: Ubuntu Font Licence 1.0, https://design.ubuntu.com/font
     Hack: MIT license, https://github.com/source-foundry/Hack
     Noto Emoji: SIL Open Font License 1.1, https://github.com/googlefonts/noto-emoji
     emoji-icon-font: MIT license, https://github.com/jslegers/emoji-icon-font
 
-The Rust libraries listed below (219 packages).
+The Rust libraries listed below (226 packages).
 
 
 FETCHED BY THE APP WHEN IT IS ASKED TO, NOT INSIDE IT
@@ -38,9 +29,6 @@ slskd
     The Soulseek client the Downloads page drives. GNU Affero General Public License, version 3.
     https://github.com/slskd/slskd
 
-PowerShell 7
-    Runs the tag editor. Installed by Windows' own installer (winget) on a click. MIT license.
-    https://github.com/PowerShell/PowerShell
 
 
 RUST LIBRARIES
@@ -59,6 +47,7 @@ base64                      0.23.1    MIT OR Apache-2.0                         
 bitflags                    2.13.2    MIT OR Apache-2.0                                    https://github.com/bitflags/bitflags
 bytemuck                    1.25.2    Zlib OR Apache-2.0 OR MIT                            https://github.com/Lokathor/bytemuck
 bytemuck_derive             1.12.1    Zlib OR Apache-2.0 OR MIT                            https://github.com/Lokathor/bytemuck
+byteorder                   1.5.0     Unlicense OR MIT                                     https://github.com/BurntSushi/byteorder
 byteorder-lite              0.1.0     Unlicense OR MIT                                     https://github.com/image-rs/byteorder-lite
 bytes                       1.12.1    MIT                                                  https://github.com/tokio-rs/bytes
 cfg-if                      1.0.5     MIT OR Apache-2.0                                    https://github.com/rust-lang/cfg-if
@@ -73,6 +62,7 @@ crc32fast                   1.5.4     MIT OR Apache-2.0                         
 crossbeam-channel           0.5.17    MIT OR Apache-2.0                                    https://github.com/crossbeam-rs/crossbeam
 crossbeam-utils             0.8.23    MIT OR Apache-2.0                                    https://github.com/crossbeam-rs/crossbeam
 cursor-icon                 1.2.0     MIT OR Apache-2.0 OR Zlib                            https://github.com/rust-windowing/cursor-icon
+data-encoding               2.11.1    MIT                                                  https://github.com/ia0/data-encoding
 deranged                    0.5.9     MIT OR Apache-2.0                                    https://github.com/jhpratt/deranged
 dirs                        7.0.0     MIT OR Apache-2.0                                    https://codeberg.org/dirs/dirs-rs
 dirs-sys                    0.5.0     MIT OR Apache-2.0                                    https://github.com/dirs-dev/dirs-sys-rs
@@ -127,6 +117,7 @@ icu_normalizer_data         2.4.0     Unicode-3.0                               
 icu_properties              2.4.0     Unicode-3.0                                          https://github.com/unicode-org/icu4x
 icu_properties_data         2.4.0     Unicode-3.0                                          https://github.com/unicode-org/icu4x
 icu_provider                2.4.0     Unicode-3.0                                          https://github.com/unicode-org/icu4x
+id3                         1.17.3    MIT                                                  https://codeberg.org/polyfloyd/rust-id3
 idna                        1.1.0     MIT OR Apache-2.0                                    https://github.com/servo/rust-url/
 idna_adapter                1.2.2     Apache-2.0 OR MIT                                    https://github.com/hsivonen/idna_adapter
 image                       0.25.10   MIT OR Apache-2.0                                    https://github.com/image-rs/image
@@ -140,6 +131,8 @@ linebender_resource_handle  0.1.1     Apache-2.0 OR MIT                         
 litemap                     0.8.3     Unicode-3.0                                          https://github.com/unicode-org/icu4x
 litrs                       1.0.1     MIT OR Apache-2.0                                    https://github.com/LukasKalbertodt/litrs
 lock_api                    0.4.14    MIT OR Apache-2.0                                    https://github.com/Amanieu/parking_lot
+lofty                       0.25.5    MIT OR Apache-2.0                                    https://github.com/Serial-ATA/lofty-rs
+lofty_attr                  0.13.0    MIT OR Apache-2.0                                    https://github.com/Serial-ATA/lofty-rs
 log                         0.4.35    MIT OR Apache-2.0                                    https://github.com/rust-lang/log
 md5                         0.7.0     Apache-2.0/MIT                                       https://github.com/stainless-steel/md5
 memchr                      2.8.3     Unlicense OR MIT                                     https://github.com/BurntSushi/memchr
@@ -152,12 +145,14 @@ moxcms                      0.8.1     BSD-3-Clause OR Apache-2.0                
 nohash-hasher               0.2.0     Apache-2.0 OR MIT                                    https://github.com/paritytech/nohash-hasher
 num-conv                    0.2.2     MIT OR Apache-2.0                                    https://github.com/jhpratt/num-conv
 num-traits                  0.2.19    MIT OR Apache-2.0                                    https://github.com/rust-num/num-traits
+ogg_pager                   0.8.0     MIT OR Apache-2.0                                    https://github.com/Serial-ATA/lofty-rs
 once_cell                   1.21.4    MIT OR Apache-2.0                                    https://github.com/matklad/once_cell
 open                        5.4.5     MIT                                                  https://github.com/Byron/open-rs
 option-ext                  0.2.0     MPL-2.0                                              https://github.com/soc/option-ext.git
 parking_lot                 0.12.5    MIT OR Apache-2.0                                    https://github.com/Amanieu/parking_lot
 parking_lot_core            0.9.12    MIT OR Apache-2.0                                    https://github.com/Amanieu/parking_lot
 parlance                    0.1.1     Apache-2.0 OR MIT                                    https://github.com/linebender/parley
+paste                       1.0.15    MIT OR Apache-2.0                                    https://github.com/dtolnay/paste
 peniko                      0.6.1     Apache-2.0 OR MIT                                    https://github.com/linebender/peniko
 percent-encoding            2.3.2     MIT OR Apache-2.0                                    https://github.com/servo/rust-url/
 pin-project-lite            0.2.17    Apache-2.0 OR MIT                                    https://github.com/taiki-e/pin-project-lite
@@ -274,7 +269,7 @@ those licenses are among the ones below:
     clipboard-win 5.4.3, ecolor 0.37.0, eframe 0.37.0, egui 0.37.0, egui_extras 0.37.0,
     egui_glow 0.37.0, egui_system_font_provider 0.37.0, egui-winit 0.37.0, emath 0.37.0,
     enum-map 3.1.0, enum-map-derive 1.0.1, epaint 0.37.0, epaint_default_fonts 0.37.0,
-    profiling 1.0.18
+    lofty 0.25.5, lofty_attr 0.13.0, ogg_pager 0.8.0, profiling 1.0.18
 
 
 LICENSE TEXTS
@@ -508,11 +503,11 @@ limitations under the License.
 ====================================================================================================
 adler2 2.0.1 (LICENSE-MIT), displaydoc 0.2.7 (LICENSE-MIT), enumn 0.1.14 (LICENSE-MIT),
 glow 0.17.0 (LICENSE-MIT), itoa 1.0.18 (LICENSE-MIT), once_cell 1.21.4 (LICENSE-MIT),
-pin-project-lite 0.2.17 (LICENSE-MIT), proc-macro2 1.0.107 (LICENSE-MIT),
-quote 1.0.47 (LICENSE-MIT), serde 1.0.229 (LICENSE-MIT), serde_core 1.0.229 (LICENSE-MIT),
-serde_derive 1.0.229 (LICENSE-MIT), serde_json 1.0.154 (LICENSE-MIT),
-smol_str 0.2.2 (LICENSE-MIT), syn 2.0.119 (LICENSE-MIT), syn 3.0.9 (LICENSE-MIT),
-thiserror 2.0.21 (LICENSE-MIT), thiserror-impl 2.0.21 (LICENSE-MIT),
+paste 1.0.15 (LICENSE-MIT), pin-project-lite 0.2.17 (LICENSE-MIT),
+proc-macro2 1.0.107 (LICENSE-MIT), quote 1.0.47 (LICENSE-MIT), serde 1.0.229 (LICENSE-MIT),
+serde_core 1.0.229 (LICENSE-MIT), serde_derive 1.0.229 (LICENSE-MIT),
+serde_json 1.0.154 (LICENSE-MIT), smol_str 0.2.2 (LICENSE-MIT), syn 2.0.119 (LICENSE-MIT),
+syn 3.0.9 (LICENSE-MIT), thiserror 2.0.21 (LICENSE-MIT), thiserror-impl 2.0.21 (LICENSE-MIT),
 typed-path 0.13.0 (LICENSE-MIT), typeid 1.0.3 (LICENSE-MIT), unicode-ident 1.0.27 (LICENSE-MIT),
 utf8-zero 0.8.1 (LICENSE-MIT), zmij 1.0.23 (LICENSE-MIT)
 ====================================================================================================
@@ -808,7 +803,7 @@ IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
-aho-corasick 1.1.5 (COPYING), memchr 2.8.3 (COPYING)
+aho-corasick 1.1.5 (COPYING), byteorder 1.5.0 (COPYING), memchr 2.8.3 (COPYING)
 ====================================================================================================
 
 This project is dual-licensed under the Unlicense and MIT licenses.
@@ -816,7 +811,8 @@ This project is dual-licensed under the Unlicense and MIT licenses.
 You may use this code under the terms of either license.
 
 ====================================================================================================
-aho-corasick 1.1.5 (LICENSE-MIT), byteorder-lite 0.1.0 (LICENSE-MIT), memchr 2.8.3 (LICENSE-MIT)
+aho-corasick 1.1.5 (LICENSE-MIT), byteorder 1.5.0 (LICENSE-MIT),
+byteorder-lite 0.1.0 (LICENSE-MIT), memchr 2.8.3 (LICENSE-MIT)
 ====================================================================================================
 
 The MIT License (MIT)
@@ -842,7 +838,8 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 THE SOFTWARE.
 
 ====================================================================================================
-aho-corasick 1.1.5 (UNLICENSE), byteorder-lite 0.1.0 (UNLICENSE), memchr 2.8.3 (UNLICENSE)
+aho-corasick 1.1.5 (UNLICENSE), byteorder 1.5.0 (UNLICENSE), byteorder-lite 0.1.0 (UNLICENSE),
+memchr 2.8.3 (UNLICENSE)
 ====================================================================================================
 
 This is free and unencumbered software released into the public domain.
@@ -878,17 +875,17 @@ glifo 0.3.0 (LICENSE-APACHE), half 2.7.1 (LICENSE-APACHE), image 0.25.10 (LICENS
 image-webp 0.2.4 (LICENSE-APACHE), itoa 1.0.18 (LICENSE-APACHE),
 linebender_resource_handle 0.1.1 (LICENSE-APACHE), litrs 1.0.1 (LICENSE-APACHE),
 miniz_oxide 0.8.9 (LICENSE-APACHE.md), miniz_oxide 0.9.1 (LICENSE-APACHE.md),
-num-conv 0.2.2 (LICENSE-Apache), pin-project-lite 0.2.17 (LICENSE-APACHE),
-proc-macro2 1.0.107 (LICENSE-APACHE), quote 1.0.47 (LICENSE-APACHE),
-raw-window-handle 0.6.2 (LICENSE-APACHE.md), serde 1.0.229 (LICENSE-APACHE),
-serde_core 1.0.229 (LICENSE-APACHE), serde_derive 1.0.229 (LICENSE-APACHE),
-serde_json 1.0.154 (LICENSE-APACHE), syn 2.0.119 (LICENSE-APACHE), syn 3.0.9 (LICENSE-APACHE),
-thiserror 2.0.21 (LICENSE-APACHE), thiserror-impl 2.0.21 (LICENSE-APACHE),
-time 0.3.55 (LICENSE-Apache), time-core 0.1.9 (LICENSE-Apache),
-time-macros 0.2.32 (LICENSE-Apache), typed-path 0.13.0 (LICENSE-APACHE),
-typeid 1.0.3 (LICENSE-APACHE), unicode-ident 1.0.27 (LICENSE-APACHE),
-utf8-zero 0.8.1 (LICENSE-APACHE), vello_common 0.2.0 (LICENSE-APACHE),
-vello_cpu 0.2.0 (LICENSE-APACHE)
+num-conv 0.2.2 (LICENSE-Apache), paste 1.0.15 (LICENSE-APACHE),
+pin-project-lite 0.2.17 (LICENSE-APACHE), proc-macro2 1.0.107 (LICENSE-APACHE),
+quote 1.0.47 (LICENSE-APACHE), raw-window-handle 0.6.2 (LICENSE-APACHE.md),
+serde 1.0.229 (LICENSE-APACHE), serde_core 1.0.229 (LICENSE-APACHE),
+serde_derive 1.0.229 (LICENSE-APACHE), serde_json 1.0.154 (LICENSE-APACHE),
+syn 2.0.119 (LICENSE-APACHE), syn 3.0.9 (LICENSE-APACHE), thiserror 2.0.21 (LICENSE-APACHE),
+thiserror-impl 2.0.21 (LICENSE-APACHE), time 0.3.55 (LICENSE-Apache),
+time-core 0.1.9 (LICENSE-Apache), time-macros 0.2.32 (LICENSE-Apache),
+typed-path 0.13.0 (LICENSE-APACHE), typeid 1.0.3 (LICENSE-APACHE),
+unicode-ident 1.0.27 (LICENSE-APACHE), utf8-zero 0.8.1 (LICENSE-APACHE),
+vello_common 0.2.0 (LICENSE-APACHE), vello_cpu 0.2.0 (LICENSE-APACHE)
 ====================================================================================================
 
 Apache License
@@ -3088,6 +3085,33 @@ Permission is granted to anyone to use this software for any purpose, including 
 3. This notice may not be removed or altered from any source distribution.
 
 ====================================================================================================
+data-encoding 2.11.1 (LICENSE)
+====================================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2015-2020 Julien Cretin
+Copyright (c) 2017-2020 Google Inc.
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+====================================================================================================
 deranged 0.5.9 (LICENSE-Apache)
 ====================================================================================================
 
@@ -5011,6 +5035,32 @@ SPDX-License-Identifier: Unicode-3.0
 
 Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
 ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
+
+====================================================================================================
+id3 1.17.3 (LICENSE)
+====================================================================================================
+
+The MIT License (MIT)
+
+Copyright (c) 2014-2017 James Hurst
+              2017      polyfloyd
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 ====================================================================================================
 idna 1.1.0 (LICENSE-MIT), percent-encoding 2.3.2 (LICENSE-MIT), url 2.5.8 (LICENSE-MIT)
