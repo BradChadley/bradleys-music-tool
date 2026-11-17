@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 
 mod page;
 mod native;
+mod sqlite;
 mod schedule;
 
 pub fn run_if_requested() -> Option<i32> { schedule::requested() }
@@ -46,7 +47,7 @@ struct Places {
     config: PathBuf,
     logs: PathBuf,
     /// a test run: settings and logs are in the test's own folder, and the worker leaves
-    /// MusicBee, the music tool's data and the code alone
+    /// Cadence, the music tool's data and the code alone
     test: bool,
 }
 
@@ -91,7 +92,8 @@ impl Which {
 /// The three things a run saves besides the music, each with a line of its own in the log.
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Part {
-    MusicBee,
+    LegacyPlayer, // Historical logs remain readable.
+    Cadence,
     Tool,
     Code,
 }
@@ -99,7 +101,8 @@ enum Part {
 impl Part {
     fn failed(self) -> &'static str {
         match self {
-            Part::MusicBee => "The MusicBee copy had a problem",
+            Part::Cadence => "The Cadence copy had a problem",
+            Part::LegacyPlayer => "The previous player data copy had a problem",
             Part::Tool => "The music tool's data could not be saved",
             Part::Code => "The code could not be saved",
         }
@@ -137,7 +140,8 @@ struct Run {
     robocopy_fail: bool,
     moved: Option<u64>,
     /// files, size
-    musicbee: Option<(u64, String)>,
+    legacy_player: Option<(u64, String)>,
+    cadence: Option<(u64, String)>,
     /// the music tool's own data, and the code: files, size
     tool: Option<(u64, String)>,
     code: Option<(u64, String)>,
@@ -189,6 +193,13 @@ struct Check {
     damaged: Vec<String>,
     /// new or changed since the last backup: the next backup copies them
     waiting: u64,
+    missing: u64,
+}
+
+impl Check {
+    fn complete(&self) -> bool {
+        self.finished && self.files > 0 && self.good == self.files && self.damaged_count == 0 && self.waiting == 0 && self.missing == 0
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -203,7 +214,7 @@ impl Run {
     /// How the run ended, in one line.
     fn headline(&self) -> (String, Tone) {
         if let Some(e) = &self.error {
-            let what = if self.has_plan { "Stopped" } else { "Did not start" };
+            let what = if self.check.as_ref().is_some_and(|c| c.finished) { "Check incomplete" } else if self.has_plan { "Stopped" } else { "Did not start" };
             return (crate::util::plain_err(format!("{what}: {e}")), Tone::Bad);
         }
         if let Some(c) = &self.check {
@@ -211,7 +222,8 @@ impl Run {
                 (false, _) => ("The check was stopped before it finished".into(), Tone::Unsure),
                 // a check that read nothing has checked nothing: the library folder was not there or not readable
                 (true, 0) if c.files == 0 => ("The check found no files in the library. Is its drive connected?".into(), Tone::Bad),
-                (true, 0) =>(format!("Checked {} in {}: all good copies", plural(c.files, "file"), c.time), Tone::Good),
+                (true, 0) if c.complete() =>(format!("Checked {} in {}: all good copies", plural(c.good, "file"), c.time), Tone::Good),
+                (true, 0) => (format!("{} of {} copies verified; backup incomplete", c.good, c.files), Tone::Unsure),
                 (true, n) => (format!("Checked {}: {}", plural(c.files, "file"), if n == 1 { "1 damaged copy".to_string() } else { format!("{n} damaged copies") }), Tone::Bad),
             };
         }
@@ -301,7 +313,8 @@ struct Rx {
     extra_head: Regex,
     copied: Regex,
     problems: Regex,
-    musicbee: Regex,
+    legacy_player: Regex,
+    cadence: Regex,
     tool: Regex,
     code: Regex,
     moved: Regex,
@@ -336,7 +349,8 @@ fn rx() -> &'static Rx {
             extra_head: r(r"^In the backup but no longer in the library: (\d+) folders, (\d+) files\."),
             copied: r(r"^Copied (\d+) files \((.+)\) in (.+)\.$"),
             problems: r(r"^(\d+) problems:"),
-            musicbee: r(r"^MusicBee: saved .*\((\d+) files, ([^)]+)\) to "),
+            cadence: r(r"^Cadence: saved .*\((\d+) files, ([^)]+)\) to "),
+            legacy_player: r(r"^MusicBee: saved .*\((\d+) files, ([^)]+)\) to "),
             tool: r(r"^Music tool: saved .*\((\d+) files, ([^)]+)\) to "),
             code: r(r"^Code: saved .*\((\d+) files, ([^)]+)\) to "),
             moved: r(r"^Moved (\d+) removed items"),
@@ -440,9 +454,12 @@ fn parse_runs(text: &str) -> Vec<Run> {
             run.robocopy_fail = true;
         } else if let Some(step) = line.strip_prefix("  ").filter(|l| l.starts_with("couldn't move ") || l.starts_with("couldn't clear ") || l.starts_with("couldn't put back ")) {
             run.step_fails.push(step.trim().to_string());
-        } else if let Some(c) = rx.musicbee.captures(line) {
-            run.musicbee = Some((c[1].parse().unwrap_or(0), c[2].to_string()));
-            part = Some(Part::MusicBee);
+        } else if let Some(c) = rx.cadence.captures(line) {
+            run.cadence = Some((c[1].parse().unwrap_or(0), c[2].to_string()));
+            part = Some(Part::Cadence);
+        } else if let Some(c) = rx.legacy_player.captures(line) {
+            run.legacy_player = Some((c[1].parse().unwrap_or(0), c[2].to_string()));
+            part = Some(Part::LegacyPlayer);
         } else if let Some(c) = rx.tool.captures(line) {
             run.tool = Some((c[1].parse().unwrap_or(0), c[2].to_string()));
             part = Some(Part::Tool);
@@ -452,7 +469,7 @@ fn parse_runs(text: &str) -> Vec<Run> {
         } else if let Some(what) = line.strip_prefix("  problem: ") {
             // "Data (C:\...): robocopy code 16 (details: C:\...\robocopy_x.txt)": the details are in the log
             let what = what.split(" (details: ").next().unwrap_or(what).trim();
-            run.part_problems.push((part.unwrap_or(Part::MusicBee), what.to_string()));
+            run.part_problems.push((part.unwrap_or(Part::LegacyPlayer), what.to_string()));
         } else if line.starts_with("Backing up ") {
             run.second = line.ends_with("(second backup)");
         } else if let Some(c) = rx.kept_old.captures(line) {
@@ -481,6 +498,10 @@ fn parse_runs(text: &str) -> Vec<Run> {
             if let Some(check) = &mut run.check {
                 check.damaged.push(file.trim().to_string());
             }
+        } else if let Some(n) = line.strip_suffix(" backup files are missing; run a backup, then check again.").and_then(|s| s.parse().ok()) {
+            if let Some(check) = &mut run.check { check.missing = n; }
+        } else if let Some(n) = line.strip_suffix(" files have different size or date and were not verified; run a backup, then check again.").and_then(|s| s.parse().ok()) {
+            if let Some(check) = &mut run.check { check.waiting = n; }
         } else if let Some(c) = rx.waiting.captures(line) {
             if let Some(check) = &mut run.check {
                 check.waiting = c[1].parse().unwrap_or(0);
@@ -666,6 +687,7 @@ fn disk_space(root: &str) -> Option<(u64, u64)> {
 #[derive(Clone, Default, PartialEq, Debug)]
 struct Saved {
     dest: String,
+    cadence_data: String,
     label: String,
     last: Option<NaiveDateTime>,
     /// the second backup: the id in the file at the top of its folder, the folder without its drive
@@ -681,7 +703,7 @@ fn read_config(file: &Path) -> Saved {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw.trim_start_matches('\u{feff}')) else { return Default::default() };
     let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
     let time = |k: &str| NaiveDateTime::parse_from_str(&s(k), "%Y-%m-%dT%H:%M:%S").ok();
-    Saved { dest: s("Destination"), label: s("DestinationLabel"), last: time("LastRun"), second_id: s("SecondaryId"), second_folder: s("SecondaryFolder"), second_label: s("SecondaryLabel"), second_last: time("SecondaryLastRun") }
+    Saved { cadence_data: s("CadenceDataDirectory"), dest: s("Destination"), label: s("DestinationLabel"), last: time("LastRun"), second_id: s("SecondaryId"), second_folder: s("SecondaryFolder"), second_label: s("SecondaryLabel"), second_last: time("SecondaryLastRun") }
 }
 
 /// The runs in one of the script's summary logs, newest first, previews left out: (the backups, the last
@@ -1258,7 +1280,7 @@ enum Phase {
     Verifying,
     /// a check of the whole backup
     Checking,
-    /// MusicBee, the music tool's data and the code are saved
+    /// Cadence, the music tool's data and the code are saved
     Saving,
     Finishing,
 }
@@ -1325,7 +1347,7 @@ fn run_job(which: Which, kind: Kind, lib: String, stop: Arc<AtomicBool>, tx: Sen
 }
 
 /// The size of the file a robocopy log line says was copied from the library (`lib` in lower case),
-/// or None for any other line (folders, skipped files, the MusicBee copy that shares the log).
+/// or None for any other line (folders, skipped files, the previous player copy that shares the log).
 #[cfg(test)]
 fn copied_file(line: &str, lib: &str) -> Option<u64> {
     let c = rx().robocopy_line.captures(line)?;
@@ -1387,6 +1409,14 @@ pub struct BackupPage {
     pairs: [Pairs; 2],
 }
 
+fn confirm_folder_choice(library: &str, dest: &Path) -> bool {
+    rfd::MessageDialog::new()
+        .set_title("Confirm backup folders")
+        .set_description(format!("Library:\n{library}\n\nBackup:\n{}\n\nConfirm only if these are the intended folders and drives. Future backups will use this library; files absent from it may be moved into backup history. Preview the changes before running the backup.", dest.display()))
+        .set_buttons(rfd::MessageButtons::OkCancel)
+        .show() == rfd::MessageDialogResult::Ok
+}
+
 impl BackupPage {
     pub fn new(_egui_ctx: &egui::Context) -> Self {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1401,9 +1431,22 @@ impl BackupPage {
             let selected = crate::cards::test_switch("MUSIC_RECS_PICK").map(PathBuf::from)
                 .or_else(|| rfd::FileDialog::new().set_title("Choose the main backup folder").pick_folder());
             let result = match selected {
-                Some(dest) => native::choose_main(&places(), Path::new(&library), &dest),
+                Some(dest) if confirm_folder_choice(&library, &dest) => native::choose_main(&places(), Path::new(&library), &dest),
+                Some(_) => Ok("The backup folder was left as it was.".into()),
                 None => Ok("The backup folder was left as it was.".into()),
             };
+            let _ = tx.send(Msg::Configured(result)); ctx.request_repaint();
+        });
+    }
+    fn confirm_backup_folders(&mut self, which: Which, folder: String, ctx: &egui::Context) {
+        if self.configuring || self.busy() { return; }
+        self.configuring = true;
+        let (tx, ctx, library) = (self.tx.clone(), ctx.clone(), self.lib.clone());
+        std::thread::spawn(move || {
+            let dest = Path::new(&folder);
+            let result = if confirm_folder_choice(&library, dest) {
+                native::confirm_folders(&places(), which, Path::new(&library), dest)
+            } else { Ok("The saved folders were left as they were.".into()) };
             let _ = tx.send(Msg::Configured(result)); ctx.request_repaint();
         });
     }
@@ -1770,6 +1813,8 @@ impl BackupPage {
             let (tx, ctx2, lib, bk) = (self.tx.clone(), ctx.clone(), library.clone(), backup.clone());
             std::thread::spawn(move || {
                 let done = crate::importer::tools::find_tool("ffmpeg").and_then(|ffmpeg| {
+                    let _backup_lock = native::RunLock::take(&bk)?;
+                    native::validate_binding(&places(), which, &lib, &bk)?;
                     let ffprobe = crate::importer::tools::find_tool("ffprobe")?;
                     let done = bring_back(&lib, &bk, &crate::repair::backups_root(&lib), &copy_sound, &ffmpeg, &ffprobe);
                     // what was heard of the files that came in takes the place of the saved results
@@ -1952,7 +1997,7 @@ fn run_notes(run: &Run) -> Vec<String> {
         notes.push(format!("{} no longer in the library moved to _deleted", plural(n, "item")));
     }
     let failed = |p: Part| run.part_problems.iter().any(|(part, _)| *part == p);
-    for (part, saved, words) in [(Part::MusicBee, &run.musicbee, "MusicBee saved"), (Part::Tool, &run.tool, "Music tool data saved"), (Part::Code, &run.code, "Code saved")] {
+    for (part, saved, words) in [(Part::Cadence, &run.cadence, "Cadence saved"), (Part::LegacyPlayer, &run.legacy_player, "Previous player data saved"), (Part::Tool, &run.tool, "Music tool data saved"), (Part::Code, &run.code, "Code saved")] {
         if let (Some((files, size)), false) = (saved, failed(part)) {
             notes.push(format!("{words} ({}, {size})", plural(*files, "file")));
         }
@@ -2200,6 +2245,20 @@ fn preview_card(ui: &mut Ui, run: &Run, lib: &str) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn cadence_snapshots_are_named_separately_from_legacy_legacy_player_history() {
+        let text = LOG.replace("MusicBee", "Cadence");
+        let runs = parse_runs(&text);
+        assert!(runs[0].cadence.is_some());
+        assert!(runs[0].legacy_player.is_none());
+        assert!(run_notes(&runs[0]).iter().any(|s| s.contains("Cadence saved")));
+        let legacy = parse_runs(LOG);
+        let notes = run_notes(&legacy[0]).join(" ");
+        assert!(notes.contains("Previous player data saved"));
+        assert!(!notes.contains("MusicBee") && !notes.contains("Cadence"));
+        assert_eq!(Part::LegacyPlayer.failed(), "The previous player data copy had a problem");
+    }
+
     const LOG: &str = r"
 ==================== 2026-11-10 03:00 ====================
 Backing up M:\Music  ->  N:\Music Backup
@@ -2256,7 +2315,7 @@ Log: C:\x\backup-log.txt
         assert_eq!(a.changed_albums[1].detail, "1 file");
         assert_eq!((a.extra_dirs, a.extra_files, a.extras.len()), (1, 2, 2));
         assert_eq!(a.headline().0, "Copied 41 files (366 MB) in 0.4s");
-        assert_eq!(a.musicbee, Some((132, "40 MB".to_string())));
+        assert_eq!(a.legacy_player, Some((132, "40 MB".to_string())));
         // an error from before the script's header is a run of its own, not part of the one before it
         let b = &runs[1];
         assert!(b.error.as_deref().unwrap().starts_with("Drive N: is now 'Other'"));
@@ -2365,14 +2424,14 @@ ERROR (2026-11-11 20:00): Another backup to N:\Music Backup is already running. 
         let a = &runs[0];
         assert!(!a.second);
         assert_eq!((a.kept_old, a.old_lost, a.moved), (Some(2), 1, Some(1)));
-        assert_eq!((a.musicbee.clone(), a.tool.clone(), a.code.clone()), (Some((208, "45 MB".into())), Some((61, "12 MB".into())), Some((140, "3 MB".into()))));
+        assert_eq!((a.legacy_player.clone(), a.tool.clone(), a.code.clone()), (Some((208, "45 MB".into())), Some((61, "12 MB".into())), Some((140, "3 MB".into()))));
         assert_eq!(a.part_problems, vec![(Part::Tool, r"Data (C:\Users\x\AppData\Local\music-recs): robocopy code 16".to_string())]);
         assert_eq!(a.headline(), ("Copied 3 files (30 MB). The music tool's data could not be saved".to_string(), Tone::Bad));
         assert_eq!(run_troubles(a), vec![r"The music tool's data could not be saved: Data (C:\Users\x\AppData\Local\music-recs): robocopy code 16".to_string(), "1 old copy could not be kept and was replaced.".to_string()]);
         // the part that failed is not said to be saved; the others are
         let notes = run_notes(a).join(" | ");
         assert!(notes.contains("Old copies of 2 changed files kept") && notes.contains("1 item no longer in the library moved to _deleted"), "{notes}");
-        assert!(notes.contains("MusicBee saved (208 files, 45 MB)") && notes.contains("Code saved") && !notes.contains("Music tool data saved"), "{notes}");
+        assert!(notes.contains("Previous player data saved (208 files, 45 MB)") && notes.contains("Code saved") && !notes.contains("Music tool data saved"), "{notes}");
 
         // the second backup: bad copies, a problem with the code, room left
         let b = &runs[1];
@@ -2388,7 +2447,7 @@ ERROR (2026-11-11 20:00): Another backup to N:\Music Backup is already running. 
 
         // a check of the whole backup: damaged copies, and what waits for the next backup
         let d = runs[3].check.clone().unwrap();
-        assert_eq!(d, Check { finished: true, files: 24045, time: "1h 12m".into(), good: 24005, damaged_count: 2, damaged: d.damaged.clone(), waiting: 38 });
+        assert_eq!(d, Check { finished: true, files: 24045, time: "1h 12m".into(), good: 24005, damaged_count: 2, damaged: d.damaged.clone(), waiting: 38, missing: 0 });
         assert_eq!(d.damaged.len(), 2);
         assert_eq!(runs[3].headline(), ("Checked 24045 files: 2 damaged copies".to_string(), Tone::Bad));
         assert_eq!(runs[4].headline(), ("Checked 12 files in 2.0s: all good copies".to_string(), Tone::Good));

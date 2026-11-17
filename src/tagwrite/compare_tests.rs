@@ -372,6 +372,7 @@ fn the_rust_editor_preserves_the_reviewed_fixture_results() {
     }
     let actual = serde_json::to_value(actual).unwrap();
     let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/tagwrite-observed.json");
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
     std::fs::write(&out, serde_json::to_string_pretty(&actual).unwrap()).unwrap();
     let expected: Value = serde_json::from_str(include_str!("fixture_expectations.json")).unwrap();
     let wrong: Vec<_> = cases.iter().filter(|c| actual[c.name] != expected[c.name]).map(|c| c.name).collect();

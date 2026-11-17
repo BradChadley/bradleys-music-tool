@@ -51,10 +51,17 @@ the first start and the app will only report.
 The Last.fm session and Soulseek login are kept in Windows Credential Manager, not in a file. Connect Last.fm in Settings and approve access in your browser; no API key is needed. The Soulseek
 client it sets up shares none of your files and can only be reached from your own PC.
 
-The Backup page copies and checks files in the app itself. Existing backup settings still work. After
-choosing the main backup folder, use "Set up nightly backup" to have this app handle scheduled backups.
-Replaced and removed copies are kept for 30 days, and a second drive can hold another checked copy.
+The Backup page copies and checks files in the app itself. After updating, existing backup setups need
+one "Confirm folders" on the Backup page. Check the library and backup paths and drives, confirm them,
+then preview the changes. A matching drive letter or disk label alone no longer identifies a backup.
+Use "Set up nightly backup" to have this app handle scheduled backups. Replaced and removed copies
+are kept for 30 days, and a second drive can hold another checked copy. Large removals stop for review.
 
+Whole-backup checks report missing and unverified files separately. A check succeeds only when every
+library file has a verified copy. App-data snapshots now save Cadence's library, playlists and settings,
+including committed SQLite changes while Cadence is open. Previous player backups remain untouched.
+If a configured or previously saved app-data folder disappears, the backup reports a failure and keeps
+the previous snapshot. See README.md in the source repository for custom Cadence paths and restoration.
 
 Problems and ideas
 ------------------

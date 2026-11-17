@@ -20,7 +20,17 @@ It is for people who keep their own music files, sorted as `Artist\Album (Year)\
 
 **Home.** One page that says where things stand: what is new from your artists, what is on its way, the state of the library and of the last check.
 
-**Backup.** Keeps checked copies of your library on a main drive and an optional second drive. Replaced and removed files are kept for 30 days. Existing backup settings still work, and the Backup page can set up nightly runs of the app.
+**Backup.** Keeps checked copies of your library on a main drive and an optional second drive. Replaced and removed files are kept for 30 days. The Backup page can set up nightly runs of the app.
+
+Existing setups need a one-time **Confirm folders** on the Backup page before backups can run. Check the displayed library and backup paths and drives, confirm, then preview the changes. New folder selections also ask for confirmation. The app remembers the library folder's identity and the backup folder's identity and marker; a matching drive letter or disk label alone is not enough. If you intentionally replace or move a library or backup folder, confirm the intended folders again. A normal run stops before moving removed copies or expiring history when more than 200 files, or more than 20% of the backup, are absent from the library. After reviewing the library, **Move them to _deleted** explicitly permits that cleanup.
+
+A whole-backup check succeeds only when every library file has a verified copy. Missing copies and files with different size or dates are reported separately and require a backup followed by another check; they are never counted as good copies.
+
+Daily app-data copies save Cadence, under `_Cadence/YYYY-MM-DD/Data` on each backup drive. They include Cadence's library, playlists, settings, integration data, imported artwork and its own backup history. SQLite databases use online snapshots, so committed changes are included even while Cadence is open. Downloadable models, generated artwork/waveform caches and logs are omitted. The newest 30 daily Cadence copies are retained; older player backups are left untouched.
+
+The default source is `%LOCALAPPDATA%\CadencePlayer\Data`. For a portable or custom Cadence library, set `CadenceDataDirectory` in the backup tool's `config.json` to the full data-folder path; otherwise `CADENCE_DATA_DIR`, when set for the backup process, takes precedence over the default. To restore, close Cadence, keep the current data folder as a separate safety copy, and copy a snapshot's `Data` folder into an empty Cadence data folder. Do not overlay a restored database onto old SQLite journal files. Saved connections are Windows-user encrypted and may require signing in again on another PC.
+
+A configured Cadence folder must exist and contain data. Optional app-data folders become required once they have been saved. If a required folder disappears or has no files to save, the run reports failure, keeps the previous snapshot, and does not advance the last successful backup time.
 
 ## Get it
 

@@ -85,9 +85,11 @@ fn new_xml(action: &str, sid: &str) -> String {
     )
 }
 pub(super) fn install(at: &Places, source: &Path) -> Result<String, String> {
-    if super::read_config(&at.config).dest.is_empty() {
+    let saved = super::read_config(&at.config);
+    if saved.dest.is_empty() {
         return Err("Choose the main backup folder first.".into());
     }
+    super::native::validate_binding(at, Which::Main, source, Path::new(&saved.dest))?;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let action = action(&exe, &at.config, source)?;
     if at.test {

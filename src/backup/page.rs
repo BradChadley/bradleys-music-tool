@@ -344,11 +344,12 @@ impl BackupPage {
         };
         // letting go of the drive: never while something is being copied to it or read from it
         let ejectable = which == Which::Second && folder.as_ref().is_some_and(|f| can_eject(f, test));
-        let (mut open, mut other, mut let_go, mut main_folder) = (false, false, false, false);
+        let (mut open, mut other, mut let_go, mut main_folder, mut confirm) = (false, false, false, false, false);
         caption_row(ui, if which == Which::Main { "MAIN BACKUP" } else { "SECOND BACKUP" }, |ui| {
             // (from the right edge inward)
             if folder.is_some() {
                 open = quiet(ui, "Open folder", 12.5, true).clicked();
+                confirm = quiet(ui, "Confirm folders", 12.5, idle && !self.configuring).clicked();
             }
             if which == Which::Main {
                 main_folder = quiet(ui, if folder.is_some() { "Change folder" } else { "Choose folder" }, 12.5, idle && !self.configuring).clicked();
@@ -368,6 +369,9 @@ impl BackupPage {
             }
         }
         if main_folder { self.choose_main_folder(ctx); }
+        if confirm {
+            if let Some(folder) = folder.clone() { self.confirm_backup_folders(which, folder, ctx); }
+        }
         if other {
             self.choosing = true;
             self.chosen = None;
@@ -586,7 +590,7 @@ impl BackupPage {
                 t
             }
             (_, Phase::Verifying) | (_, Phase::Checking) => reading("Checking the copies against the library:"),
-            (_, Phase::Saving) => "Saving MusicBee, the music tool's data and the code".to_string(),
+            (_, Phase::Saving) => "Saving Cadence, the music tool's data and the code".to_string(),
             (_, Phase::Finishing) => "Finishing".to_string(),
         };
         let can_stop = job.kind == Kind::CheckAll && !job.stopped;
@@ -878,7 +882,7 @@ fn last_backup(ui: &mut Ui, run: Option<&Run>, last_ok: Option<NaiveDateTime>, c
 }
 
 /// What a backup did besides copying, short enough for one quiet line: "All 28,499 copies checked ·
-/// MusicBee, tool data and code saved". (`run_notes` has it in full, with the numbers.)
+/// Cadence, tool data and code saved". (`run_notes` has it in full, with the numbers.)
 fn run_brief(run: &Run) -> String {
     let mut parts = vec![];
     let albums = run.albums_phrase();
@@ -889,7 +893,7 @@ fn run_brief(run: &Run) -> String {
         parts.push(if *n == 1 { "The copy was checked".to_string() } else { format!("All {} copies checked", commas(*n)) });
     }
     let failed = |p: Part| run.part_problems.iter().any(|(part, _)| *part == p);
-    let saved: Vec<&str> = [(Part::MusicBee, run.musicbee.is_some(), "MusicBee"), (Part::Tool, run.tool.is_some(), "tool data"), (Part::Code, run.code.is_some(), "code")].into_iter().filter(|(part, there, _)| *there && !failed(*part)).map(|p| p.2).collect();
+    let saved: Vec<&str> = [(Part::Cadence, run.cadence.is_some(), "Cadence"), (Part::LegacyPlayer, run.legacy_player.is_some(), "previous player data"), (Part::Tool, run.tool.is_some(), "tool data"), (Part::Code, run.code.is_some(), "code")].into_iter().filter(|(part, there, _)| *there && !failed(*part)).map(|p| p.2).collect();
     let list = match saved.as_slice() {
         [] => String::new(),
         [a] => a.to_string(),
@@ -971,7 +975,7 @@ fn schedule_words(task: &Task) -> (String, Color32, String, Color32) {
 fn check_line(ui: &mut Ui, run: &Run) {
     let when = run.when.map(|t| format!(" {}", lower_first(&when_text(t)))).unwrap_or_default();
     let (found, tone) = match &run.check {
-        Some(c) if c.finished && c.files > 0 && c.damaged_count == 0 => (format!("all {} copies good", commas(c.files)), Tone::Good),
+        Some(c) if c.complete() && run.error.is_none() => (format!("all {} copies good", commas(c.good)), Tone::Good),
         Some(c) if c.finished && c.damaged_count > 0 => (if c.damaged_count == 1 { "1 damaged copy".to_string() } else { format!("{} damaged copies", commas(c.damaged_count)) }, Tone::Bad),
         // stopped, found no files, or never got as far as checking: the run says it itself
         _ => run.headline(),
@@ -979,6 +983,9 @@ fn check_line(ui: &mut Ui, run: &Run) {
     two_tone(ui, &format!("Whole backup checked{when}"), DIM(), &found, tone_color(tone, GREEN()), 13.5, 10.0);
     if let Some(c) = run.check.as_ref().filter(|c| c.finished && c.waiting > 0) {
         let files = if c.waiting == 1 { "1 file is".to_string() } else { format!("{} files are", commas(c.waiting)) };
-        ui.add(Label::new(RichText::new(format!("{files} new or changed since the last backup; the next backup copies {}.", if c.waiting == 1 { "it" } else { "them" })).size(12.5).color(FAINT())).wrap());
+        ui.add(Label::new(RichText::new(format!("{files} not verified because its source or backup metadata differs. Run a backup, then check again.")).size(12.5).color(WARN())).wrap());
+    }
+    if let Some(c) = run.check.as_ref().filter(|c| c.finished && c.missing > 0) {
+        ui.add(Label::new(RichText::new(format!("{} backup files are missing. Run a backup, then check again.", commas(c.missing))).size(12.5).color(WARN())).wrap());
     }
 }

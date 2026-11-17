@@ -398,7 +398,9 @@ pub fn batches(root: &Path) -> Vec<BatchInfo> {
             })
         })
         .collect();
-    out.sort_by(|a, b| b.id.cmp(&a.id));
+    // IDs have only whole seconds followed by random characters. Sorting them can reverse
+    // two quick repairs, making a sequence of Undos finish at an intermediate file version.
+    out.sort_by(|a, b| b.when.cmp(&a.when).then_with(|| b.id.cmp(&a.id)));
     out
 }
 
@@ -602,6 +604,19 @@ mod journal_tests {
     }
     fn read(p: &Path) -> String {
         std::fs::read_to_string(p).unwrap_or_else(|_| "<gone>".into())
+    }
+
+    #[test]
+    fn same_second_repair_history_uses_recorded_time_not_random_id() {
+        let (base, _, root) = lab("history-order");
+        let older = "20261117-030000-ffffff";
+        let newer = "20261117-030000-000000";
+        for (id, when) in [(older, "2026-11-17T03:00:00.100000-05:00"), (newer, "2026-11-17T03:00:00.900000-05:00")] {
+            put(&root.join(id).join("batch.json"), &serde_json::json!({"Id": id, "Title": id, "When": when}).to_string());
+        }
+        let found = batches(&root);
+        assert_eq!(found.iter().map(|b| b.id.as_str()).collect::<Vec<_>>(), vec![newer, older]);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

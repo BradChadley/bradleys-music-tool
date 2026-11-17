@@ -26,9 +26,10 @@ re!(
     SCAM_RX,
     r"(?i)torrent|ripped by|\brip(ped)? (by|from)\b|upload(ed)? by|downloaded (from|at|by)|free download|\bpmedia\b|\bwarez\b|\bscene\b|\[vx\]|\bvx\b|kingdom-?leaks|hyperleaks|newalbumreleases|zippyshare|mediafire|datpiff|livemixtapes|mp3va|\bnar\b|\bglt\b|\bmtd\b|\bpsv\b"
 );
+// Historical encoder names remain recognized so existing tags are not mistaken for uploader junk.
 re!(
     SOFTWARE_RX,
-    r"(?i)exact audio copy|\beac\b|itunes|dbpoweramp|foobar|lame|winamp|media ?monkey|musicbee|mp3tag|cdex|\bxld\b|quicktime|windows media|nero|audiograbber|fre:ac|easy cd-da|ffmpeg|lavf|lavc|apple|amazon|spotify|tidal|qobuz|beatport|bandcamp|google|picard|musicbrainz"
+    r"(?i)exact audio copy|\beac\b|itunes|dbpoweramp|foobar|lame|winamp|media ?monkey|cadence|musicbee|mp3tag|cdex|\bxld\b|quicktime|windows media|nero|audiograbber|fre:ac|easy cd-da|ffmpeg|lavf|lavc|apple|amazon|spotify|tidal|qobuz|beatport|bandcamp|google|picard|musicbrainz"
 );
 // real credits keep their comment even with a link in it ("music by X, visual art by Y, www.instagram.com/y")
 re!(
@@ -394,6 +395,12 @@ mod tests {
         assert_eq!(t("comment", "music by Keith Rankin\nvisual art by midi wizard\nwww.instagram.com/midi_wizard/").len(), 0);
         assert_eq!(t("comment", "ripped by XYZ, art by me www.x.com").len(), 1);
         assert_eq!(t("encoded_by", "LAME 3.100").len(), 0);
+        for player in ["Cadence", "MusicBee"] {
+            let value = format!("{player} https://example.com");
+            assert_eq!(t("encoded_by", &value).len(), 0);
+            let spread = HashMap::from([(junk_key("comment", player), 5)]);
+            assert!(junk_reason("comment", player, Some(&spread)).is_none());
+        }
         assert_eq!(t("download", "freemusic.ru").len(), 1);
         assert_eq!(t("freemusic.ru", "x").len(), 1);
         assert_eq!(t("lyrics", "see www.x.com").len(), 0);

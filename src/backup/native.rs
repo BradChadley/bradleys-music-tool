@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 type Result<T> = std::result::Result<T, String>;
-const OWN: &[&str] = &["_changed", "_deleted", "_musicbee", "_musictool", "_code", "_backup-id.txt", "_backup-staging"];
+const OWN: &[&str] = &["_changed", "_deleted", "_musicbee", "_cadence", "_musictool", "_code", "_backup-id.txt", "_backup-staging"];
 
 fn err(e: impl std::fmt::Display) -> String {
     crate::util::plain_err(e.to_string())
@@ -44,6 +44,96 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     let a = key(a).trim_end_matches('\\').to_string();
     let b = key(b).trim_end_matches('\\').to_string();
     a == b || a.starts_with(&(b.clone() + "\\")) || b.starts_with(&(a + "\\"))
+}
+
+/// A directory's volume serial and file ID survive drive-letter and label changes.
+/// Keep the handle open while reading the ID; never write a marker into the library.
+fn directory_id(path: &Path) -> Result<String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle};
+    plain_path(path)?;
+    let file = OpenOptions::new().read(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(path).map_err(err)?;
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(err(std::io::Error::last_os_error()));
+    }
+    if info.dwFileAttributes & 0x10 == 0 || (info.nFileIndexHigh == 0 && info.nFileIndexLow == 0) {
+        return Err("This folder does not provide a stable identity for safe backups.".into());
+    }
+    Ok(format!("{:08x}-{:08x}{:08x}", info.dwVolumeSerialNumber, info.nFileIndexHigh, info.nFileIndexLow))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+struct Binding {
+    source_path: String,
+    source_id: String,
+    destination_id: String,
+    marker: String,
+}
+fn binding_key(which: Which) -> &'static str {
+    match which { Which::Main => "MainBinding", Which::Second => "SecondaryBinding" }
+}
+fn settings(at: &Places) -> Result<serde_json::Value> {
+    let value = match fs::read_to_string(&at.config) {
+        Ok(s) => serde_json::from_str(s.trim_start_matches('\u{feff}')).map_err(err)?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(err(e)),
+    };
+    if !value.is_object() { return Err("The backup settings are not readable. They were left alone.".into()); }
+    Ok(value)
+}
+pub(super) fn validate_binding(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
+    let value = settings(at)?;
+    let binding: Binding = serde_json::from_value(value.get(binding_key(which)).cloned().ok_or(
+        "Confirm the library and backup folders on the Backup page before running this backup. Existing copies were left alone."
+    )?).map_err(|_| "The saved folder identities are not readable. Confirm the folders on the Backup page.".to_string())?;
+    if key(source) != binding.source_path || directory_id(source)? != binding.source_id {
+        return Err("The library folder or its drive has changed. Existing backups were left alone. Confirm the folders on the Backup page only if this is the intended library.".into());
+    }
+    let marker = fs::read_to_string(plain_path(&dest.join(ID_FILE))?).map_err(|_| "The backup identity file is missing or unreadable. Existing copies were left alone.".to_string())?;
+    if binding.marker.is_empty() || marker.trim_start_matches('\u{feff}').trim() != binding.marker || directory_id(dest)? != binding.destination_id {
+        return Err("This is not the confirmed backup folder or drive. Nothing was copied or moved.".into());
+    }
+    Ok(())
+}
+
+/// Only an explicit folder selection/confirmation may enroll or replace identities.
+/// The caller holds the destination lock; the settings lock serializes both drives.
+fn bind(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
+    let _lock = RunLock::take(&at.config)?;
+    let mut value = settings(at)?;
+    let source_id = directory_id(source)?;
+    let folder = dest.to_string_lossy();
+    let label = volume_label(&format!("{}\\", &folder[..2])).ok_or("The backup drive is not connected.")?;
+    fs::create_dir_all(dest).map_err(err)?;
+    let marker_path = plain_path(&dest.join(ID_FILE))?;
+    let marker = match fs::read_to_string(&marker_path) {
+        Ok(s) if !s.trim_start_matches('\u{feff}').trim().is_empty() => s.trim_start_matches('\u{feff}').trim().to_owned(),
+        Ok(_) => return Err("The backup identity file is empty. It was left alone.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let id = format!("{:x}-{:x}-{}", crate::importer::scan::rand_id(), crate::importer::scan::rand_id(), std::process::id());
+            let mut file = OpenOptions::new().create_new(true).write(true).open(&marker_path).map_err(err)?;
+            file.write_all(id.as_bytes()).map_err(err)?;
+            file.sync_all().map_err(err)?;
+            id
+        }
+        Err(e) => return Err(err(e)),
+    };
+    let binding = serde_json::to_value(Binding { source_path: key(source), source_id, destination_id: directory_id(dest)?, marker: marker.clone() }).map_err(err)?;
+    if value.get(binding_key(which)) != Some(&binding) {
+        value.as_object_mut().unwrap().remove(if which == Which::Main { "LastRun" } else { "SecondaryLastRun" });
+    }
+    value[binding_key(which)] = binding;
+    if which == Which::Main {
+        value["Destination"] = folder.as_ref().into();
+        value["DestinationLabel"] = label.into();
+    } else {
+        value["SecondaryId"] = marker.into();
+        value["SecondaryFolder"] = folder[2..].into();
+        value["SecondaryLabel"] = label.into();
+    }
+    fs::create_dir_all(at.config.parent().unwrap()).map_err(err)?;
+    crate::util::write_atomic(&at.config, &serde_json::to_vec_pretty(&value).map_err(err)?).map_err(err)
 }
 fn safe_roots(source: &Path, dest: &Path, main: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
     let (source, dest) = (plain_path(source)?, plain_path(dest)?);
@@ -348,9 +438,10 @@ fn select_dest(at: &Places, saved: &Saved, which: Which, kind: &Kind) -> Result<
     Ok(dest)
 }
 
-fn remember(at: &Places, which: Which, dest: &Path) -> Result<()> {
+fn remember(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
     // Re-read under a separate lock so two backups finishing together keep each other's settings.
     let _lock = RunLock::take(&at.config)?;
+    validate_binding(at, which, source, dest)?;
     let mut value: serde_json::Value = match fs::read_to_string(&at.config) {
         Ok(s) => serde_json::from_str(s.trim_start_matches('\u{feff}')).map_err(err)?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
@@ -415,6 +506,14 @@ pub(super) fn execute(at: &Places, which: Which, kind: &Kind, library: &Path, st
         let destination = select_dest(at, &saved, which, kind)?;
         let (source, dest) = safe_roots(library, &destination, (which == Which::Second).then(|| Path::new(&saved.dest)))?;
         let _lock = RunLock::take(&dest)?;
+        if matches!(kind, Kind::Setup(_)) {
+            if tree(&source, false)?.files.is_empty() {
+                return Err("The library has no files. Nothing was moved or copied.".into());
+            }
+            bind(at, which, &source, &dest)?;
+        } else {
+            validate_binding(at, which, &source, &dest)?;
+        }
         line(format!("Backing up {}  ->  {}{}", source.display(), dest.display(), if which == Which::Second { "  (second backup)" } else { "" }))?;
         run(at, which, kind, &source, &dest, stop, &mut line, &mut |files, bytes| send.borrow_mut()(Msg::Copied(files, bytes)))
     })();
@@ -449,16 +548,21 @@ fn run(
         return Err("The library has no files. Nothing was moved or copied.".into());
     }
     let total: u64 = library.files.values().map(|e| e.size).sum();
+    let tolerance = if fat_times(dest) { Duration::from_secs(2) } else { Duration::ZERO };
     if *kind == Kind::CheckAll {
         line(format!("Checking every file in {} against the library. Nothing is copied or changed.", dest.display()))?;
-        let (mut good, mut waiting, mut damaged, mut done) = (0, 0, vec![], 0);
+        let (mut good, mut waiting, mut missing, mut damaged, mut done) = (0, 0, 0, vec![], 0);
         for (i, (k, e)) in library.files.iter().enumerate() {
             if stop.load(Ordering::Relaxed) {
                 return Err("Stopped. Nothing was copied or changed.".into());
             }
             line(format!("Checking {} of {} files, {} of {}", i + 1, library.files.len(), fmt_size(done), fmt_size(total)))?;
             done += e.size;
-            if backup.files.get(k).is_none_or(|b| !same_meta(e, b, Duration::from_secs(2))) {
+            let Some(b) = backup.files.get(k) else {
+                missing += 1;
+                continue;
+            };
+            if !same_meta(e, b, tolerance) {
                 waiting += 1;
                 continue;
             }
@@ -484,11 +588,14 @@ fn run(
             line(format!("  damaged: {f}"))?;
         }
         if waiting > 0 {
-            line(format!("{waiting} files are new or changed since the last backup; the next backup will copy them."))?;
+            line(format!("{waiting} files have different size or date and were not verified; run a backup, then check again."))?;
         }
-        return if damaged.is_empty() { Ok(()) } else { Err(format!("{} copies need a look.", damaged.len())) };
+        if missing > 0 {
+            line(format!("{missing} backup files are missing; run a backup, then check again."))?;
+        }
+        return if damaged.is_empty() && waiting == 0 && missing == 0 { Ok(()) }
+            else { Err(format!("{good} verified copies; {missing} missing, {waiting} not verified, {} damaged or unreadable.", damaged.len())) };
     }
-    let tolerance = if fat_times(dest) { Duration::from_secs(2) } else { Duration::ZERO };
     let mut copies: Vec<&Entry> =
         library.files.iter().filter(|(k, e)| backup.files.get(*k).is_none_or(|b| !same_meta(e, b, tolerance))).map(|(_, e)| e).collect();
     if let Kind::Recopy(list) = kind {
@@ -557,6 +664,7 @@ fn run(
         }
     }
     for (i, e) in copies.iter().enumerate() {
+        validate_binding(at, which, source, dest)?;
         let (bytes, old) = copy_checked(source, dest, &e.rel, &stamp, stop)?;
         done_bytes += bytes;
         kept += usize::from(old);
@@ -577,6 +685,7 @@ fn run(
         ))?;
         return Ok(());
     }
+    validate_binding(at, which, source, dest)?;
     for rel in library.dirs.values() {
         if stop.load(Ordering::Relaxed) {
             return Err("Stopped. Copies already finished are kept.".into());
@@ -584,16 +693,18 @@ fn run(
         ensure_dirs(dest, rel, &stamp)?;
     }
     if !extras.is_empty() {
-        if *kind != Kind::Mirror && extra_files > 200 && extra_files * 5 > backup.files.len() {
+        if *kind != Kind::Mirror && (extra_files > 200 || extra_files * 5 > backup.files.len()) {
             line(format!(
                 "{extra_files} of the backup's {} files are no longer in the library. That is a lot at once, so they were left where they are.",
                 backup.files.len()
             ))?;
+            return Err("Many files are missing from the library. Removed copies and backup history were left alone. Review the library before choosing 'Move them to _deleted'.".into());
         } else {
             if tree(source, false)? != library {
                 return Err("The library changed during the backup. Removed items were left where they are; run the backup again.".into());
             }
             for rel in &extras {
+                validate_binding(at, which, source, dest)?;
                 let from = below(dest, rel)?;
                 if below(source, rel)?.exists() {
                     return Err("A removed file is back in the library. Nothing more was moved.".into());
@@ -614,8 +725,9 @@ fn run(
     if !at.test {
         snapshots(at, dest, stop, line)?;
     }
+    validate_binding(at, which, source, dest)?;
     clean_history(dest, at.test, line)?;
-    remember(at, which, dest)?;
+    remember(at, which, source, dest)?;
     if which == Which::Second {
         if let Some((free, _)) = super::disk_space(&dest.to_string_lossy()[..3]) {
             line(format!("Room left on the second backup drive: {}.", fmt_size(free)))?;
@@ -629,6 +741,16 @@ struct SnapshotSource {
     path: PathBuf,
     skip_dirs: Vec<PathBuf>,
     skip_files: Vec<&'static str>,
+    required: bool,
+}
+fn cadence_source(path: PathBuf) -> SnapshotSource {
+    SnapshotSource {
+        name: "Data", path,
+        required: true,
+        // Keep imported artwork, saved connections, database history and all other durable files.
+        skip_dirs: ["Cache", "Artwork", "Logs", "Models", "Heard", "UpdateDownloads"].map(PathBuf::from).to_vec(),
+        skip_files: vec!["waveforms.db", "waveforms.db-wal", "waveforms.db-shm", "error.log", "running.marker"],
+    }
 }
 fn snapshot_files(root: &Path, skip_dirs: &[PathBuf], skip_files: &[&str]) -> Result<Vec<PathBuf>> {
     fn visit(root: &Path, dir: &Path, skip_dirs: &[PathBuf], skip_files: &[&str], out: &mut Vec<PathBuf>) -> Result<()> {
@@ -655,18 +777,17 @@ fn snapshot_files(root: &Path, skip_dirs: &[PathBuf], skip_files: &[&str]) -> Re
     Ok(out)
 }
 fn snapshots(at: &Places, dest: &Path, stop: &AtomicBool, line: &mut dyn FnMut(String) -> Result<()>) -> Result<()> {
-    let source = |name, path| SnapshotSource { name, path, skip_dirs: vec![], skip_files: vec![] };
+    let source = |name, path| SnapshotSource { name, path, skip_dirs: vec![], skip_files: vec![], required: false };
     let local = dirs::data_local_dir().ok_or("The app data folder was not found.")?;
     let roaming = dirs::config_dir().ok_or("The settings folder was not found.")?;
-    let program = std::env::var_os("ProgramFiles(x86)").map(PathBuf::from);
-    let mut bee = vec![source("Settings", roaming.join("MusicBee"))];
-    if let Some(music) = dirs::audio_dir() {
-        bee.push(source("Library", music.join("MusicBee")));
-    }
-    if let Some(p) = program {
-        bee.push(source("Plugins", p.join("MusicBee/Plugins")));
-        bee.push(source("Skins", p.join("MusicBee/Skins")));
-    }
+    let configured = read_config(&at.config).cadence_data;
+    let portable = std::env::var_os("CADENCE_DATA_DIR").filter(|p| !p.is_empty());
+    let cadence_required = !configured.trim().is_empty() || portable.is_some() || dest.join("_Cadence").try_exists().map_err(err)?;
+    let cadence_path = if !configured.trim().is_empty() { PathBuf::from(configured) }
+        else if let Some(path) = portable { PathBuf::from(path) }
+        else { local.join("CadencePlayer/Data") };
+    let mut cadence = cadence_source(cadence_path);
+    cadence.required = cadence_required;
     let mut app = source("Data", local.join("music-recs"));
     app.skip_dirs = [
         "slskd/bin",
@@ -694,7 +815,7 @@ fn snapshots(at: &Places, dest: &Path, stop: &AtomicBool, line: &mut dyn FnMut(S
         code.push(backup);
     }
     for (folder, label, sources) in [
-        ("_MusicBee", "MusicBee", bee),
+        ("_Cadence", "Cadence", vec![cadence]),
         ("_MusicTool", "Music tool", vec![app, source("Window", roaming.join("Bradley's Music Tool"))]),
         ("_Code", "Code", code),
     ] {
@@ -718,6 +839,19 @@ impl Drop for ScratchDir {
     }
 }
 
+fn previously_saved(dest: &Path, folder: &str, name: &str) -> Result<bool> {
+    let root = plain_path(&dest.join(folder))?;
+    if !root.try_exists().map_err(err)? { return Ok(false); }
+    for entry in fs::read_dir(root).map_err(err)? {
+        let p = entry.map_err(err)?.path();
+        if p.file_name().is_some_and(|n| chrono::NaiveDate::parse_from_str(&n.to_string_lossy(), "%Y-%m-%d").is_ok())
+            && plain_path(&p.join(name))?.try_exists().map_err(err)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn save_snapshot(
     dest: &Path,
     folder: &str,
@@ -733,17 +867,33 @@ fn save_snapshot(
     let _scratch = ScratchDir(stage.clone());
     let (mut count, mut bytes) = (0, 0);
     for s in sources {
-        if !s.path.exists() {
+        let required = s.required || previously_saved(dest, folder, s.name)?;
+        if !s.path.try_exists().map_err(err)? {
+            if required {
+                return Err(format!("{label}: the required data folder is missing: {}. The previous snapshot was kept.", s.path.display()));
+            }
             continue;
         }
         plain_path(&s.path)?;
         if overlaps(&s.path, dest) {
             return Err(format!("{label}: its source and backup folders overlap, so it was left alone."));
         }
+        let before = count;
         for rel in snapshot_files(&s.path, &s.skip_dirs, &s.skip_files)? {
+            // SQLite snapshots fold committed WAL pages into the database. Never copy journals separately.
+            if folder == "_Cadence" && rel.file_name().is_some_and(|n| {
+                let n = n.to_string_lossy().to_lowercase();
+                n.ends_with("-wal") || n.ends_with("-shm") || n.ends_with("-journal") || n.ends_with(".tmp")
+            }) { continue; }
             let from = plain_path(&s.path.join(&rel))?;
             let to = stage.join(s.name).join(&rel);
             fs::create_dir_all(to.parent().unwrap()).map_err(err)?;
+            if folder == "_Cadence" && from.extension().is_some_and(|e| e.eq_ignore_ascii_case("db")) {
+                super::sqlite::snapshot(&from, &to, stop)?;
+                count += 1;
+                bytes += fs::metadata(&to).map_err(err)?.len();
+                continue;
+            }
             let mut input = locked_read(&from)?;
             let meta = input.metadata().map_err(err)?;
             let mut output = OpenOptions::new().create_new(true).read(true).write(true).open(&to).map_err(err)?;
@@ -755,6 +905,9 @@ fn save_snapshot(
             copy_metadata(&output, &to, &meta)?;
             count += 1;
             bytes += meta.len();
+        }
+        if required && count == before {
+            return Err(format!("{label}: the required data folder has no files to save: {}. The previous snapshot was kept.", s.path.display()));
         }
     }
     if count == 0 {
@@ -782,7 +935,7 @@ fn clean_history(dest: &Path, test: bool, line: &mut dyn FnMut(String) -> Result
     for (folder, what, daily) in [
         ("_changed", "old copies", false),
         ("_deleted", "removed files", false),
-        ("_MusicBee", "MusicBee copies", true),
+        ("_Cadence", "Cadence copies", true), // Previous player snapshots are left untouched.
         ("_MusicTool", "Music tool copies", true),
         ("_Code", "Code copies", true),
     ] {
@@ -872,6 +1025,159 @@ mod tests {
         }
     }
     #[test]
+    fn folder_bindings_reject_a_different_library_and_a_replaced_source_folder() {
+        let l = Lab::new();
+        l.write("original.mp3", b"original");
+        l.setup();
+        let other = l.base.join("different-library");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join("other.mp3"), b"other").unwrap();
+        let before = fs::read(&l.at.config).unwrap();
+        assert!(execute(&l.at, Which::Main, &Kind::Backup, &other, &AtomicBool::new(false), &mut |_| {}).is_err());
+        fs::rename(&l.source, l.base.join("original-library")).unwrap();
+        l.write("other.mp3", b"replacement at the same path");
+        assert!(l.run(Kind::Backup).is_err());
+        assert_eq!(fs::read(&l.at.config).unwrap(), before);
+        assert_eq!(fs::read(l.dest.join("original.mp3")).unwrap(), b"original");
+        assert!(!l.dest.join("_deleted").exists());
+    }
+    #[test]
+    fn folder_bindings_reject_a_replacement_destination_even_with_a_copied_marker() {
+        let l = Lab::new();
+        l.write("song.mp3", b"original");
+        l.setup();
+        let marker = fs::read(l.dest.join(ID_FILE)).unwrap();
+        fs::rename(&l.dest, l.base.join("real-backup")).unwrap();
+        fs::create_dir_all(&l.dest).unwrap();
+        fs::write(l.dest.join(ID_FILE), marker).unwrap();
+        fs::write(l.dest.join("unrelated.txt"), b"leave alone").unwrap();
+        assert!(l.run(Kind::Backup).is_err());
+        assert!(!l.dest.join("song.mp3").exists());
+        assert_eq!(fs::read(l.dest.join("unrelated.txt")).unwrap(), b"leave alone");
+    }
+    #[test]
+    fn an_unbound_legacy_backup_requires_explicit_confirmation_without_changing_history() {
+        let l = Lab::new();
+        l.write("song.mp3", b"original");
+        l.setup();
+        let mut value = settings(&l.at).unwrap();
+        value.as_object_mut().unwrap().remove("MainBinding");
+        fs::write(&l.at.config, value.to_string()).unwrap();
+        fs::remove_file(l.dest.join(ID_FILE)).unwrap();
+        let config = fs::read(&l.at.config).unwrap();
+        assert!(l.run(Kind::Backup).unwrap_err().contains("Confirm"));
+        assert_eq!(fs::read(&l.at.config).unwrap(), config);
+        assert!(!l.dest.join(ID_FILE).exists());
+        choose_main(&l.at, &l.source, &l.dest).unwrap();
+        assert!(read_config(&l.at.config).last.is_none());
+        assert_eq!(fs::read(l.dest.join("song.mp3")).unwrap(), b"original");
+        l.run(Kind::Backup).unwrap();
+        assert!(read_config(&l.at.config).last.is_some());
+    }
+    #[test]
+    fn a_missing_marker_or_changed_volume_identity_never_gets_automatically_reenrolled() {
+        let l = Lab::new();
+        l.write("song.mp3", b"song");
+        l.setup();
+        let mut value = settings(&l.at).unwrap();
+        value["MainBinding"]["destination_id"] = "another-volume".into();
+        fs::write(&l.at.config, value.to_string()).unwrap();
+        assert!(l.run(Kind::Backup).is_err());
+        choose_main(&l.at, &l.source, &l.dest).unwrap();
+        fs::remove_file(l.dest.join(ID_FILE)).unwrap();
+        assert!(l.run(Kind::Backup).is_err());
+        assert!(!l.dest.join(ID_FILE).exists());
+    }
+    #[test]
+    fn confirming_a_legacy_second_backup_preserves_the_main_binding_and_marker() {
+        let l = Lab::new();
+        l.write("song.mp3", b"song");
+        l.setup();
+        let second = l.base.join("removable/Music Backup");
+        execute(&l.at, Which::Second, &Kind::Setup(second.to_string_lossy().into()), &l.source, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let mut value = settings(&l.at).unwrap();
+        let main_binding = value["MainBinding"].clone();
+        let main_last = value["LastRun"].clone();
+        let marker = fs::read(second.join(ID_FILE)).unwrap();
+        value.as_object_mut().unwrap().remove("SecondaryBinding");
+        fs::write(&l.at.config, value.to_string()).unwrap();
+        assert!(validate_binding(&l.at, Which::Second, &l.source, &second).is_err());
+        confirm_folders(&l.at, Which::Second, &l.source, &second).unwrap();
+        validate_binding(&l.at, Which::Second, &l.source, &second).unwrap();
+        let value = settings(&l.at).unwrap();
+        assert_eq!(value["MainBinding"], main_binding);
+        assert_eq!(value["LastRun"], main_last);
+        assert_eq!(fs::read(second.join(ID_FILE)).unwrap(), marker);
+    }
+    #[test]
+    fn checks_require_every_copy_to_be_verified_and_report_missing_separately() {
+        let l = Lab::new();
+        l.write("song.mp3", b"song");
+        l.setup();
+        l.run(Kind::CheckAll).unwrap();
+        fs::remove_file(l.dest.join("song.mp3")).unwrap();
+        assert!(l.run(Kind::CheckAll).is_err());
+        let (_, run) = super::super::read_runs(&l.at.logs.join(Which::Main.log_name()));
+        let run = run.unwrap();
+        let check = run.check.as_ref().unwrap();
+        assert_eq!((check.good, check.missing, check.waiting), (0, 1, 0));
+        assert!(!check.complete());
+        assert!(run.headline().1 != super::super::Tone::Good);
+        l.run(Kind::Backup).unwrap();
+        l.write("song.mp3", b"a longer changed song");
+        assert!(l.run(Kind::CheckAll).is_err());
+        let (_, run) = super::super::read_runs(&l.at.logs.join(Which::Main.log_name()));
+        let check = run.unwrap().check.unwrap();
+        assert_eq!((check.good, check.missing, check.waiting), (0, 0, 1));
+        l.run(Kind::Backup).unwrap();
+        l.run(Kind::CheckAll).unwrap();
+    }
+    #[test]
+    fn missing_or_empty_required_sources_preserve_the_previous_snapshot() {
+        let l = Lab::new();
+        l.write("settings.json", b"durable settings");
+        let sources = [cadence_source(l.source.clone())];
+        let stop = AtomicBool::new(false);
+        save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).unwrap();
+        let dated = l.dest.join("_Cadence").join(Local::now().format("%Y-%m-%d").to_string()).join("Data/settings.json");
+        fs::rename(&l.source, l.base.join("disconnected")).unwrap();
+        assert!(save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).is_err());
+        fs::create_dir(&l.source).unwrap();
+        assert!(save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).is_err());
+        assert_eq!(fs::read(dated).unwrap(), b"durable settings");
+        assert!(!l.dest.join("_changed").exists());
+    }
+    #[test]
+    fn optional_discovery_becomes_required_after_a_successful_snapshot() {
+        let l = Lab::new();
+        let mut s = cadence_source(l.base.join("optional-app"));
+        s.required = false;
+        let sources = [s];
+        let stop = AtomicBool::new(false);
+        save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).unwrap();
+        fs::create_dir_all(&sources[0].path).unwrap();
+        fs::write(sources[0].path.join("settings.json"), b"saved").unwrap();
+        save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).unwrap();
+        fs::rename(&sources[0].path, l.base.join("disconnected")).unwrap();
+        assert!(save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).is_err());
+    }
+    #[test]
+    fn a_small_library_cannot_retire_all_its_old_copies_on_an_ordinary_run() {
+        let l = Lab::new();
+        l.write("original.mp3", b"original");
+        l.setup();
+        fs::remove_file(l.source.join("original.mp3")).unwrap();
+        l.write("unrelated.mp3", b"other");
+        let previous = read_config(&l.at.config).last;
+        assert!(l.run(Kind::Backup).is_err());
+        assert_eq!(read_config(&l.at.config).last, previous);
+        assert_eq!(fs::read(l.dest.join("original.mp3")).unwrap(), b"original");
+        assert!(!l.dest.join("_deleted").exists());
+        l.run(Kind::Mirror).unwrap();
+        assert!(!l.dest.join("original.mp3").exists());
+        assert!(l.contents("_deleted").contains(&b"original".to_vec()));
+    }
+    #[test]
     fn preview_reads_only_and_a_backup_keeps_changed_and_removed_files() {
         let l = Lab::new();
         l.write("A/Album/one.mp3", b"first version");
@@ -891,7 +1197,7 @@ mod tests {
         assert_eq!(fs::read(l.at.logs.join(Which::Main.log_name())).unwrap(), log);
         assert!(!l.dest.join("_changed").exists() && !l.dest.join("_deleted").exists());
         assert_eq!(fs::read(l.dest.join("A/Album/one.mp3")).unwrap(), b"first version");
-        l.run(Kind::Backup).unwrap();
+        l.run(Kind::Mirror).unwrap();
         assert!(l.contents("_changed").contains(&b"first version".to_vec()));
         assert!(l.contents("_deleted").contains(&b"second song".to_vec()));
         assert_eq!(fs::read(l.dest.join("A/Album/one.mp3")).unwrap(), b"a new longer version");
@@ -938,8 +1244,7 @@ mod tests {
         }
         l.setup();
         fs::remove_dir_all(l.source.join("Gone")).unwrap();
-        let run = l.run(Kind::Backup).unwrap();
-        assert!(run.iter().any(|s| s.contains("That is a lot at once")));
+        assert!(l.run(Kind::Backup).is_err());
         assert!(l.dest.join("Gone/0.mp3").exists());
         l.run(Kind::Mirror).unwrap();
         assert!(!l.dest.join("Gone").exists());
@@ -1079,7 +1384,7 @@ mod tests {
         l.write("cache/img/skip.png", b"skip");
         l.write("library-tags-cache.txt", b"skip");
         let sources =
-            vec![SnapshotSource { name: "Data", path: l.source.clone(), skip_dirs: vec!["cache/img".into()], skip_files: vec!["library-tags-cache.txt"] }];
+            vec![SnapshotSource { name: "Data", path: l.source.clone(), required: true, skip_dirs: vec!["cache/img".into()], skip_files: vec!["library-tags-cache.txt"] }];
         let stop = AtomicBool::new(false);
         save_snapshot(&l.dest, "_MusicTool", "Music tool", &sources, &stop, &mut |_| Ok(())).unwrap();
         let dated = l.dest.join("_MusicTool").join(Local::now().format("%Y-%m-%d").to_string()).join("Data");
@@ -1092,6 +1397,30 @@ mod tests {
         l.write("keep.txt", b"third");
         assert!(save_snapshot(&l.dest, "_MusicTool", "Music tool", &sources, &AtomicBool::new(true), &mut |_| Ok(())).is_err());
         assert_eq!(fs::read(dated.join("keep.txt")).unwrap(), b"second");
+    }
+    #[test]
+    fn cadence_keeps_durable_data_omits_caches_and_preserves_previous_copy_on_failure() {
+        let l = Lab::new();
+        l.write("connections.dat", b"encrypted settings");
+        l.write("ImportCovers/chosen.jpg", b"chosen cover");
+        l.write("Artwork/cached.jpg", b"cache");
+        l.write("Models/large-model.bin", b"download");
+        l.write("library.db-wal", b"never copy WAL separately");
+        let sources = [cadence_source(l.source.clone())];
+        let stop = AtomicBool::new(false);
+        let mut log = vec![];
+        save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |line| { log.push(line); Ok(()) }).unwrap();
+        let dated = l.dest.join("_Cadence").join(Local::now().format("%Y-%m-%d").to_string()).join("Data");
+        assert_eq!(fs::read(dated.join("ImportCovers/chosen.jpg")).unwrap(), b"chosen cover");
+        assert_eq!(fs::read(dated.join("connections.dat")).unwrap(), b"encrypted settings");
+        assert!(!dated.join("Artwork").exists() && !dated.join("Models").exists() && !dated.join("library.db-wal").exists());
+        assert!(log[0].starts_with("Cadence: saved "));
+        l.write("library.db", b"broken database");
+        assert!(save_snapshot(&l.dest, "_Cadence", "Cadence", &sources, &stop, &mut |_| Ok(())).is_err());
+        assert_eq!(fs::read(dated.join("connections.dat")).unwrap(), b"encrypted settings");
+        assert!(!dated.join("library.db").exists());
+        assert!(reserved(Path::new("_Cadence/2000-01-01/Data/library.db")));
+        assert!(reserved(Path::new("_MusicBee/2000-01-01/library.mbl")));
     }
     #[test]
     fn old_history_is_recycled_in_a_lab_and_current_history_stays() {
@@ -1109,32 +1438,42 @@ mod tests {
         assert!(recent.exists());
         assert_eq!(fs::read(l.dest.join("_backup-staging/recycled/_deleted/2000-01-01_030000/old.mp3")).unwrap(), b"old");
     }
+    #[test]
+    fn cadence_retention_keeps_thirty_snapshots_without_touching_legacy_player_data() {
+        let l = Lab::new();
+        let today = Local::now().date_naive();
+        for age in 0..31 {
+            let path = l.dest.join("_Cadence").join((today - chrono::Duration::days(age)).format("%Y-%m-%d").to_string());
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join("saved.txt"), b"snapshot").unwrap();
+        }
+        let legacy = l.dest.join("_MusicBee/2000-01-01");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("library.mbl"), b"old library").unwrap();
+        clean_history(&l.dest, true, &mut |_| Ok(())).unwrap();
+        assert_eq!(fs::read_dir(l.dest.join("_Cadence")).unwrap().count(), 30);
+        assert!(l.dest.join("_Cadence").join(today.format("%Y-%m-%d").to_string()).exists());
+        assert_eq!(fs::read(legacy.join("library.mbl")).unwrap(), b"old library");
+    }
 }
 
 pub(super) fn choose_main(at: &Places, library: &Path, destination: &Path) -> Result<String> {
-    let (source, dest) = safe_roots(library, destination, None)?;
+    confirm_folders(at, Which::Main, library, destination)
+}
+
+pub(super) fn confirm_folders(at: &Places, which: Which, library: &Path, destination: &Path) -> Result<String> {
+    let saved = read_config(&at.config);
+    let (source, dest) = safe_roots(library, destination, (which == Which::Second).then(|| Path::new(&saved.dest)))?;
     if at.test {
         let lab = at.config.parent().and_then(Path::parent).and_then(Path::parent).ok_or("The lab folder is missing.")?;
         if ![&source, &dest].iter().all(|p| key(p).starts_with(&(key(lab) + "\\"))) {
             return Err("A lab can only use its own made-up folders.".into());
         }
     }
-    let text = dest.to_string_lossy();
-    let root = text.get(..2).filter(|r| r.ends_with(':')).ok_or("Choose a folder on a connected drive.")?;
-    let label = volume_label(&format!("{root}\\")).ok_or("That drive is not connected.")?;
-    let _lock = RunLock::take(&at.config)?;
-    let mut v: serde_json::Value = if at.config.exists() {
-        serde_json::from_str(fs::read_to_string(&at.config).map_err(err)?.trim_start_matches('\u{feff}')).map_err(err)?
-    } else {
-        serde_json::json!({})
-    };
-    let object = v.as_object_mut().ok_or("The backup settings could not be read.")?;
-    if object.get("Destination").and_then(|v| v.as_str()) != Some(text.as_ref()) {
-        object.remove("LastRun");
+    let _lock = RunLock::take(&dest)?;
+    if tree(&source, false)?.files.is_empty() {
+        return Err("The library has no files. The saved folders were left alone.".into());
     }
-    object.insert("Destination".into(), text.as_ref().into());
-    object.insert("DestinationLabel".into(), label.into());
-    fs::create_dir_all(at.config.parent().unwrap()).map_err(err)?;
-    crate::util::write_atomic(&at.config, &serde_json::to_vec_pretty(&v).map_err(err)?).map_err(err)?;
-    Ok("Backup folder saved. Preview or start the backup when you are ready.".into())
+    bind(at, which, &source, &dest)?;
+    Ok("Library and backup folders confirmed. Preview the changes before starting a backup.".into())
 }
