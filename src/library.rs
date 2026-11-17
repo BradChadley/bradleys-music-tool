@@ -476,6 +476,18 @@ struct Snapshot {
     artists: HashMap<String, LibArtist>,
 }
 
+/// Two ways of writing one folder name: the same folder (Windows names ignore case and a closing slash).
+pub fn same_folder(a: &str, b: &str) -> bool {
+    let tidy = |s: &str| s.trim().trim_matches('"').trim_end_matches(['\\', '/']).replace('/', "\\").to_lowercase();
+    tidy(a) == tidy(b)
+}
+
+/// The saved last good scan, only when it was a scan of `music_dir`: one of another folder (the music folder
+/// was changed since) would count its albums as owned.
+fn snapshot_for(saved: &[u8], music_dir: &str) -> Option<Snapshot> {
+    serde_json::from_slice::<Snapshot>(saved).ok().filter(|s| !music_dir.trim().is_empty() && same_folder(&s.music_dir, music_dir))
+}
+
 fn snapshot_path() -> std::path::PathBuf {
     crate::config::app_dir().join("library-snapshot.json")
 }
@@ -502,14 +514,32 @@ impl Library {
                     Err(e) => e,
                     Ok(_) => format!("{music_dir} has no artist folders"),
                 };
-                let snap: Snapshot = std::fs::read(snapshot_path())
+                let snap = std::fs::read(snapshot_path())
                     .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())
-                    .ok_or_else(|| format!("{why}. Is the drive connected? (No earlier scan to fall back on.)"))?;
+                    .and_then(|b| snapshot_for(&b, music_dir))
+                    .ok_or_else(|| format!("{why}. Is the drive connected? (No earlier scan of this folder to fall back on.)"))?;
                 let aliases = Self::scan_aliases(alias_file);
                 let note = format!("{why}. Using your library as it was on {} ({} artists). Is the drive connected?", snap.saved, snap.artists.len());
                 Ok((Self { artists: snap.artists, aliases }, Some(note)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    #[test]
+    fn a_saved_scan_of_another_folder_is_never_used() {
+        // review finding: with the music folder changed to one that is empty or gone, the last good scan of
+        // the old folder was used, so albums only it had still counted as owned
+        let snap = |dir: &str| serde_json::to_vec(&Snapshot { saved: "Nov 17, 2026".into(), music_dir: dir.into(), artists: HashMap::new() }).unwrap();
+        assert!(snapshot_for(&snap(r"Q:\Songs"), r"Q:\Songs").is_some());
+        assert!(snapshot_for(&snap(r"Q:\Songs"), r"q:\songs\").is_some(), "the same folder written another way");
+        assert!(snapshot_for(&snap(r"Q:\Songs"), r"R:\Other Songs").is_none());
+        assert!(snapshot_for(&snap(r"Q:\Songs"), "").is_none());
+        assert!(snapshot_for(b"{ half", r"Q:\Songs").is_none());
+        assert!(same_folder(r"Q:\Songs", "Q:/Songs/") && !same_folder(r"Q:\Songs", r"Q:\Songs2"));
     }
 }

@@ -204,14 +204,26 @@ impl Ctx {
     }
 
     // ---------- downloads Soulseek still had open ----------
-    pub fn get_pending(&self) -> Vec<String> {
+    // Each line is "<print>\t<path>": the print (`import::inventory_print`) says what the download held when it
+    // was imported, so the later clean-up never recycles a file that arrived after that. A line with no print
+    // (written before prints were kept) is not taken as imported: that download is simply left for a person.
+    fn pending_lines(&self) -> Vec<String> {
         std::fs::read_to_string(&self.pending_file).map(|t| t.lines().filter(|l| !l.is_empty()).map(|l| l.to_string()).collect()).unwrap_or_default()
     }
-    pub fn set_pending(&self, path: &str, on: bool) {
+    /// The downloads that were imported but Soulseek still had open, each with the print of what was imported.
+    pub fn get_pending(&self) -> Vec<(String, String)> {
+        self.pending_lines().into_iter().filter_map(|l| l.split_once('\t').map(|(print, path)| (path.to_string(), print.to_string()))).filter(|(_, print)| !print.is_empty()).collect()
+    }
+    /// What was imported from this download, when it is waiting to be removed.
+    pub fn pending_print(&self, path: &str) -> Option<String> {
+        self.get_pending().into_iter().find(|(p, _)| p == path).map(|(_, print)| print)
+    }
+    /// `print` Some: remember the download as imported, with what it held; None: forget it.
+    pub fn set_pending(&self, path: &str, print: Option<&str>) {
         let _lock = self.pending_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let mut list: Vec<String> = self.get_pending().into_iter().filter(|p| p != path).collect();
-        if on {
-            list.push(path.to_string());
+        let mut list: Vec<String> = self.pending_lines().into_iter().filter(|l| l != path && l.split_once('\t').map(|(_, p)| p) != Some(path)).collect();
+        if let Some(print) = print {
+            list.push(format!("{print}\t{path}"));
         }
         if list.is_empty() {
             let _ = std::fs::remove_file(&self.pending_file);

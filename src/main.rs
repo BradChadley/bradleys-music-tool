@@ -247,8 +247,10 @@ struct App {
     /// when Settings were last saved / the lookups were last forgotten (for the short "Saved" notes)
     saved_at: Option<f64>,
     cache_cleared_at: Option<f64>,
-    /// "is this folder there" answers for Settings: box name -> (text checked, found, when)
-    path_ok: std::collections::HashMap<&'static str, (String, bool, f64)>,
+    /// "is this folder there" answers for Settings, looked at beside the window (`settings::PathChecks`)
+    path_ok: settings::PathChecks,
+    /// whether a Soulseek login is saved, and when that was read (Settings reads it at most every two seconds)
+    slsk_login_seen: Option<(bool, f64)>,
     /// Search and fetch from Soulseek (the top of the Downloads page), set up the first time that page is opened.
     downloads: Option<downloads::DownloadsPanel>,
     library_page: Option<library_page::LibraryPage>,
@@ -407,6 +409,7 @@ impl App {
             saved_at: None,
             cache_cleared_at: None,
             path_ok: Default::default(),
+            slsk_login_seen: None,
             downloads: None,
             library_page: None,
             health: None,
@@ -811,17 +814,10 @@ impl App {
 
     // ---------------------------------------------------------------- settings
 
-    /// Whether a folder or file from Settings is there. Asked at most every few seconds per box, so a sleeping
-    /// drive never stalls the window on every redraw.
+    /// Whether a folder or file from Settings is there: the last answer, looked at beside the window, so a
+    /// sleeping drive or a share that is gone never stalls it.
     fn path_found(&mut self, which: &'static str, path: &str, now: f64) -> bool {
-        if let Some((text, ok, at)) = self.path_ok.get(which) {
-            if text == path && now - at < 4.0 {
-                return *ok;
-            }
-        }
-        let ok = !path.trim().is_empty() && std::path::Path::new(path.trim()).exists();
-        self.path_ok.insert(which, (path.to_string(), ok, now));
-        ok
+        self.path_ok.found(which, path, now, true, |p| p.exists(), None)
     }
 
     /// What in Settings needs a look, each with the section it is in (see `settings::SECTIONS`). Worked out at most
@@ -1174,6 +1170,19 @@ impl eframe::App for App {
         // new versions: the worker starts with the first frame (its first look is five seconds later) and
         // hears here when the choice in Settings changes
         update::start(&ctx, update::Policy::from_saved(&self.cfg.updates));
+        // once, after the app went back from a new version that could not start: said on whatever page is
+        // open, for the first 20 seconds
+        if let Some(words) = update::notice() {
+            if ctx.input(|i| i.time) < 20.0 {
+                egui::Area::new(egui::Id::unique("update-went-back")).order(egui::Order::Foreground).anchor(Align2::CENTER_BOTTOM, vec2(0.0, -24.0)).show(&ctx, |ui| {
+                    Frame::new().fill(CARD_HOVER()).corner_radius(8).inner_margin(Margin::symmetric(16, 10)).show(ui, |ui| {
+                        ui.set_max_width(560.0);
+                        ui.label(RichText::new(words).color(TEXT()));
+                    });
+                });
+                ctx.request_repaint_after(std::time::Duration::from_millis(500));
+            }
+        }
         // the Soulseek client saves where Settings says (before the Downloads page can start it)
         slskd::want_downloads(&self.cfg.downloads_dir);
         if let Some(s) = &mut self.script {
@@ -2473,6 +2482,10 @@ fn already_open() -> bool {
 fn main() -> eframe::Result {
     // (a freshly fetched update is asked which version it is before it may take this file's place)
     if update::answered_self_check() {
+        return Ok(());
+    }
+    // (the old program file, unseen, guarding the first start of an update that was just put in)
+    if update::guarded_update() {
         return Ok(());
     }
     if let Some(code) = backup::run_if_requested() { std::process::exit(code); }

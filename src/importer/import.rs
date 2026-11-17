@@ -95,19 +95,53 @@ fn any_locked(files: &[PathBuf]) -> bool {
 /// test runs (`--keep-originals`): never touch the source downloads
 pub static KEEP_ORIGINALS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Sends the original download to the Recycle Bin. Returns false (and remembers it) if Soulseek still has it open.
-pub fn remove_original(ctx: &Ctx, u: &Unit) -> bool {
+/// Sends the original download to the Recycle Bin. Returns false (and remembers it, with `imported`: the
+/// `inventory_print` of what was imported from it) if Soulseek still has it open.
+pub fn remove_original(ctx: &Ctx, u: &Unit, imported: &str) -> bool {
     if KEEP_ORIGINALS.load(Ordering::Relaxed) {
         return true;
     }
     let files: Vec<PathBuf> = if u.is_dir { walk_files(&u.item) } else { vec![u.item.clone()] };
     let key = u.item.to_string_lossy().to_string();
     if !any_locked(&files) && trash::delete(&u.item).is_ok() {
-        ctx.set_pending(&key, false);
+        ctx.set_pending(&key, None);
         return true;
     }
-    ctx.set_pending(&key, true);
+    ctx.set_pending(&key, Some(imported));
     false
+}
+
+/// One short line that stands for a list of files with their sizes (the same list, in any order, gives the
+/// same line). FNV-1a, so the line is the same from one version of the app to the next.
+pub fn inventory_print(files: impl Iterator<Item = (PathBuf, u64)>) -> String {
+    let mut list: Vec<String> = files.map(|(p, size)| format!("{}|{size}", p.to_string_lossy().to_lowercase())).collect();
+    list.sort();
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in list.join("\n").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{}-{h:016x}", list.len())
+}
+
+/// The print of what the scan read from this download (what an import of it brings in).
+pub fn scanned_print(u: &Unit) -> String {
+    inventory_print(u.files.iter().map(|f| (f.path.clone(), f.size)))
+}
+
+/// The print of what the download holds now.
+pub fn print_on_disk(u: &Unit) -> String {
+    let files = if u.is_dir { walk_files(&u.item) } else { vec![u.item.clone()] };
+    inventory_print(files.into_iter().map(|p| {
+        let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(u64::MAX);
+        (p, size)
+    }))
+}
+
+/// A leftover download is only removed while it holds exactly what was imported from it: a track that
+/// arrived later (and that a rescan would read as part of the leftover) was never imported.
+pub fn leftover_is_what_was_imported(ctx: &Ctx, u: &Unit) -> bool {
+    ctx.pending_print(&u.item.to_string_lossy()).is_some_and(|imported| imported == print_on_disk(u))
 }
 
 /// A temp folder that removes itself, on every way out of a function.
@@ -555,6 +589,20 @@ mod folder_name_tests {
     }
 }
 
+/// The album folder name an import really uses: a long one is shortened, leaving at least ~70 characters for
+/// track names (and the temporary ".importing" suffix). Two long names that differ only past the cut end up
+/// the same here, so `import_many` never runs those two at once.
+pub fn fitted_folder(ctx: &Ctx, artist: &str, folder: &str) -> String {
+    let artist_dir = ctx.library.join(artist);
+    let room = MAX_PATH.saturating_sub(70 + artist_dir.to_string_lossy().chars().count()).clamp(20, 120);
+    shorten_name(folder, room, true)
+}
+
+/// The key two imports must not share while they run: the artist and the album folder as it will be named.
+pub fn running_key(ctx: &Ctx, artist: &str, folder: &str) -> String {
+    crate::importer::scan::place_key(artist, &fitted_folder(ctx, artist, folder))
+}
+
 /// `report` is called as report("status text", fraction 0..1). `cover` is the prefetched download, if there is one.
 /// `drained` is called once every conversion job has been handed out (the next album may start then).
 pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: Option<&CoverSlot>, drained: &(dyn Fn() + Sync)) -> ImportResult {
@@ -566,9 +614,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         return ImportResult::Failed;
     }
     let artist_dir = ctx.library.join(&u.artist);
-    // leave at least ~70 characters for track names (and the temporary ".importing" suffix)
-    let room = MAX_PATH.saturating_sub(70 + artist_dir.to_string_lossy().chars().count()).clamp(20, 120);
-    u.folder = shorten_name(&u.folder, room, true);
+    u.folder = fitted_folder(ctx, &u.artist, &u.folder);
     let existing = find_existing_album(ctx, &u.artist, &u.folder);
     // The album goes beside the copy it replaces (which may be on a shelf, or in a genre folder), else where
     // this artist keeps such releases, else in the artist's folder.
@@ -587,11 +633,14 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     }
 
     if u.action == Action::Cleanup && existing.is_some() {
-        if !KEEP_ORIGINALS.load(Ordering::Relaxed) && changed_since_scan(u) {
-            report("The leftover download changed after it was scanned, so it was left alone. Rescan to look at it again.", 1.0);
+        // compared with what was imported from it, not with the rescan: a rescan reads late arrivals as part of it
+        let imported = ctx.pending_print(&u.item.to_string_lossy());
+        if !KEEP_ORIGINALS.load(Ordering::Relaxed) && !leftover_is_what_was_imported(ctx, u) {
+            report("The leftover download holds files that were not imported, so it was left alone. Remove it yourself, or import the new files from it.", 1.0);
+            ctx.log(&format!("KEPT leftover (holds files that were not imported): {}", u.item.display()));
             return ImportResult::OkKept;
         }
-        if remove_original(ctx, u) {
+        if remove_original(ctx, u, imported.as_deref().unwrap_or_default()) {
             report("Removed the leftover download", 1.0);
             ctx.log(&format!("CLEAN {}", u.item.display()));
             return ImportResult::Cleaned;
@@ -987,7 +1036,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
                 crate::replace::done(&ctx.replacements, old);
                 crate::links::folder_changed(old); // Health looks at this artist again
                 ctx.log(&format!("REPLACED {n} track(s) in {} (old files kept in the undo backups)", old.display()));
-                if !KEEP_ORIGINALS.load(Ordering::Relaxed) && !changed_since_scan(u) && remove_original(ctx, u) {
+                if !KEEP_ORIGINALS.load(Ordering::Relaxed) && !changed_since_scan(u) && remove_original(ctx, u, &scanned_print(u)) {
                     report(&format!("Replaced {n} {} - the rest of the album was left as it is", if n == 1 { "track" } else { "tracks" }), 1.0);
                     ImportResult::Ok
                 } else {
@@ -1066,7 +1115,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         ctx.log(&format!("KEPT original (changed since scan): {}", u.item.display()));
         return ImportResult::OkKept;
     }
-    if remove_original(ctx, u) {
+    if remove_original(ctx, u, &scanned_print(u)) {
         report(&format!("{verb} - {cover_note}"), 1.0);
         return ImportResult::Ok;
     }
@@ -1249,7 +1298,7 @@ pub fn import_many(ctx: &Ctx, jobs: Vec<ImportJob>, on: &(dyn Fn(Event) + Sync))
         });
 
         for (n, (id, mut u)) in prepared.into_iter().enumerate() {
-            let key = crate::importer::scan::batch_key(&u);
+            let key = running_key(ctx, &u.artist, &u.folder);
             {
                 let mut g = lock();
                 while g.in_flight >= ALBUMS_AT_ONCE || (g.in_flight > 0 && !g.drained) || g.keys.contains(&key) {

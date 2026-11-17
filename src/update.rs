@@ -17,6 +17,16 @@
 //!              before the window: the staged file is proven again, the running file is renamed to
 //!              `<name>.old.exe` (Windows allows renaming a running program file, not writing over it),
 //!              the new one takes its name and is started. One old file is kept as a step back.
+//!   6. GUARD   the swap leaves `<name>.update-pending.json`, and the copy that made way stays on, unseen, as
+//!              a guard (`<name>.old.exe --guard-update`). It starts the new version and waits for it to
+//!              have its window up and drawing for five seconds, when the new version removes the note
+//!              itself. If the new version ends with an error first, or has not got that far in two
+//!              minutes (it is then ended), the guard puts the old file back under the app's name, starts
+//!              it, and notes the version in `<name>.update-refused.json` so it is never fetched or put
+//!              in again (a later version is). The app that is back says so once, and Settings says so.
+//!              If no guard was there (the PC went off, say), the third start of a version that never
+//!              got its window up goes back by itself. A version that got its window up once is never
+//!              rolled back: the note is gone.
 //!
 //! Where the app cannot write to its own folder it only says that a version is out, with a way to the
 //! download page. A test run (`MUSIC_RECS_DATA` set) and a build in cargo's `target` folder never check
@@ -295,11 +305,25 @@ struct Places {
     note: PathBuf,
     /// the program file from before the last swap: one step back
     old: PathBuf,
+    /// left by a swap until the new version has its window up (`Pending`)
+    pending: PathBuf,
+    /// the last version that could not start and was rolled back (`Refused`)
+    refused: PathBuf,
+    /// a version that could not start, moved aside while the old one goes back
+    failed: PathBuf,
 }
 
 impl Places {
     fn of(exe: &Path) -> Places {
-        Places { exe: exe.to_path_buf(), new: exe.with_extension("new.exe"), note: exe.with_extension("new.json"), old: exe.with_extension("old.exe") }
+        Places {
+            exe: exe.to_path_buf(),
+            new: exe.with_extension("new.exe"),
+            note: exe.with_extension("new.json"),
+            old: exe.with_extension("old.exe"),
+            pending: exe.with_extension("update-pending.json"),
+            refused: exe.with_extension("update-refused.json"),
+            failed: exe.with_extension("failed.exe"),
+        }
     }
 
     fn here() -> Option<Places> {
@@ -363,7 +387,7 @@ fn staged(p: &Places, key: &str, than: &str) -> Option<Manifest> {
     }
     let good = (|| {
         let m = Manifest::read(&std::fs::read_to_string(&p.note).ok()?)?;
-        if !m.signed_by(key) || !newer(&m.version, than) || std::fs::metadata(&p.new).ok()?.len() != m.size {
+        if !m.signed_by(key) || !newer(&m.version, than) || is_refused(p, &m.version) || std::fs::metadata(&p.new).ok()?.len() != m.size {
             return None;
         }
         let (sha, _) = file_sha256(&p.new, u64::MAX)?;
@@ -528,6 +552,8 @@ pub enum Why {
     CannotWrite,
     /// the user stopped the fetch
     Stopped,
+    /// it was put in once, could not start on this PC, and the app went back (see `Refused`)
+    Refused,
 }
 
 /// Where updating stands, for Settings and the top row.
@@ -635,6 +661,8 @@ pub fn stop_fetch() {
 /// Starts the worker, once the window is up. Nothing here is on the way to opening the window: the first
 /// look is five seconds later.
 pub fn start(ctx: &egui::Context, p: Policy) {
+    // (with every frame, whatever the choice: a first start after a swap says when it is up and working)
+    settle(ctx);
     set_policy(p);
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
@@ -700,6 +728,11 @@ fn round(src: &Source, p: Policy, ctx: &egui::Context) -> State {
         places.clear_parts(None);
         return end(State::UpToDate(Local::now()));
     }
+    if is_refused(&places, &m.version) {
+        // (it could not start here once: it is not fetched again, only a later version is)
+        places.clear_parts(None);
+        return end(State::Out(m.version, Why::Refused));
+    }
     if p != Policy::Auto {
         return end(State::Out(m.version, Why::TellOnly));
     }
@@ -762,43 +795,321 @@ pub fn answered_self_check() -> bool {
 
 /// `--after-update <process number>`: this program file was just put in place by the copy with that
 /// number, which is closing. Wait for it to be gone (15 seconds at most), so the two never run side by
-/// side. True when the app was started this way.
+/// side. True when the app was started this way. (`--after-update guarded`: started by the guard of a
+/// first start, which holds nothing of the app's and stays on; there is nothing to wait for.)
 pub fn started_after_update() -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
-    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
     let args: Vec<String> = std::env::args().collect();
     let Some(i) = args.iter().position(|a| a == "--after-update") else { return false };
     if let Some(pid) = args.get(i + 1).and_then(|n| n.parse::<u32>().ok()) {
-        unsafe {
-            let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
-            if !h.is_null() {
-                WaitForSingleObject(h, 15_000);
-                CloseHandle(h);
-            }
-        }
+        wait_for_gone(pid);
     }
     true
+}
+
+/// Waits for the process with that number to end, 15 seconds at most.
+fn wait_for_gone(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, 15_000);
+            CloseHandle(h);
+        }
+    }
 }
 
 fn start_again(exe: &Path) -> bool {
     std::process::Command::new(exe).arg("--after-update").arg(std::process::id().to_string()).spawn().is_ok()
 }
 
-/// At a plain start, before the window: an update that lies ready is put in and started in this one's
-/// place. True when that happened, and this copy should end at once.
+// ------------------------------------------------------------------ the first start of a new version
+
+/// How long a new version has, from the guard starting it, to have its window up and drawing. A lab may
+/// make it shorter (`MUSIC_RECS_UPDATE_WITHIN`, seconds, only in a test run).
+const FIRST_START_WITHIN: Duration = Duration::from_secs(120);
+/// How long the window must have been up and drawing before a new version counts as started properly.
+const SETTLED_AFTER: f64 = 5.0;
+/// Starts that never got the window up, after which the next start goes back by itself (for when no guard
+/// was there to do it).
+const TRIES: u32 = 2;
+
+/// `<name>.update-pending.json`: a version was just put in and has not yet started properly.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct Pending {
+    /// the version that was put in
+    version: String,
+    /// the version it replaced, which is the old file
+    from: String,
+    /// how many times it has been started so far
+    #[serde(default)]
+    starts: u32,
+}
+
+/// `<name>.update-refused.json`: the last version that could not start on this PC and was rolled back. It
+/// is never fetched or put in again; a later version is.
+#[derive(Clone, PartialEq, Debug, serde::Serialize, serde::Deserialize)]
+struct Refused {
+    version: String,
+    back_to: String,
+    why: String,
+    at: String,
+    /// the app that went back has said so once
+    #[serde(default)]
+    told: bool,
+}
+
+fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+fn write_json<T: serde::Serialize>(path: &Path, value: &T) -> bool {
+    serde_json::to_string_pretty(value).is_ok_and(|t| crate::util::write_atomic(path, t.as_bytes()).is_ok())
+}
+
+fn pending(p: &Places) -> Option<Pending> {
+    read_json(&p.pending)
+}
+
+fn refused(p: &Places) -> Option<Refused> {
+    read_json(&p.refused)
+}
+
+/// True when `version` is the one that could not start here and was rolled back.
+fn is_refused(p: &Places, version: &str) -> bool {
+    refused(p).is_some_and(|r| r.version == version)
+}
+
+/// The swap, and the note that the new version has yet to start properly.
+fn put_in(p: &Places, m: &Manifest) -> Result<(), String> {
+    swap(p)?;
+    if !write_json(&p.pending, &Pending { version: m.version.clone(), from: current(), starts: 0 }) {
+        crate::config::log("update: the note that the new version has yet to start could not be written; its first start is not guarded");
+    }
+    Ok(())
+}
+
+/// Puts the old program file back under the app's name and notes the version that could not start as
+/// refused. Only while the note of a pending first start is there: a version that started properly once is
+/// never rolled back, and a rollback happens once (it removes the note).
+fn roll_back(p: &Places, why: &str) -> Result<Refused, String> {
+    let Some(note) = pending(p) else { return Err("the new version had started properly, so nothing was rolled back".into()) };
+    if !p.old.exists() {
+        let _ = std::fs::remove_file(&p.pending);
+        return Err("the version before it is no longer there to go back to".into());
+    }
+    let r = Refused { version: note.version, back_to: note.from, why: why.to_string(), at: Local::now().format("%Y-%m-%d %H:%M:%S").to_string(), told: false };
+    // the note first, so this version is never put in again even if what follows goes wrong
+    if !write_json(&p.refused, &r) {
+        return Err("the note of the version that could not start could not be written, so nothing was rolled back".into());
+    }
+    let _ = std::fs::remove_file(&p.failed);
+    std::fs::rename(&p.exe, &p.failed).map_err(|e| said("the new program file could not be moved aside.", &e))?;
+    if let Err(e) = std::fs::rename(&p.old, &p.exe) {
+        let back = std::fs::rename(&p.failed, &p.exe);
+        return Err(format!("{} {}", said("the old program file could not take its place again.", &e), if back.is_ok() { "The new one is back in place." } else { "THE NEW ONE COULD NOT BE PUT BACK." }));
+    }
+    let _ = std::fs::remove_file(&p.pending);
+    // (while it still runs it cannot be removed: then it goes at the next start)
+    let _ = std::fs::remove_file(&p.failed);
+    Ok(r)
+}
+
+/// A start of a version whose first start is still pending is counted. Some(starts) when it has had
+/// `TRIES` starts already without its window coming up, and should go back now.
+fn count_start(p: &Places) -> Option<u32> {
+    let mut note = pending(p)?;
+    if note.starts >= TRIES {
+        return Some(note.starts);
+    }
+    note.starts += 1;
+    write_json(&p.pending, &note);
+    None
+}
+
+/// How a new version's first start went.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// its window was up and drawing long enough: it removed the note itself
+    Started,
+    /// it ended on its own, without an error, before that (closed at once, say): no verdict
+    LeftEarly,
+    /// it ended with an error before that (its exit code)
+    Crashed(Option<i32>),
+    /// it was not that far in time and was ended
+    Hung,
+}
+
+/// Watches the first start of `child` until it has started properly, has ended, or `within` has passed.
+fn watch(p: &Places, child: &mut std::process::Child, within: Duration) -> Verdict {
+    let began = Instant::now();
+    loop {
+        if !p.pending.exists() {
+            return Verdict::Started;
+        }
+        match child.try_wait() {
+            Ok(Some(status)) if p.pending.exists() => return if status.success() { Verdict::LeftEarly } else { Verdict::Crashed(status.code()) },
+            Ok(Some(_)) => return Verdict::Started,
+            Ok(None) if began.elapsed() < within => std::thread::sleep(Duration::from_millis(100)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return if p.pending.exists() { Verdict::Hung } else { Verdict::Started };
+            }
+        }
+    }
+}
+
+/// Rolls back and starts the version that is back. True when it went back.
+fn go_back(p: &Places, why: &str) -> bool {
+    match roll_back(p, why) {
+        Ok(r) => {
+            crate::config::log(&format!("update: version {} could not start ({why}); went back to version {}, and {} is not put in again", r.version, r.back_to, r.version));
+            if !start_again(&p.exe) {
+                crate::config::log("update: the version that is back could not be started; it starts the next time the app is opened");
+            }
+            true
+        }
+        Err(e) => {
+            crate::config::log(&format!("update: going back did not work: {e}"));
+            false
+        }
+    }
+}
+
+/// Starts the new version under the app's name and watches its first start: if it ends with an error or
+/// hangs before its window is up, the old one goes back.
+fn guard(p: &Places, within: Duration) {
+    let version = pending(p).map(|n| n.version).unwrap_or_default();
+    let why = match std::process::Command::new(&p.exe).arg("--after-update").arg("guarded").spawn() {
+        Err(e) => crate::util::plain_err(format!("Windows could not start it ({e})")),
+        Ok(mut child) => match watch(p, &mut child, within) {
+            Verdict::Started => return crate::config::log(&format!("update: version {version} started properly")),
+            Verdict::LeftEarly => return crate::config::log(&format!("update: version {version} was closed before its window was up, without an error; it stays, and its next starts tell")),
+            Verdict::Crashed(code) => format!("it closed with an error{} before its window was up", code.map(|c| format!(" (code {c:#x})")).unwrap_or_default()),
+            Verdict::Hung => format!("its window was not up and working within {} seconds, so it was ended", within.as_secs()),
+        },
+    };
+    go_back(p, &why);
+}
+
+/// `--guard-update <program file> <process number>`: started from the old program file by the copy that
+/// just put an update in. Waits for that copy to be gone, then starts the new version and guards its first
+/// start. True when the app was started this way (it then ends, with no window).
+pub fn guarded_update() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    let Some(i) = args.iter().position(|a| a == "--guard-update") else { return false };
+    let Some(exe) = args.get(i + 1) else { return true };
+    if let Some(pid) = args.get(i + 2).and_then(|n| n.parse::<u32>().ok()) {
+        wait_for_gone(pid);
+    }
+    let within = test_data().and(std::env::var("MUSIC_RECS_UPDATE_WITHIN").ok()).and_then(|s| s.parse::<u64>().ok()).map_or(FIRST_START_WITHIN, Duration::from_secs);
+    guard(&Places::of(Path::new(exe)), within);
+    true
+}
+
+/// After a swap: the old program file, unseen, guards the new version's first start. If the guard cannot
+/// be started the new version is started without one. True when something was started.
+fn hand_over(p: &Places) -> bool {
+    // (it opens no window: `guarded_update` ends the app's start before any)
+    let guard = std::process::Command::new(&p.old).arg("--guard-update").arg(&p.exe).arg(std::process::id().to_string()).spawn();
+    if guard.is_ok() {
+        return true;
+    }
+    crate::config::log("update: the guard could not be started; the new version starts without one");
+    start_again(&p.exe)
+}
+
+/// Where this run stands on confirming its own first start: 0 not looked yet, 1 watching, 2 nothing to do.
+static SETTLE: AtomicU8 = AtomicU8::new(0);
+
+/// With every frame: when this is the first start of a version just put in and its window has been up and
+/// drawing for five seconds, the note is removed. It started properly and is never rolled back.
+fn settle(ctx: &egui::Context) {
+    static SINCE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    match SETTLE.load(Ordering::Relaxed) {
+        2 => return,
+        0 => {
+            let watched = Places::here().is_some_and(|p| p.pending.exists());
+            SETTLE.store(if watched { 1 } else { 2 }, Ordering::Relaxed);
+            if !watched {
+                return;
+            }
+            lab_fault();
+        }
+        _ => {}
+    }
+    let now = ctx.input(|i| i.time);
+    let since = *SINCE.get_or_init(|| now);
+    if now - since < SETTLED_AFTER {
+        ctx.request_repaint_after(Duration::from_secs_f64(SETTLED_AFTER - (now - since) + 0.05));
+        return;
+    }
+    SETTLE.store(2, Ordering::Relaxed);
+    let Some(p) = Places::here() else { return };
+    let version = pending(&p).map(|n| n.version).unwrap_or_default();
+    if std::fs::remove_file(&p.pending).is_ok() {
+        crate::config::log(&format!("update: version {version} has its window up and working; it stays"));
+    }
+}
+
+/// A lab can have a new version fail its first start (`MUSIC_RECS_UPDATE_FAULT`, only in a test run):
+/// "crash" ends it with an error, "hang" stops its window from drawing, "quiet" closes it without an error.
+fn lab_fault() {
+    let Some(fault) = test_data().and(std::env::var("MUSIC_RECS_UPDATE_FAULT").ok()) else { return };
+    match fault.as_str() {
+        "crash" => std::process::abort(),
+        "hang" => loop {
+            std::thread::sleep(Duration::from_secs(1));
+        },
+        "quiet" => std::process::exit(0),
+        _ => {}
+    }
+}
+
+/// What the app says once after it went back from a version that could not start: the first time this
+/// is asked after the rollback, and for the rest of that run.
+pub fn notice() -> Option<String> {
+    static SAID: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    SAID.get_or_init(|| {
+        let p = Places::here()?;
+        let mut r = refused(&p).filter(|r| !r.told)?;
+        r.told = true;
+        write_json(&p.refused, &r);
+        Some(format!("Version {} could not start properly on this PC, so the app went back to version {}. It will not try {} again; a later version will come as usual.", r.version, r.back_to, r.version))
+    })
+    .clone()
+}
+
+// ------------------------------------------------------------------ at the start and the end of the app
+
+/// At a plain start, before the window: an update that lies ready is put in and handed over to. True when
+/// that happened, and this copy should end at once. First, when this is a version that has been started
+/// `TRIES` times without its window coming up (and no guard went back), the old one goes back now.
 pub fn put_in_at_start() -> bool {
+    let Some(p) = Places::here() else { return false };
+    // (a version that could not start and was still running when it was moved aside goes now)
+    if p.failed.exists() {
+        let _ = std::fs::remove_file(&p.failed);
+    }
+    if let Some(tries) = count_start(&p) {
+        if go_back(&p, &format!("its window was not up on {tries} starts")) {
+            return true;
+        }
+    }
     if source().is_none() {
         return false;
     }
-    let Some(p) = Places::here() else { return false };
     let Some(m) = staged(&p, &trusted_key(), &current()) else { return false };
-    match swap(&p) {
+    match put_in(&p, &m) {
         Ok(()) => {
             crate::config::log(&format!("update: version {} put in at the start (the one before is kept as {})", m.version, p.old.file_name().unwrap_or_default().to_string_lossy()));
-            if start_again(&p.exe) {
+            if hand_over(&p) {
                 return true;
             }
             crate::config::log("update: the new version could not be started; carrying on with this one, which is the old one still running");
+            // (this run is the old version: it must not take the note for the new one's)
+            SETTLE.store(2, Ordering::Relaxed);
             false
         }
         Err(why) => {
@@ -814,15 +1125,19 @@ pub fn ask_restart() {
 }
 
 /// After the window has closed and everything has been saved: if a restart for an update was asked for,
-/// put the update in and start the app again. If it cannot be put in, the app as it was starts again.
+/// put the update in and hand over to it. If it cannot be put in, the app as it was starts again.
 pub fn after_close() {
     if !RESTART.load(Ordering::Relaxed) {
         return;
     }
     let Some(p) = Places::here() else { return };
     if let Some(m) = staged(&p, &trusted_key(), &current()) {
-        match swap(&p) {
-            Ok(()) => crate::config::log(&format!("update: version {} put in on \"Restart to update\"", m.version)),
+        match put_in(&p, &m) {
+            Ok(()) => {
+                crate::config::log(&format!("update: version {} put in on \"Restart to update\"", m.version));
+                hand_over(&p);
+                return;
+            }
             Err(why) => crate::config::log(&format!("update: version {} could not be put in: {why}", m.version)),
         }
     }
@@ -1029,9 +1344,145 @@ mod tests {
         assert_eq!(p.note, Path::new(r"C:\Apps\Tool\bradleys-music-tool.new.json"));
         assert_eq!(p.old, Path::new(r"C:\Apps\Tool\bradleys-music-tool.old.exe"));
         assert_eq!(p.part("1.3.0"), Path::new(r"C:\Apps\Tool\bradleys-music-tool.new-1.3.0.part"));
+        assert_eq!(p.pending, Path::new(r"C:\Apps\Tool\bradleys-music-tool.update-pending.json"));
+        assert_eq!(p.refused, Path::new(r"C:\Apps\Tool\bradleys-music-tool.update-refused.json"));
+        assert_eq!(p.failed, Path::new(r"C:\Apps\Tool\bradleys-music-tool.failed.exe"));
         assert!(in_build_folder(Path::new(r"C:\code\app\target\oneapp\release\bradleys-music-tool.exe")));
         assert!(in_build_folder(Path::new(r"C:\code\app\Target\release\x.exe")));
         assert!(!in_build_folder(Path::new(r"C:\Apps\Tool\bradleys-music-tool.exe")));
+    }
+
+    // ---------------------------------------------------------------- the first start of a new version
+
+    /// An app folder just after a swap from 1.2.0 to 1.3.0: the new file under the app's name, the old one
+    /// beside it, and the note that the new one has yet to start properly.
+    fn swapped(name: &str) -> (Places, PathBuf) {
+        let (_, p, dir) = release(name);
+        std::fs::write(&p.new, b"the new app").unwrap();
+        swap(&p).unwrap();
+        assert!(write_json(&p.pending, &Pending { version: "1.3.0".into(), from: "1.2.0".into(), starts: 0 }));
+        (p, dir)
+    }
+
+    /// A stand-in for the new version's first start: a real process that ends with `code`, or keeps
+    /// running for about `seconds`.
+    fn first_start(code: Option<i32>, seconds: u32) -> std::process::Child {
+        let what = match code {
+            Some(c) => format!("exit {c}"),
+            None => format!("ping -n {} 127.0.0.1 >nul", seconds + 1),
+        };
+        std::process::Command::new("cmd").args(["/c", &what]).stdout(std::process::Stdio::null()).spawn().unwrap()
+    }
+
+    #[test]
+    fn a_first_start_that_gets_its_window_up_stays_and_is_never_rolled_back() {
+        let (p, dir) = swapped("started");
+        let mut child = first_start(None, 20);
+        // the new version removes the note itself once its window has been up for a while
+        let note = p.pending.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(400));
+            std::fs::remove_file(note).unwrap();
+        });
+        assert_eq!(watch(&p, &mut child, Duration::from_secs(15)), Verdict::Started);
+        assert!(child.try_wait().unwrap().is_none(), "a version that started properly is left running");
+        let _ = child.kill();
+        let _ = child.wait();
+        // a later crash is not the first start's: there is nothing to roll back
+        assert!(roll_back(&p, "crashed later").is_err());
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the new app");
+        assert_eq!(std::fs::read(&p.old).unwrap(), b"the app as it is");
+        assert!(refused(&p).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_first_start_that_crashes_goes_back_to_the_old_version() {
+        let (p, dir) = swapped("crash");
+        let mut child = first_start(Some(3), 0);
+        assert_eq!(watch(&p, &mut child, Duration::from_secs(15)), Verdict::Crashed(Some(3)));
+        let r = roll_back(&p, "it closed with an error").unwrap();
+        assert_eq!((r.version.as_str(), r.back_to.as_str(), r.told), ("1.3.0", "1.2.0", false));
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the app as it is", "the old version is back under the app's name");
+        assert!(!p.old.exists() && !p.failed.exists() && !p.pending.exists());
+        assert!(is_refused(&p, "1.3.0") && !is_refused(&p, "1.3.1"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_first_start_that_hangs_is_ended_and_goes_back() {
+        let (p, dir) = swapped("hang");
+        let mut child = first_start(None, 30);
+        let began = Instant::now();
+        assert_eq!(watch(&p, &mut child, Duration::from_secs(1)), Verdict::Hung);
+        assert!(began.elapsed() < Duration::from_secs(10));
+        assert!(child.try_wait().unwrap().is_some(), "the hung version was ended");
+        roll_back(&p, "its window was not up").unwrap();
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the app as it is");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_first_start_closed_without_an_error_is_no_verdict() {
+        let (p, dir) = swapped("quiet");
+        let mut child = first_start(Some(0), 0);
+        assert_eq!(watch(&p, &mut child, Duration::from_secs(15)), Verdict::LeftEarly);
+        assert!(p.pending.exists(), "the note stays, so the next starts still tell");
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the new app");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn going_back_happens_once_and_the_refused_version_is_never_put_in_again() {
+        let (p, dir) = swapped("loop");
+        roll_back(&p, "it closed with an error").unwrap();
+        // a second rollback has nothing to go back from: the version that is back stays
+        assert!(roll_back(&p, "again").is_err());
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the app as it is");
+
+        // the refused version, signed and fetched again, is not put in: no swap, no loop
+        std::fs::write(&p.new, BYTES).unwrap();
+        std::fs::write(&p.note, serde_json::to_string(&signed()).unwrap()).unwrap();
+        assert_eq!(staged(&p, KEY, "1.2.0"), None);
+        assert!(!p.new.exists() && !p.note.exists());
+        // with no note of a refused version (another one was refused later), the same files would go in
+        std::fs::remove_file(&p.refused).unwrap();
+        std::fs::write(&p.new, BYTES).unwrap();
+        std::fs::write(&p.note, serde_json::to_string(&signed()).unwrap()).unwrap();
+        assert_eq!(staged(&p, KEY, "1.2.0"), Some(signed()));
+
+        // with no old file to go back to, nothing is moved and the note goes, so no start tries again
+        let (p, dir2) = swapped("no-old");
+        std::fs::remove_file(&p.old).unwrap();
+        assert!(roll_back(&p, "it closed with an error").is_err());
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the new app");
+        assert!(!p.pending.exists());
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(dir2);
+    }
+
+    #[test]
+    fn without_a_guard_the_third_start_that_never_got_its_window_up_goes_back() {
+        let (p, dir) = swapped("unguarded");
+        assert_eq!(count_start(&p), None, "the first start (the guarded one)");
+        assert_eq!(count_start(&p), None, "the second");
+        assert_eq!(count_start(&p), Some(2), "the third goes back");
+        roll_back(&p, "its window was not up on 2 starts").unwrap();
+        assert_eq!(count_start(&p), None, "the version that is back is not counted");
+        assert_eq!(std::fs::read(&p.exe).unwrap(), b"the app as it is");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_notes_survive_being_read_back() {
+        let (p, dir) = swapped("notes");
+        assert_eq!(pending(&p), Some(Pending { version: "1.3.0".into(), from: "1.2.0".into(), starts: 0 }));
+        // an older note without a count of starts still reads
+        std::fs::write(&p.pending, r#"{"version":"1.3.0","from":"1.2.0"}"#).unwrap();
+        assert_eq!(pending(&p).map(|n| n.starts), Some(0));
+        std::fs::write(&p.pending, "not json").unwrap();
+        assert!(pending(&p).is_none(), "a note that cannot be read rolls nothing back");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

@@ -183,14 +183,15 @@ pub(crate) struct FolderCard {
     trouble: Option<String>,
     /// read the folder once more though it is the same one (what was found stays on show meanwhile)
     again: bool,
-    /// whether the folder is there, and when that was last looked at: asked at most every two seconds,
-    /// so a sleeping drive never stalls the window on every redraw
-    there: (f64, bool),
+    /// whether the folder is there: the last answer, looked at beside the window (`settings::PathChecks`),
+    /// so a sleeping drive or a share that is gone never stalls it. Not there until the first answer is in.
+    there: bool,
+    checks: crate::settings::PathChecks,
 }
 
 impl Default for FolderCard {
     fn default() -> Self {
-        Self { read: String::new(), found: None, reading: None, picking: None, trouble: None, again: false, there: (-10.0, false) }
+        Self { read: String::new(), found: None, reading: None, picking: None, trouble: None, again: false, there: false, checks: Default::default() }
     }
 }
 
@@ -213,10 +214,11 @@ impl FolderCard {
         }
         let dir = app.cfg.music_dir.trim().to_string();
         out.another = dir != self.read;
-        if out.another || now - self.there.0 > 2.0 {
-            self.there = (now, !dir.is_empty() && Path::new(&dir).is_dir());
-        }
-        if out.another || self.again {
+        let was = self.there;
+        self.there = self.checks.found("music-card", &dir, now, false, |p| p.is_dir(), Some(ctx));
+        // the answer that the folder is there came in after it was chosen (or its drive woke up): read it now
+        let arrived = self.there && !was && !out.another && self.reading.is_none() && self.found.is_none();
+        if out.another || self.again || arrived {
             // another folder: what was found, and anything still being read, is about the old one
             if let Some((_, stop, _)) = self.reading.take() {
                 stop.store(true, Ordering::Relaxed);
@@ -226,7 +228,7 @@ impl FolderCard {
                 self.found = None;
             }
             self.again = false;
-            if self.there.1 {
+            if self.there {
                 let (tx, rx) = crossbeam_channel::unbounded();
                 let stop = Arc::new(AtomicBool::new(false));
                 self.reading = Some((rx, stop.clone(), (0, 0)));
@@ -265,7 +267,7 @@ impl FolderCard {
 
     /// A folder is chosen and is there.
     pub(crate) fn ready(&self) -> bool {
-        !self.read.is_empty() && self.there.1
+        !self.read.is_empty() && self.there
     }
 
     /// What reading the folder found, once it has been read.

@@ -205,11 +205,11 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
         app.slsk_user = slskd::login_name().unwrap_or_default();
     }
     // (read from the file at most every two seconds, not on every redraw)
-    let has_saved = match app.path_ok.get("slsk-login") {
-        Some((_, ok, at)) if now - at < 2.0 => *ok,
+    let has_saved = match app.slsk_login_seen {
+        Some((ok, at)) if now - at < 2.0 => ok,
         _ => {
             let ok = slskd::read_settings().map(|s| s.has_login).unwrap_or(false);
-            app.path_ok.insert("slsk-login", (String::new(), ok, now));
+            app.slsk_login_seen = Some((ok, now));
             ok
         }
     };
@@ -318,7 +318,7 @@ fn basics(app: &mut App, st: &mut State, ui: &mut Ui, left: f32, wide: f32, now:
                 app.slsk_pass.clear();
                 ctx.data_mut(|d| d.remove::<String>(egui::Id::unique("soulseek-edit")));
                 app.slsk_show = false;
-                app.path_ok.remove("slsk-login");
+                app.slsk_login_seen = None;
                 app.attention_cache.0 = -10.0;
                 // it signs in from here on; a client that is not on this PC yet is fetched first, as
                 // "Start" does on the first-start screen
@@ -910,8 +910,9 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
                         Why::TellOnly => say(ui, &format!("Version {v} is out."), DIM()),
                         Why::CannotWrite => say(ui, &format!("Version {v} is out, but the app cannot write to its own folder."), WARN()),
                         Why::Stopped => say(ui, &format!("Version {v} is out. Fetching it was stopped."), DIM()),
+                        Why::Refused => say(ui, &format!("Version {v} could not start on this PC, so the app went back to this one. A later version will come as usual."), WARN()),
                     }
-                    if *why != Why::Stopped && theme::main_action(ui, "Get it", true).clicked() {
+                    if !matches!(why, Why::Stopped | Why::Refused) && theme::main_action(ui, "Get it", true).clicked() {
                         crate::util::open_url(&format!("{}/releases/latest", update::REPO));
                     }
                 }
@@ -997,6 +998,59 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
     changed
 }
 
+/// Whether the folders named in Settings are there. Each is looked at on a thread of its own, never on the
+/// window's: a network share that is gone or a drive that is waking up can take seconds to answer, and the
+/// window must keep drawing meanwhile. Until the first answer for a name is in, it counts as `unknown` says;
+/// a folder is looked at again at most every four seconds, and never while the last look at it has not
+/// come back. The window is drawn again when an answer changes.
+#[derive(Clone, Default)]
+pub(crate) struct PathChecks(std::sync::Arc<std::sync::Mutex<std::collections::HashMap<&'static str, PathCheck>>>);
+
+struct PathCheck {
+    path: String,
+    found: bool,
+    /// when the last look started (the window's clock)
+    at: f64,
+    looking: bool,
+}
+
+impl PathChecks {
+    /// The last answer for this box (`which`), starting a new look beside the window when it is due.
+    /// `look` is the check itself (`Path::exists` in the app).
+    pub(crate) fn found(&self, which: &'static str, path: &str, now: f64, unknown: bool, look: fn(&Path) -> bool, repaint: Option<&egui::Context>) -> bool {
+        let path = path.trim();
+        if path.is_empty() {
+            return false;
+        }
+        let mut known = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = known.entry(which).or_insert_with(|| PathCheck { path: String::new(), found: unknown, at: f64::NEG_INFINITY, looking: false });
+        if entry.path != path {
+            // another folder was typed or chosen: its answer is not known yet
+            *entry = PathCheck { path: path.to_string(), found: unknown, at: f64::NEG_INFINITY, looking: false };
+        }
+        let answer = entry.found;
+        if !entry.looking && now - entry.at >= 4.0 {
+            entry.looking = true;
+            entry.at = now;
+            let (checks, path, repaint) = (self.0.clone(), path.to_string(), repaint.cloned());
+            std::thread::spawn(move || {
+                let found = look(Path::new(&path));
+                let mut known = checks.lock().unwrap_or_else(|e| e.into_inner());
+                // (an answer about a folder the box no longer names is dropped)
+                if let Some(e) = known.get_mut(which).filter(|e| e.path == path) {
+                    let changed = e.found != found;
+                    e.found = found;
+                    e.looking = false;
+                    if let Some(ctx) = repaint.filter(|_| changed) {
+                        ctx.request_repaint();
+                    }
+                }
+            });
+        }
+        answer
+    }
+}
+
 /// What in Settings needs a look, each with the section it is in: only something that was set up and
 /// has stopped working, never something that was left out. `music` is whether the music folder is there
 /// (None: none is chosen), `soulseek` whether a login is saved and whether its client is on this PC or
@@ -1038,5 +1092,42 @@ mod tests {
         assert_eq!(both.len(), 2);
         assert_eq!((both[0].1, both[1].1), (BASICS, FILES));
         assert!(SECTIONS[both[1].1] == "Files" && SECTIONS[both[0].1] == "Basics");
+    }
+}
+
+#[cfg(test)]
+mod path_check_tests {
+    use super::*;
+
+    fn slow_and_missing(_: &Path) -> bool {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        false
+    }
+
+    #[test]
+    fn a_folder_that_answers_slowly_never_holds_up_the_window() {
+        // review finding: the music folder was looked at on the window's thread, so a share that is gone
+        // froze the whole window for as long as Windows took to answer
+        let checks = PathChecks::default();
+        let started = std::time::Instant::now();
+        assert!(checks.found("music", r"\\gone\share\Music", 0.0, true, slow_and_missing, None), "not known yet: counts as there");
+        assert!(checks.found("music", r"\\gone\share\Music", 5.0, true, slow_and_missing, None), "still being looked at");
+        assert!(started.elapsed() < std::time::Duration::from_millis(500), "the window waited {:?}", started.elapsed());
+        // the answer comes in beside the window
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while checks.found("music", r"\\gone\share\Music", 6.0, true, slow_and_missing, None) {
+            assert!(std::time::Instant::now() < until, "the answer never came");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        // another name starts over, and an empty one is never there
+        assert!(!checks.found("music", r"\\gone\other", 7.0, false, slow_and_missing, None));
+        assert!(!checks.found("music", "  ", 8.0, true, slow_and_missing, None));
+        // a real folder is found
+        let here = std::env::temp_dir();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !checks.found("backup", &here.to_string_lossy(), 0.0, false, |p| p.exists(), None) {
+            assert!(std::time::Instant::now() < until, "the answer never came");
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 }

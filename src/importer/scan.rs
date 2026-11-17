@@ -273,7 +273,7 @@ pub fn update_unit_action(ctx: &Ctx, u: &mut Unit) {
         return;
     };
     let item = u.item.to_string_lossy().to_string();
-    if ctx.get_pending().contains(&item) {
+    if ctx.pending_print(&item).is_some() {
         u.action = Action::Cleanup;
         u.include = true;
         u.note = "Already imported - Soulseek had the original open last time. Import will just remove the leftover download.".into();
@@ -350,7 +350,12 @@ pub fn unfit_to_replace(ctx: &Ctx, u: &Unit, old: &Path) -> Option<String> {
 
 /// Same artist + album folder (ignoring year and edition) means the same destination.
 pub fn batch_key(u: &Unit) -> String {
-    format!("{}|{}", norm(&u.artist), album_key(&u.folder))
+    place_key(&u.artist, &u.folder)
+}
+
+/// `batch_key` for an artist and album folder name.
+pub fn place_key(artist: &str, folder: &str) -> String {
+    format!("{}|{}", norm(artist), album_key(folder))
 }
 
 /// Two downloads in one batch that would land in the same folder: keep the best one ticked.
@@ -588,11 +593,22 @@ pub fn read_unit(ctx: &Ctx, item: &Path, stage: &dyn Fn(&'static str)) -> Result
     for (i, k) in keys.iter().enumerate() {
         groups.entry(k.clone()).or_default().push(i);
     }
+    // Within a group, a copy is only the same song as one kept when its length matches too: two different
+    // recordings that share a vague tag ("Untitled", no number) are both kept, and if they would then be saved
+    // under one name the import stops and says so, instead of one being dropped and recycled with the download.
+    let same_length = |a: &Track, b: &Track| a.duration.is_finite() && b.duration.is_finite() && a.duration > 0.0 && b.duration > 0.0 && (a.duration - b.duration).abs() <= 2.0;
     let mut dupes: Vec<usize> = vec![];
     for (_, mut idx) in groups {
         if idx.len() > 1 {
             idx.sort_by(|&a, &b| (tracks[b].lossless as u8, tracks[b].kbps).cmp(&(tracks[a].lossless as u8, tracks[a].kbps)));
-            dupes.extend(&idx[1..]);
+            let mut kept: Vec<usize> = vec![];
+            for i in idx {
+                if kept.iter().any(|&k| same_length(&tracks[k], &tracks[i])) {
+                    dupes.push(i);
+                } else {
+                    kept.push(i);
+                }
+            }
         }
     }
     if !dupes.is_empty() {

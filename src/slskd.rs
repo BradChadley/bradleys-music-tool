@@ -261,58 +261,100 @@ fn unquote(s: &str) -> &str {
 /// A file that would open slskd up is refused, so the app never starts it like that: settings that can be
 /// changed over its web side, or a web side that asks for no sign-in.
 pub fn parse_settings(text: &str) -> Result<Settings, String> {
-    let (mut section, mut port, mut user, mut pass, mut in_auth) = (String::new(), None, false, false, false);
+    let (mut port, mut user, mut pass) = (None, false, false);
     let mut listen: Option<u16> = None;
     let mut mark = std::collections::hash_map::DefaultHasher::new();
     let yes = |v: &str| matches!(v.to_lowercase().as_str(), "true" | "yes" | "on" | "y" | "1");
     let sharing = || Err("The Soulseek client's settings file shares folders with other Soulseek users. The app shares nothing, so it does not start it like that. Empty \"shares: directories\" in slskd.yml.".to_string());
-    // under "shares:", "directories:" with a folder after it or listed below it ("- 'D:\Music'")
-    let mut in_share_dirs = false;
+    let unclear = |line: &str| {
+        Err(format!(
+            "The Soulseek client's settings file writes its web, sharing or remote settings in a way the app cannot check (\"{}\"). Write them one setting per line, as in slskd's example file.",
+            line.trim()
+        ))
+    };
+    // The settings that would open slskd up live under these top-level keys. In them, anything the app does
+    // not read the way slskd would (a {...} map on one line, anchors and aliases, merge keys, type tags, block
+    // text, a value carried onto the next line) is refused instead of guessed at.
+    const WATCHED: [&str; 3] = ["web", "shares", "remote_configuration"];
+    // where each line sits: the keys above it, by their indentation (any indentation, as YAML allows)
+    let mut path: Vec<(usize, String)> = vec![];
+    // the indentation of "directories:" under "shares:" while its list is being read
+    let mut share_dirs: Option<usize> = None;
     for line in text.lines() {
-        if line.trim_start().starts_with('#') || line.trim().is_empty() {
+        let body = line.trim_start();
+        if body.starts_with('#') || body.trim().is_empty() {
             continue;
         }
-        let indent = line.len() - line.trim_start().len();
-        if in_share_dirs && indent >= 2 && line.trim_start().starts_with('-') {
-            return sharing();
+        if body.starts_with("---") || body.starts_with("...") {
+            continue;
         }
-        let Some((k, v)) = line.trim().split_once(':') else { continue };
-        if section == "shares" && indent == 2 {
-            in_share_dirs = k.trim() == "directories";
-            let v = unquote(v);
-            if in_share_dirs && !v.is_empty() && v != "[]" {
+        let indent = line.len() - body.len();
+        if let Some(at) = share_dirs {
+            if body.starts_with('-') && indent >= at {
                 return sharing();
             }
-        } else if indent <= 2 {
-            in_share_dirs = false;
+            if indent <= at {
+                share_dirs = None;
+            }
         }
-        if indent == 0 {
-            section = k.trim().to_string();
-            in_auth = false;
-            if section == "remote_configuration" && yes(unquote(v)) {
-                return Err("The Soulseek client's settings file lets its settings be changed from outside (remote_configuration). The app does not start it like that.".into());
+        while path.last().is_some_and(|(i, _)| *i >= indent) {
+            path.pop();
+        }
+        let watched = |p: &[(usize, String)], key: Option<&str>| p.first().map(|(_, k)| k.as_str()).or(key).is_some_and(|k| WATCHED.contains(&k));
+        if body.starts_with('-') {
+            // an item of a list: only a share list matters (above), and a list item that opens a map of its own
+            // inside the watched settings is not something the app can follow
+            let item = body.trim_start_matches('-').trim();
+            if watched(&path, None) && (item.contains(": ") || item.ends_with(':') || item.starts_with(['{', '&', '*', '!', '|', '>'])) {
+                return unclear(line);
             }
             continue;
         }
+        if body.starts_with('?') {
+            return unclear(line);
+        }
+        let Some((k, v)) = body.split_once(':') else {
+            // a value carried onto a line of its own
+            if watched(&path, None) {
+                return unclear(line);
+            }
+            continue;
+        };
+        let k = k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+        let raw = v.trim();
         let v = unquote(v);
-        if section == "web" && indent == 2 {
-            in_auth = k.trim() == "authentication";
+        let in_watched = watched(&path, Some(&k));
+        if in_watched && (k == "<<" || (raw.starts_with(['{', '&', '*', '!', '|', '>']) && raw != "{}")) {
+            return unclear(line);
         }
-        if in_auth && indent == 4 && k.trim() == "disabled" && yes(v) {
-            return Err("The Soulseek client's settings file turns off the sign-in on its web side. The app does not start it like that.".into());
-        }
-        match (section.as_str(), k.trim()) {
-            ("soulseek", "username") if indent == 2 => {
+        let keys: Vec<&str> = path.iter().map(|(_, k)| k.as_str()).chain(std::iter::once(k.as_str())).collect();
+        match keys.as_slice() {
+            ["remote_configuration"] if yes(v) => {
+                return Err("The Soulseek client's settings file lets its settings be changed from outside (remote_configuration). The app does not start it like that.".into());
+            }
+            ["web", "authentication", "disabled"] if yes(v) => {
+                return Err("The Soulseek client's settings file turns off the sign-in on its web side. The app does not start it like that.".into());
+            }
+            ["shares", "directories"] => {
+                if !v.is_empty() && v != "[]" {
+                    return sharing();
+                }
+                share_dirs = Some(indent);
+            }
+            ["soulseek", "username"] => {
                 user = !v.is_empty();
                 mark.write(line.as_bytes());
             }
-            ("soulseek", "password") if indent == 2 => {
+            ["soulseek", "password"] => {
                 pass = !v.is_empty();
                 mark.write(line.as_bytes());
             }
-            ("web", "port") if indent == 2 => port = v.parse::<u16>().ok(),
-            ("soulseek", "listen_port") if indent == 2 => listen = v.parse::<u16>().ok(),
+            ["web", "port"] => port = v.parse::<u16>().ok(),
+            ["soulseek", "listen_port"] => listen = v.parse::<u16>().ok(),
             _ => {}
+        }
+        if raw.is_empty() || raw.starts_with('#') {
+            path.push((indent, k));
         }
     }
     let port = port.ok_or("The slskd settings file has no web port.")?;
@@ -1189,5 +1231,54 @@ mod tests {
         assert_eq!(id.len(), 36);
         assert_eq!(id.matches('-').count(), 4);
         assert_ne!(id, new_id());
+    }
+}
+
+#[cfg(test)]
+mod yaml_shape_tests {
+    use super::*;
+
+    #[test]
+    fn settings_that_open_slskd_up_are_refused_however_the_yaml_is_written() {
+        // review finding: the reader knew only two-space indentation and one line per setting, so valid
+        // YAML in another shape turned the web sign-in off or shared folders without being noticed
+        let open = [
+            // the review's own examples
+            "web:\n  port: 5830\n  authentication:\n    disabled: true # local development\n",
+            "web:\n  port: 5830\nshares: {directories: ['C:\\Private']}\n",
+            // other indentation
+            "web:\n    port: 5830\n    authentication:\n        disabled: true\n",
+            "web:\n port: 5830\n authentication:\n  disabled: yes\n",
+            "web:\n    port: 5830\nshares:\n    directories:\n        - 'D:\\Music'\n",
+            "web:\n    port: 5830\nshares:\n    directories:\n    - D:\\Music\n",
+            // a map on one line, type tags, anchors and merge keys, block text, a value on the next line
+            "web:\n  port: 5830\n  authentication: {disabled: true}\n",
+            "web: {port: 5830, authentication: {disabled: true}}\n",
+            "web:\n  port: 5830\n  authentication:\n    disabled: !!bool true\n",
+            "base: &open\n  disabled: true\nweb:\n  port: 5830\n  authentication:\n    <<: *open\n",
+            "web:\n  port: 5830\n  authentication: *open\n",
+            "web:\n  port: 5830\n  authentication:\n    disabled: >\n      true\n",
+            "remote_configuration:\n  true\nweb:\n  port: 5830\n",
+            "\"remote_configuration\": true\nweb:\n  port: 5830\n",
+            "? remote_configuration\n: true\nweb:\n  port: 5830\n",
+            "web:\n  port: 5830\nshares:\n  directories:\n    - path: 'D:\\Music'\n",
+        ];
+        for yml in open {
+            assert!(parse_settings(yml).is_err(), "{yml}");
+        }
+        // what the app writes, and the same settings with other indentation, still read
+        for fine in [
+            "web:\n  port: 5830\n  authentication:\n    disabled: false\nshares:\n  directories: []\n",
+            "web:\n    port: 5830\n    authentication:\n        disabled: false\n    https:\n        disabled: true\nshares:\n    directories:\n",
+            "soulseek:\n    listen_port: 50310\nweb:\n    port: 5830\n",
+            "web:\n  port: 5830\nfilters:\n  search:\n    request: ['a', 'b']\n    other: {x: 1}\n",
+            "web:\n  port: 5830\n  authentication:\n    api_keys: {}\n",
+        ] {
+            let set = parse_settings(fine).unwrap_or_else(|e| panic!("{fine}: {e}"));
+            assert_eq!(set.port, 5830);
+        }
+        assert_eq!(parse_settings("soulseek:\n    listen_port: 50310\nweb:\n    port: 5830\n").unwrap().listen_port, 50310);
+        // a port under another key is not the web port
+        assert!(parse_settings("web:\n    https:\n        port: 5831\n").is_err());
     }
 }

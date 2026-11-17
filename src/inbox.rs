@@ -343,8 +343,9 @@ pub struct Inbox {
     looked_at: f64,
     /// the list, or why it cannot be read; None when there is no file
     pub list: Option<Result<List, String>>,
-    /// the library as last read, and what it was read from
+    /// the library as last read, and the music folder it was read from
     lib: Option<Arc<Library>>,
+    lib_music: String,
     lib_for: Folders,
     lib_read_at: f64,
     lib_rx: Option<crossbeam_channel::Receiver<Option<Library>>>,
@@ -363,7 +364,7 @@ impl Inbox {
         let dir = data.join("inbox");
         let _ = std::fs::create_dir_all(&dir);
         let state_file = State::file();
-        Inbox { dir, state: State::load_from(&state_file), state_file, mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
+        Inbox { dir, state: State::load_from(&state_file), state_file, mark: None, looked_at: -10.0, list: None, lib: None, lib_music: String::new(), lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
     }
 
     fn save(&self) {
@@ -462,10 +463,7 @@ impl Inbox {
         if let Some(rx) = &self.lib_rx {
             match rx.try_recv() {
                 Ok(lib) => {
-                    // a library that could not be read (drive unplugged) keeps the last reading
-                    if let Some(lib) = lib {
-                        self.lib = Some(Arc::new(lib));
-                    }
+                    self.take_reading(lib);
                     self.lib_rx = None;
                     self.ready = true;
                 }
@@ -482,6 +480,8 @@ impl Inbox {
         let due = again || now - self.lib_read_at >= LIBRARY_EVERY || *folders != self.lib_for;
         if !due || folders.music.trim().is_empty() {
             if folders.music.trim().is_empty() {
+                // no music folder: nothing is owned (a library read before says nothing about "none")
+                self.lib = None;
                 self.ready = true;
             }
             return;
@@ -496,6 +496,21 @@ impl Inbox {
             let _ = tx.send(lib);
             ctx.request_repaint();
         });
+    }
+
+    /// Takes up a reading of the library (`lib_for`): None when it could not be read or held no artists.
+    /// A drive that is unplugged keeps the last reading of that same folder; a reading of another folder says
+    /// nothing about what this one holds, so it is dropped (albums only it had are not owned any more).
+    fn take_reading(&mut self, lib: Option<Library>) {
+        let asked = self.lib_for.music.clone();
+        match lib {
+            Some(lib) => {
+                self.lib = Some(Arc::new(lib));
+                self.lib_music = asked;
+            }
+            None if !crate::library::same_folder(&self.lib_music, &asked) => self.lib = None,
+            None => {}
+        }
     }
 
     /// The rows to show now (empty until the library has been read for this list).
@@ -667,7 +682,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("inbox-tick-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let mut inbox = Inbox { dir: dir.clone(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] };
+        let mut inbox = Inbox { dir: dir.clone(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_music: String::new(), lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] };
         assert!(!inbox.tick(0.0), "no file, nothing to open");
         std::fs::write(dir.join(CADENCE_FILE), doc(vec![album("A", "B", &[])])).unwrap();
         assert!(!inbox.tick(1.0), "looked at every two seconds only");
@@ -744,6 +759,36 @@ mod tests {
     }
 
     fn inbox_like(dir: &Path) -> Inbox {
-        Inbox { dir: dir.to_path_buf(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
+        Inbox { dir: dir.to_path_buf(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_music: String::new(), lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] }
+    }
+}
+
+#[cfg(test)]
+mod library_change_tests {
+    use super::*;
+
+    #[test]
+    fn a_reading_of_another_music_folder_is_not_kept() {
+        // review finding: when the music folder was changed to one that could not be read, the old
+        // folder's library stayed, so Cadence was told albums only the old folder had were owned
+        let dir = std::env::temp_dir().join(format!("inbox-change-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let album = dir.join("old").join("Amber Relay").join("Signal Garden");
+        std::fs::create_dir_all(&album).unwrap();
+        std::fs::write(album.join("01 - Static Bloom.mp3"), b"x").unwrap();
+        let old = dir.join("old").to_string_lossy().to_string();
+        let mut inbox = Inbox { dir: dir.clone(), state_file: dir.join("inbox-state.json"), state: State::default(), mark: None, looked_at: -10.0, list: None, lib: None, lib_music: String::new(), lib_for: Folders::default(), lib_read_at: -1e9, lib_rx: None, ready: false, show_all: false, answered: vec![] };
+        inbox.lib_for.music = old.clone();
+        inbox.take_reading(Library::scan(&old, "", "").ok());
+        assert!(inbox.lib.is_some());
+        // the same folder unplugged: the last reading of it stays
+        inbox.lib_for.music = format!("{}\\", old.to_uppercase());
+        inbox.take_reading(None);
+        assert!(inbox.lib.is_some(), "an unplugged drive keeps what it held");
+        // another folder that cannot be read: what the old one held is not owned any more
+        inbox.lib_for.music = dir.join("new").to_string_lossy().to_string();
+        inbox.take_reading(None);
+        assert!(inbox.lib.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

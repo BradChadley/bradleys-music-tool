@@ -717,3 +717,82 @@ fn a_row_is_there_at_once_has_no_tick_until_its_facts_are_in_and_never_moves() {
     assert_eq!(import_words(false, 0, 0, 0, 3), "Tick an album to import it");
     assert_eq!(import_words(false, 0, 0, 0, 0), "");
 }
+
+/// A track of `secs` seconds tagged only with a title (no track number).
+fn untitled(ctx: &Ctx, out: &Path, secs: u32, freq: u32) {
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let mut c = tools::command(&ctx.ffmpeg, false);
+    c.args(["-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", &format!("sine=frequency={freq}:duration={secs}")]);
+    c.args(["-c:a", "libmp3lame", "-b:a", "192k", "-metadata", "artist=Test Artist", "-metadata", "album=Vague", "-metadata", "title=Untitled"]);
+    c.arg(out).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    assert!(tools::run_limited(&mut c, 60), "ffmpeg could not make {}", out.display());
+}
+
+#[test]
+fn two_recordings_with_the_same_vague_tags_are_both_kept() {
+    // review finding: "Untitled" twice with no track numbers was one song, so one recording was dropped
+    // and then recycled with the download
+    let l = lab("vague");
+    let dir = l.ctx.source.join("Test Artist - Vague");
+    untitled(&l.ctx, &dir.join("take a.mp3"), 2, 300);
+    untitled(&l.ctx, &dir.join("take b.mp3"), 7, 500);
+    settle(&dir);
+    let u = scan(&l, &dir);
+    assert_eq!(u.tracks.len(), 2, "{:?}", u.warnings);
+    assert!(!u.warnings.iter().any(|w| w.contains("duplicate")), "{:?}", u.warnings);
+    // the same recording twice (the same length) is still one song
+    let same = l.ctx.source.join("Test Artist - Same");
+    untitled(&l.ctx, &same.join("take a.mp3"), 3, 300);
+    untitled(&l.ctx, &same.join("take a copy.mp3"), 3, 300);
+    settle(&same);
+    let u = scan(&l, &same);
+    assert_eq!(u.tracks.len(), 1, "{:?}", u.warnings);
+}
+
+#[test]
+fn a_leftover_is_only_removed_while_it_holds_what_was_imported() {
+    // review finding: the clean-up compared the folder with a rescan, which reads a track that arrived
+    // after the import as part of the leftover, so that track went to the Recycle Bin never imported
+    use super::import::{leftover_is_what_was_imported, print_on_disk, scanned_print};
+    let l = lab("leftover");
+    let dir = download(&l, "Test Artist - Leftover", "Leftover", &[(1, "One"), (2, "Two")], 320);
+    let imported = scan(&l, &dir);
+    assert_eq!(scanned_print(&imported), print_on_disk(&imported));
+    let item = imported.item.to_string_lossy().to_string();
+    // the import went through, but Soulseek had the download open: it is remembered with what was imported
+    l.ctx.set_pending(&item, Some(&scanned_print(&imported)));
+    assert!(leftover_is_what_was_imported(&l.ctx, &imported));
+    // a track arrives, and the next scan reads it as part of the leftover
+    tone(&l.ctx, &dir.join("03 Three.mp3"), "Leftover", 3, "Three", 320);
+    settle(&dir);
+    let rescanned = scan(&l, &dir);
+    assert!(!changed_since_scan(&rescanned), "the rescan alone sees nothing new: the old check would recycle");
+    assert!(!leftover_is_what_was_imported(&l.ctx, &rescanned), "the new track was never imported");
+    // with it gone again, the leftover is what was imported once more
+    std::fs::remove_file(dir.join("03 Three.mp3")).unwrap();
+    assert!(leftover_is_what_was_imported(&l.ctx, &scan(&l, &dir)));
+    // forgetting it, and a line from before prints were kept, are not "imported"
+    l.ctx.set_pending(&item, None);
+    assert!(l.ctx.pending_print(&item).is_none());
+    std::fs::write(&l.ctx.pending_file, format!("{item}\r\n")).unwrap();
+    assert!(l.ctx.pending_print(&item).is_none() && !leftover_is_what_was_imported(&l.ctx, &imported));
+    // and a new line for it replaces the old one
+    l.ctx.set_pending(&item, Some("2-x"));
+    assert_eq!(l.ctx.pending_print(&item).as_deref(), Some("2-x"));
+    assert_eq!(std::fs::read_to_string(&l.ctx.pending_file).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn two_long_album_names_that_end_up_one_folder_never_import_at_once() {
+    // review finding: the import order kept the names apart by their full text, but both were shortened to
+    // one folder name, so the two imports shared and deleted one ".importing" folder
+    use super::import::{fitted_folder, running_key};
+    let l = lab("longnames");
+    let stem = "A Very Long Album Name That Goes On ".repeat(5);
+    let (one, two) = (format!("{stem}Part One"), format!("{stem}Part Two"));
+    assert_eq!(fitted_folder(&l.ctx, "Test Artist", &one), fitted_folder(&l.ctx, "Test Artist", &two), "both are cut to one name");
+    assert_ne!(super::scan::place_key("Test Artist", &one), super::scan::place_key("Test Artist", &two), "the full names differ");
+    assert_eq!(running_key(&l.ctx, "Test Artist", &one), running_key(&l.ctx, "Test Artist", &two));
+    // short names that differ stay apart
+    assert_ne!(running_key(&l.ctx, "Test Artist", "Comet"), running_key(&l.ctx, "Test Artist", "Rocket"));
+}
