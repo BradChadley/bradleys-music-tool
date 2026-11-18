@@ -1,5 +1,7 @@
 # Bradley's Music Tool
 
+> **Bradley's Music Tool is now part of [Cadence](https://github.com/BradChadley/Cadence-Releases/releases/latest).** Health, Get music, Recs and Backup live in Cadence from version 0.30.0, in one app. Version 1.0.9 is the Music Tool's last release: it keeps working as it is, but it gets no more updates, and this repository is kept as an archive. To install Cadence, use [Cadence Installer](https://github.com/BradChadley/cadence-installer/releases/latest/download/Cadence-Installer.exe).
+
 A Windows app that looks after a music library kept in folders: it shows what you have, finds what is wrong with it and repairs it, tells you what your artists have released, and files new albums in the right place.
 
 ![The Library page: albums as a grid of covers](docs/library.png)
