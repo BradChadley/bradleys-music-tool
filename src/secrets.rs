@@ -21,8 +21,30 @@ pub struct Entry {
     pub secret: String,
 }
 
+/// Whose entries these are: the start of every entry's name in Credential Manager. The Music Tool's are
+/// "Bradley's Music Tool: ..."; Cadence's engine keeps its own ("Cadence: ...", see `set_owner`).
+const MUSIC_TOOL: &str = "Bradley's Music Tool";
+static OWNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Names whose entries this process keeps, for the rest of the run: Cadence's engine says "Cadence" at its
+/// start, so its Soulseek login is "Cadence: Soulseek" and never the Music Tool's. Set once, before anything
+/// is read; false if it was already set.
+pub fn set_owner(owner: &str) -> bool {
+    OWNER.set(owner.to_string()).is_ok()
+}
+
+fn owner() -> &'static str {
+    OWNER.get().map(String::as_str).unwrap_or(MUSIC_TOOL)
+}
+
 fn target(name: &str) -> String {
-    format!("Bradley's Music Tool: {name}")
+    format!("{}: {name}", owner())
+}
+
+/// The name an entry is kept under in a test's file or in memory: the bare name for the Music Tool (as test
+/// files from before have it), the whole name for another owner, so the two never share an entry.
+fn local_key(name: &str) -> String {
+    if owner() == MUSIC_TOOL { name.to_string() } else { target(name) }
 }
 
 enum Place {
@@ -57,8 +79,8 @@ fn file_map(path: &std::path::Path) -> BTreeMap<String, (String, String)> {
 
 fn seen_key(name: &str) -> String {
     match place() {
-        Place::File(p) => format!("{}|{name}", p.display()),
-        _ => name.to_string(),
+        Place::File(p) => format!("{}|{}", p.display(), local_key(name)),
+        _ => local_key(name),
     }
 }
 
@@ -69,8 +91,8 @@ pub fn get(name: &str) -> Option<Entry> {
     }
     let got = match place() {
         Place::Windows => vault::read(&target(name)),
-        Place::File(p) => file_map(&p).get(name).map(|(u, s)| Entry { user: u.clone(), secret: s.clone() }),
-        Place::Memory => MEMORY.lock().unwrap_or_else(|e| e.into_inner()).get(name).map(|(u, s)| Entry { user: u.clone(), secret: s.clone() }),
+        Place::File(p) => file_map(&p).get(&local_key(name)).map(|(u, s)| Entry { user: u.clone(), secret: s.clone() }),
+        Place::Memory => MEMORY.lock().unwrap_or_else(|e| e.into_inner()).get(&local_key(name)).map(|(u, s)| Entry { user: u.clone(), secret: s.clone() }),
     }
     .filter(|e| !e.secret.is_empty());
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).insert(key, got.clone());
@@ -93,31 +115,31 @@ pub fn set(name: &str, user: &str, secret: &str) -> Result<(), String> {
         Place::Windows => vault::write(&target(name), user, secret).map_err(|_| failed())?,
         Place::File(p) => {
             let mut map = file_map(&p);
-            map.insert(name.to_string(), (user.to_string(), secret.to_string()));
+            map.insert(local_key(name), (user.to_string(), secret.to_string()));
             let bytes = serde_json::to_vec_pretty(&map).map_err(|_| failed())?;
             crate::util::write_atomic(&p, &bytes).map_err(|_| failed())?;
         }
         Place::Memory => {
-            MEMORY.lock().unwrap_or_else(|e| e.into_inner()).insert(name.to_string(), (user.to_string(), secret.to_string()));
+            MEMORY.lock().unwrap_or_else(|e| e.into_inner()).insert(local_key(name), (user.to_string(), secret.to_string()));
         }
     }
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&seen_key(name));
     if get(name).as_ref() == Some(&want) { Ok(()) } else { Err(failed()) }
 }
 
-#[allow(dead_code)] // only tests take an entry out again
+/// Takes an entry out (Cadence's engine signing out, and tests).
 pub fn remove(name: &str) {
     match place() {
         Place::Windows => vault::delete(&target(name)),
         Place::File(p) => {
             let mut map = file_map(&p);
-            map.remove(name);
+            map.remove(&local_key(name));
             if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
                 let _ = crate::util::write_atomic(&p, &bytes);
             }
         }
         Place::Memory => {
-            MEMORY.lock().unwrap_or_else(|e| e.into_inner()).remove(name);
+            MEMORY.lock().unwrap_or_else(|e| e.into_inner()).remove(&local_key(name));
         }
     }
     SEEN.lock().unwrap_or_else(|e| e.into_inner()).remove(&seen_key(name));
@@ -177,7 +199,6 @@ mod vault {
         if unsafe { CredWriteW(&c, 0) } != 0 { Ok(()) } else { Err(()) }
     }
 
-    #[allow(dead_code)] // only tests take an entry out again
     pub fn delete(target: &str) {
         let name = wide(target);
         unsafe {

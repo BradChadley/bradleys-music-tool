@@ -882,6 +882,13 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
             ui.spacing_mut().item_spacing.x = 16.0;
             match &state {
                 _ if !can => say(ui, "This copy is a test run or a build from source, and does not update itself.", DIM()),
+                Up::Retired => {
+                    say(ui, update::RETIRED_WORDS, DIM());
+                    let action = app.notice.action().clone();
+                    if theme::main_action(ui, action.words(), true).clicked() {
+                        crate::retire::act(&action);
+                    }
+                }
                 Up::Idle if chosen == Policy::Off => say(ui, "Not checking for new versions.", DIM()),
                 Up::Idle => faint(ui, "Not checked yet"),
                 Up::Checking => say(ui, "Checking\u{2026}", DIM()),
@@ -928,7 +935,7 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
                         update::stop_fetch();
                     }
                 }
-                Up::Ready(_) | Up::Checking => {}
+                Up::Ready(_) | Up::Checking | Up::Retired => {}
                 Up::Out(_, Why::Stopped) => {
                     // (the part that arrived is still there: the fetch carries on from it)
                     if theme::quiet(ui, "Carry on", 13.5, true).clicked() {
@@ -962,22 +969,25 @@ fn about(app: &mut App, ui: &mut Ui, left: f32, wide: f32) -> bool {
             ui.painter().rect_filled(filled, 1.5, theme::ACCENT2());
         }
     });
-    ui.add_space(GAP);
-    rows_card(ui, left, wide, "settings-new-versions", None, |ui| {
-        const WAYS: [rows::Item; 3] = [
-            rows::Item { name: "Install by themselves", about: "Fetched and checked in the background; put in when you restart." },
-            rows::Item { name: "Only tell me", about: "Says a new version is out; you choose when to get it." },
-            rows::Item { name: "Never check", about: "The app does not look for new versions." },
-        ];
-        let policies = [Policy::Auto, Policy::Tell, Policy::Off];
-        let at = policies.iter().position(|p| *p == chosen).unwrap_or(0);
-        rows::row(ui, "new-versions", "New versions", None, |ui| {
-            if let Some(n) = rows::pick_one(ui, "pick:updates", &WAYS, at) {
-                app.cfg.updates = policies[n].saved().to_string();
-                changed = true;
-            }
+    // (the last version looks for no new versions: there is nothing to choose)
+    if !update::RETIRED {
+        ui.add_space(GAP);
+        rows_card(ui, left, wide, "settings-new-versions", None, |ui| {
+            const WAYS: [rows::Item; 3] = [
+                rows::Item { name: "Install by themselves", about: "Fetched and checked in the background; put in when you restart." },
+                rows::Item { name: "Only tell me", about: "Says a new version is out; you choose when to get it." },
+                rows::Item { name: "Never check", about: "The app does not look for new versions." },
+            ];
+            let policies = [Policy::Auto, Policy::Tell, Policy::Off];
+            let at = policies.iter().position(|p| *p == chosen).unwrap_or(0);
+            rows::row(ui, "new-versions", "New versions", None, |ui| {
+                if let Some(n) = rows::pick_one(ui, "pick:updates", &WAYS, at) {
+                    app.cfg.updates = policies[n].saved().to_string();
+                    changed = true;
+                }
+            });
         });
-    });
+    }
     ui.add_space(16.0);
     ui.horizontal(|ui| {
         theme::centered_row(ui, "about-ways", 0.0, |ui| {

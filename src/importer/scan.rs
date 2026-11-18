@@ -196,6 +196,27 @@ pub fn artist_dirs(ctx: &Ctx, artist: &str) -> Vec<PathBuf> {
     out
 }
 
+/// The folder in the library an album of this artist goes into, by name: a compilation's (its artist
+/// "Various Artists") is the compilations folder Settings names (`Ctx::compilations_folder`).
+pub fn folder_artist(ctx: &Ctx, artist: &str) -> String {
+    // (only the name the scan gives a compilation: with the usual setting nothing changes)
+    if artist.trim().eq_ignore_ascii_case(crate::organize::DEFAULT_COMPILATIONS) { crate::organize::compilations_name(&ctx.compilations_folder) } else { artist.to_string() }
+}
+
+/// Where a new album goes (the folder that holds its album folder). With Keep the library organized, the
+/// artist's own folder, as Organize files it (`existing`, the copy it replaces, goes to the undo backups
+/// wherever it is). Otherwise beside the copy it replaces, else on the shelf this artist keeps such releases
+/// on, else the artist's folder.
+pub fn home_for(ctx: &Ctx, artist: &str, folder: &str, tracks: usize, existing: Option<&Path>) -> PathBuf {
+    if ctx.keep_organized {
+        return artist_dirs(ctx, artist).into_iter().next().unwrap_or_else(|| ctx.library.join(artist));
+    }
+    match existing {
+        Some(e) => e.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ctx.library.join(artist)),
+        None => home_for_new(ctx, artist, folder, tracks),
+    }
+}
+
 /// The album folders in an artist's folder, as the library reads them (see `crate::library`): shelves are
 /// looked into, and an album kept inside another album's folder is one of its own.
 pub fn album_dirs(artist_dir: &Path) -> Vec<PathBuf> {
@@ -253,20 +274,18 @@ pub fn get_album_quality(ctx: &Ctx, dir: &Path) -> AlbumQuality {
 
 /// Works out what Import should do, given what's already in the library under the current artist/folder names.
 pub fn update_unit_action(ctx: &Ctx, u: &mut Unit) {
-    u.existing = find_existing_album(ctx, &u.artist, &u.folder);
+    let artist = folder_artist(ctx, &u.artist);
+    u.existing = find_existing_album(ctx, &artist, &u.folder);
     u.action = Action::New;
     u.note.clear();
     // where it will go, when that is not simply the artist's folder: beside the copy it replaces (on its
     // shelf, or in a genre folder), or on the shelf this artist keeps such releases on
     let plain = ctx.library.join(&u.artist);
-    let home = match &u.existing {
-        Some(e) => e.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| plain.clone()),
-        None => home_for_new(ctx, &u.artist, &u.folder, u.tracks.len()),
-    };
+    let home = home_for(ctx, &artist, &u.folder, u.tracks.len(), u.existing.as_deref());
     u.home = (home != plain).then_some(home);
     let Some(existing) = u.existing.clone() else {
         // a near match is never replaced and never skipped: it is left unticked for a person to decide
-        if let Some(near) = find_similar_album(ctx, &u.artist, &u.folder) {
+        if let Some(near) = find_similar_album(ctx, &artist, &u.folder) {
             u.include = false;
             u.note = format!("You have '{}'. This may be another recording of it: tick to add it beside that one.", near.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
         }

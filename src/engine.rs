@@ -328,12 +328,31 @@ fn weight(a: &ArtistStat) -> f64 {
 }
 
 pub fn run(cfg: Config, net: Arc<Net>, tx: Sender<Msg>, cancel: Arc<AtomicBool>, repaint: impl Fn() + Send + Sync + Clone + 'static) {
+    run_with(cfg, net, tx, cancel, repaint, None)
+}
+
+/// What a player knows about one artist's listening, given in place of Last.fm's history (Cadence's own play
+/// counts): all time, the last 12 months, the last 3 months, and recently.
+#[derive(Clone, Debug, Default)]
+pub struct Played {
+    pub name: String,
+    pub plays: u64,
+    pub plays_12m: u64,
+    pub plays_3m: u64,
+    pub plays_recent: u64,
+}
+
+/// `run`, with the plays given (`Some`): step 2 then reads nothing from Last.fm (its four history requests of up
+/// to 1,000 rows each are not made), and New releases needs no Last.fm at all. Artists to try still needs a
+/// Last.fm key in `cfg`. Cadence's engine runs it this way; it has no window, so nothing is said on a taskbar.
+pub fn run_with(cfg: Config, net: Arc<Net>, tx: Sender<Msg>, cancel: Arc<AtomicBool>, repaint: impl Fn() + Send + Sync + Clone + 'static, plays: Option<Vec<Played>>) {
+    let windowed = plays.is_none();
     let send = {
         let tx = tx.clone();
         let repaint = repaint.clone();
         move |m: Msg| {
             // (the refresh has ended: said on the taskbar when the window is not in front)
-            if matches!(m, Msg::Finished) {
+            if windowed && matches!(m, Msg::Finished) {
                 crate::links::job_ended("recs refresh");
             }
             let _ = tx.send(m);
@@ -366,8 +385,20 @@ pub fn run(cfg: Config, net: Arc<Net>, tx: Sender<Msg>, cancel: Arc<AtomicBool>,
         );
     }
 
-    // 2. Last.fm listening
-    if cfg.has_lastfm() {
+    // 2. listening: the plays given, else Last.fm's history
+    if let Some(plays) = plays {
+        for p in plays {
+            let key = lib.key_for(&p.name);
+            if key.is_empty() {
+                continue;
+            }
+            let st = stats.entry(key.clone()).or_insert_with(|| ArtistStat { key, name: p.name.clone(), ..Default::default() });
+            st.plays_all = p.plays;
+            st.plays_12m = p.plays_12m;
+            st.plays_3m = p.plays_3m;
+            st.plays_recent = p.plays_recent;
+        }
+    } else if cfg.has_lastfm() {
         send(Msg::Status("Reading your Last.fm history…".into()));
         let (u, k) = (cfg.lastfm_user.as_str(), cfg.lastfm_api_key.as_str());
         let periods: [(&str, u32); 3] = [("overall", 1000), ("12month", 500), ("3month", 300)];

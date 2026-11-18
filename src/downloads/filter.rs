@@ -74,7 +74,7 @@ struct Term {
 
 /// What was typed, read once.
 #[derive(Debug, Default, PartialEq)]
-pub(super) struct Filter {
+pub(crate) struct Filter {
     terms: Vec<Term>,
 }
 

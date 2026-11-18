@@ -59,6 +59,22 @@ pub(super) fn snapshot(source: &Path, destination: &Path, stop: &AtomicBool) -> 
     Ok(())
 }
 
+/// A database of a test's own, opened to read and write (made if missing), for the engine's tests of the
+/// snapshot path.
+#[cfg(test)]
+pub(crate) struct TestDb(Db);
+
+#[cfg(test)]
+impl TestDb {
+    pub(crate) fn open(path: &Path) -> TestDb {
+        TestDb(Db::open(path, 2 | 4).expect("a test database opens"))
+    }
+    /// Runs SQL; SQLite's result code (0 when it worked, 19 for a broken constraint).
+    pub(crate) fn exec(&self, sql: &str) -> i32 {
+        unsafe { sqlite3_exec(self.0.0, CString::new(sql).unwrap().as_ptr(), std::ptr::null(), std::ptr::null_mut(), std::ptr::null_mut()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

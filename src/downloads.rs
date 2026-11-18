@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-mod filter;
+pub(crate) mod filter;
 mod page;
 pub use page::PAGE;
 
@@ -39,29 +39,29 @@ enum Setup {
 
 /// The downloads of one folder from one person.
 #[derive(Clone, PartialEq)]
-struct Group {
-    user: String,
-    folder: String,
-    files: usize,
-    done: usize,
-    failed: usize,
+pub(crate) struct Group {
+    pub(crate) user: String,
+    pub(crate) folder: String,
+    pub(crate) files: usize,
+    pub(crate) done: usize,
+    pub(crate) failed: usize,
     /// of the failed ones, how many the other person refused outright
-    refused: usize,
-    bytes: u64,
-    done_bytes: u64,
-    speed: f64,
+    pub(crate) refused: usize,
+    pub(crate) bytes: u64,
+    pub(crate) done_bytes: u64,
+    pub(crate) speed: f64,
     /// every file's id (to remove the rows), and the ones still under way (to cancel)
-    all_ids: Vec<String>,
-    live_ids: Vec<String>,
+    pub(crate) all_ids: Vec<String>,
+    pub(crate) live_ids: Vec<String>,
     /// files that slskd saves in a "CD1" style folder outside the album's own: (that folder, file name)
-    parts: Vec<(String, String, u64)>,
+    pub(crate) parts: Vec<(String, String, u64)>,
 }
 
 impl Group {
-    fn finished(&self) -> bool {
+    pub(crate) fn finished(&self) -> bool {
         self.done + self.failed == self.files
     }
-    fn arrived(&self) -> bool {
+    pub(crate) fn arrived(&self) -> bool {
         self.finished() && self.failed == 0
     }
     fn key(&self) -> (String, String) {
@@ -73,12 +73,12 @@ impl Group {
 }
 
 #[derive(Clone, PartialEq)]
-struct SearchSnap {
-    text: String,
-    complete: bool,
-    answers: u64,
-    candidates: Vec<Candidate>,
-    error: Option<String>,
+pub(crate) struct SearchSnap {
+    pub(crate) text: String,
+    pub(crate) complete: bool,
+    pub(crate) answers: u64,
+    pub(crate) candidates: Vec<Candidate>,
+    pub(crate) error: Option<String>,
     /// the number the page gave this run of the search, so an older run of the same words is not taken for it
     run: u64,
     /// how much of it has ended, 0 to 1: the share of its searches (the looks and the full one) that are in
@@ -86,7 +86,7 @@ struct SearchSnap {
 }
 
 /// What a search needs from the Soulseek client (slskd, or made-up answers in a test run).
-trait Searches {
+pub(crate) trait Searches {
     fn start(&self, id: &str, text: &str, look: slskd::Look) -> Result<(), String>;
     /// (has it ended, how many people have answered so far)
     fn state(&self, id: &str) -> Result<(bool, u64), String>;
@@ -113,16 +113,16 @@ impl Searches for Client {
 /// One search as the page sees it, made of several searches for the same words (`slskd::LOOKS`): short
 /// looks that end early and the full search. The answers of each join the list when it ends, and the list
 /// is ranked over everything known so far. Nothing here can ask for a download.
-struct Staged {
+pub(crate) struct Staged {
     /// each search's id, and whether its answers have been taken (or it failed and is left out)
     parts: Vec<(String, bool)>,
     /// every answer so far, one per person
     responses: Vec<serde_json::Value>,
-    snap: SearchSnap,
+    pub(crate) snap: SearchSnap,
 }
 
 impl Staged {
-    fn start(s: &dyn Searches, text: String) -> Staged {
+    pub(crate) fn start(s: &dyn Searches, text: String) -> Staged {
         let mut parts = vec![];
         let mut error = None;
         for (n, look) in slskd::LOOKS.iter().enumerate() {
@@ -138,7 +138,7 @@ impl Staged {
     }
 
     /// Asks how each search that is still running is doing, and takes the answers of those that have ended.
-    fn poll(&mut self, s: &dyn Searches) {
+    pub(crate) fn poll(&mut self, s: &dyn Searches) {
         if self.snap.complete || self.snap.error.is_some() {
             return;
         }
@@ -173,7 +173,7 @@ impl Staged {
     }
 
     /// Stops and forgets every one of its searches.
-    fn close(self, s: &dyn Searches) {
+    pub(crate) fn close(self, s: &dyn Searches) {
         for (id, _) in &self.parts {
             s.forget(id);
         }
@@ -1158,7 +1158,7 @@ pub(crate) fn size_words(bytes: u64) -> String {
     }
 }
 
-fn group(transfers: &[Transfer]) -> Vec<Group> {
+pub(crate) fn group(transfers: &[Transfer]) -> Vec<Group> {
     let mut out: Vec<Group> = vec![];
     for t in transfers {
         let i = match out.iter().position(|g| g.user == t.user && g.folder == t.folder) {
@@ -1212,7 +1212,7 @@ fn newly_arrived(groups: &[Group], seen: &HashSet<(String, String)>) -> Vec<Stri
 /// Only the files this download brought are moved (another album's "CD1" may be in the same folder), and
 /// only if every one of them is there and none would land on a file that exists: otherwise nothing is
 /// touched. All the names come from a stranger's computer, so each must be exactly one folder level.
-fn gather_discs(downloads: &std::path::Path, album: &str, parts: &[(String, String, u64)]) -> Result<(), String> {
+pub(crate) fn gather_discs(downloads: &std::path::Path, album: &str, parts: &[(String, String, u64)]) -> Result<(), String> {
     use crate::importer::is_folder_name;
     let not_gathered = || format!("The discs of '{album}' are in the downloads folder as they arrived.");
     if !is_folder_name(album) || parts.iter().any(|(disc, file, _)| !slskd::is_disc_folder(disc) || !is_folder_name(disc) || !is_folder_name(file)) {

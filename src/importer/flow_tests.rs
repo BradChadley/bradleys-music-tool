@@ -796,3 +796,22 @@ fn two_long_album_names_that_end_up_one_folder_never_import_at_once() {
     // short names that differ stay apart
     assert_ne!(running_key(&l.ctx, "Test Artist", "Comet"), running_key(&l.ctx, "Test Artist", "Rocket"));
 }
+
+#[test]
+fn a_stopped_import_adds_nothing_and_leaves_no_build_folder() {
+    let mut l = lab("stop");
+    l.ctx.keep_originals = Some(true);
+    let dir = download(&l, "Test Artist - Comet", "Comet", &[(1, "One"), (2, "Two")], 320);
+    let mut u = scan(&l, &dir);
+    // asked to stop before it begins: it stops at the first check, between tracks
+    l.ctx.stop = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)));
+    let said = std::cell::RefCell::new(String::new());
+    let r = import_unit(&l.ctx, &mut u, &|text, _| *said.borrow_mut() = text.to_string(), None, &|| {});
+    assert_eq!(r, ImportResult::Failed);
+    assert!(said.borrow().starts_with("Stopped"), "{}", said.borrow());
+    assert!(std::fs::read_dir(&l.ctx.library).unwrap().next().is_none(), "no album, build folder or artist folder is left");
+    assert!(dir.join("01 One.mp3").exists() && dir.join("02 Two.mp3").exists(), "the download stays");
+    // not stopped: the same import goes through
+    l.ctx.stop = Some(std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)));
+    assert_eq!(import_unit(&l.ctx, &mut u, &|_, _| {}, None, &|| {}), ImportResult::Ok);
+}

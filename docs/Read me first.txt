@@ -5,6 +5,10 @@ A music library tool for Windows 10 and 11 (64-bit): recommendations from what y
 search with an import that tags and files albums for you, a library browser, and a health check that
 finds and repairs damaged files, bad tags and missing covers.
 
+Its tools now live in Cadence, a music player for Windows: Health, Get music, Recs and Backup, in one
+app. This is the last version of the Music Tool. It keeps working as it is but gets no more updates.
+Get Cadence: https://github.com/BradChadley/Cadence-Releases/releases/latest
+
 
 Starting it
 -----------

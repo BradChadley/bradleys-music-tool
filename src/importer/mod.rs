@@ -19,7 +19,7 @@ mod lossless_tests;
 pub(crate) mod lyrics;
 #[cfg(test)]
 mod lyrics_tests;
-mod model;
+pub(crate) mod model;
 pub(crate) mod probe;
 pub(crate) mod quality;
 pub mod recheck;
@@ -366,6 +366,11 @@ impl ImportTab {
         ctx.lyrics.timed = !cfg.lyrics_plain;
         ctx.keep_lossless = cfg.keep_lossless;
         ctx.mp3_quality = cfg.mp3_quality;
+        ctx.save_lyrics = cfg.save_lyrics;
+        // (a download is recycled unless Settings say to keep them; a test run's --keep-originals still counts)
+        if !cfg.recycle_originals {
+            ctx.keep_originals = Some(true);
+        }
         let ctx = Arc::new(ctx);
         quality::load_cache(&ctx.quality_cache);
         unwrap::clean_old(&ctx.work_dir);
@@ -529,7 +534,7 @@ impl ImportTab {
             send(Msg::FactsDone);
             // 3. the pictures (six at once): they come last and hold no fact back
             let read = read.into_inner().unwrap_or_else(|e| e.into_inner());
-            let mut asks: Vec<(usize, Vec<(usize, String, String, f64)>)> = read.iter().map(|(i, u, _)| (*i, scan::lyric_asks(u))).collect();
+            let mut asks: Vec<(usize, Vec<(usize, String, String, f64)>)> = read.iter().map(|(i, u, _)| (*i, if ctx.save_lyrics { scan::lyric_asks(u) } else { vec![] })).collect();
             asks.sort_by_key(|a| a.0);
             let read = std::sync::Mutex::new(read);
             std::thread::scope(|s| {
@@ -635,7 +640,7 @@ impl ImportTab {
                     facts_arrived(&mut self.rows, index, unit.map(|u| *u), self.pointing);
                     // (its songs without lyrics are asked about once the covers are in)
                     if let Some(r) = self.rows.iter_mut().find(|r| r.index == index && r.ready()) {
-                        r.unit.lyrics_pending = self.ctx.lyrics.online && !scan::lyric_asks(&r.unit).is_empty();
+                        r.unit.lyrics_pending = self.ctx.lyrics.online && self.ctx.save_lyrics && !scan::lyric_asks(&r.unit).is_empty();
                     }
                 }
                 Msg::Lyric { scan, index, track, answer } => {

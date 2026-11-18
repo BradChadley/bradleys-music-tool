@@ -84,7 +84,7 @@ fn yaml_unquote(v: &str) -> String {
 }
 
 /// Whether a name and password can be kept and handed to slskd.
-fn check_login(user: &str, pass: &str) -> Result<(), String> {
+pub(crate) fn check_login(user: &str, pass: &str) -> Result<(), String> {
     let bad = |s: &str| s.chars().any(|c| c.is_control());
     if user.trim().is_empty() || pass.is_empty() {
         return Err("Type both a name and a password.".into());
@@ -460,6 +460,8 @@ pub struct Transfer {
     pub done_bytes: u64,
     pub speed: f64,
     pub state: String,
+    /// its place in the other person's line while it waits (0 when not said)
+    pub place: u64,
 }
 
 impl Transfer {
@@ -561,7 +563,7 @@ pub fn candidates(responses: &[Value], query: &str) -> Vec<Candidate> {
             let format = if lossless || rate == 0 { ext.to_uppercase() } else { format!("{} {rate}", ext.to_uppercase()) };
             let lower = name.to_lowercase();
             let mut score = 0i64;
-            score += if free_slot { 1000 } else { 0 };
+            score += if free_slot { FREE_SLOT_WORTH } else { 0 };
             score += if lossless || rate >= 320 { 300 } else if rate >= 256 { 150 } else { 0 };
             score += words.iter().filter(|w| lower.contains(w.as_str())).count() as i64 * 60;
             // a whole album beats a folder holding one or two songs from it
@@ -574,6 +576,21 @@ pub fn candidates(responses: &[Value], query: &str) -> Vec<Candidate> {
     out.sort_by(|a, b| b.score.cmp(&a.score).then(b.speed.cmp(&a.speed)));
     out.truncate(60);
     out
+}
+
+/// The worth `candidates` gives a free upload slot: it lifts a copy that starts now above any that waits.
+pub const FREE_SLOT_WORTH: i64 = 1000;
+
+/// `candidates`, ranked again for Cadence's engine: with `prefer_starts_now` off, a free slot is worth nothing
+/// and copies are ranked on everything else. The order is otherwise the same.
+pub fn rank(mut list: Vec<Candidate>, prefer_starts_now: bool) -> Vec<Candidate> {
+    if !prefer_starts_now {
+        for c in list.iter_mut().filter(|c| c.free_slot) {
+            c.score -= FREE_SLOT_WORTH;
+        }
+        list.sort_by(|a, b| b.score.cmp(&a.score).then(b.speed.cmp(&a.speed)));
+    }
+    list
 }
 
 /// slskd's list of downloads, one entry per file.
@@ -603,6 +620,7 @@ pub fn transfers(v: &Value) -> Vec<Transfer> {
                     done_bytes: n(f, "bytesTransferred"),
                     speed: f.get("averageSpeed").and_then(|x| x.as_f64()).unwrap_or(0.0),
                     state: s(f, "state"),
+                    place: n(f, "placeInQueue"),
                 });
             }
         }
@@ -653,8 +671,10 @@ pub fn new_id() -> String {
 
 // ------------------------------------------------------------------ requests
 
+#[derive(Clone)]
 pub struct Client {
     base: String,
+    port: u16,
     key: String,
     agent: ureq::Agent,
 }
@@ -667,7 +687,7 @@ impl Client {
     /// The client of a slskd started on another web port than its settings file names (see `ports_for_start`).
     pub fn at(set: &Settings, web_port: u16) -> Self {
         let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(15))).http_status_as_error(false).build().into();
-        Client { base: format!("http://127.0.0.1:{web_port}"), key: set.key.clone(), agent }
+        Client { base: format!("http://127.0.0.1:{web_port}"), port: web_port, key: set.key.clone(), agent }
     }
 
     fn finish(res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<(u16, Value), String> {
@@ -689,6 +709,14 @@ impl Client {
     }
     fn delete(&self, path: &str) -> Result<u16, String> {
         Self::finish(self.agent.delete(format!("{}{path}", self.base)).header("X-API-Key", &self.key).call()).map(|r| r.0)
+    }
+
+    /// Whether anything listens on its web port yet. Quick either way: on Windows a request to a port nobody
+    /// listens on takes about two seconds to fail (the connection is tried again), so a client that is still
+    /// starting is looked at this way first.
+    pub fn listening(&self) -> bool {
+        let at = std::net::SocketAddr::from(([127, 0, 0, 1], self.port));
+        std::net::TcpStream::connect_timeout(&at, Duration::from_millis(250)).is_ok()
     }
 
     pub fn server(&self) -> Result<ServerState, String> {
@@ -834,6 +862,21 @@ fn keep_line(line: &str) {
     t.push_back(line);
 }
 
+/// Whether Soulseek turned down the login the latest start of slskd was given, from what slskd wrote: the
+/// Soulseek server says so in so many words ("The server rejected login attempt: INVALIDPASS"). Not seen
+/// against the real server by this project's tests: they run a stand-in.
+pub fn login_refused() -> bool {
+    let t = TAIL.lock().unwrap_or_else(|e| e.into_inner());
+    refused_words(t.iter().map(String::as_str))
+}
+
+fn refused_words<'a>(mut lines: impl Iterator<Item = &'a str>) -> bool {
+    lines.any(|l| {
+        let l = l.to_lowercase();
+        l.contains("rejected login") || l.contains("loginrejected") || l.contains("invalidpass") || l.contains("invalidusername")
+    })
+}
+
 /// Why the latest start of slskd stopped, in words for the page, from what it wrote. None when it said
 /// nothing that tells.
 pub fn why_it_stopped() -> Option<String> {
@@ -867,11 +910,16 @@ fn stopped_words<'a>(lines: impl DoubleEndedIterator<Item = &'a str> + Clone) ->
 /// Starts slskd with no window, saving into `downloads` (see `start_args`), on the ports `ports_for_start`
 /// picks. The caller keeps the handle and stops it when the app closes; the web port is where to reach it.
 pub fn spawn(downloads: Option<&std::path::Path>, set: &Settings) -> Result<(std::process::Child, Ports), String> {
+    spawn_as(downloads, set, crate::secrets::get(crate::secrets::SOULSEEK).as_ref())
+}
+
+/// `spawn` signed in with this login (Cadence's engine tries a new one before it keeps it).
+pub fn spawn_as(downloads: Option<&std::path::Path>, set: &Settings, login: Option<&crate::secrets::Entry>) -> Result<(std::process::Child, Ports), String> {
     let ports = ports_for_start(set);
     if ports.web != set.port || ports.listen != set.listen_port {
         crate::config::log(&format!("soulseek: port {} or {} cannot be used now; starting the client on {} and {}", set.port, set.listen_port, ports.web, ports.listen));
     }
-    let child = spawn_plain(downloads, ports)?;
+    let child = spawn_plain(downloads, ports, login)?;
     tie_to_app(&child);
     crate::config::log(&format!("soulseek: the client was started (process {}, ports {} and {})", child.id(), ports.web, ports.listen));
     Ok((child, ports))
@@ -933,14 +981,14 @@ fn test_no_connect() -> bool {
     test("MUSIC_RECS_DATA") && test("MUSIC_RECS_SLSKD_NO_CONNECT")
 }
 
-fn spawn_plain(downloads: Option<&std::path::Path>, ports: Ports) -> Result<std::process::Child, String> {
+fn spawn_plain(downloads: Option<&std::path::Path>, ports: Ports, login: Option<&crate::secrets::Entry>) -> Result<std::process::Child, String> {
     // never with a settings file that would open slskd up (see `parse_settings`)
     read_settings()?;
     TAIL.lock().unwrap_or_else(|e| e.into_inner()).clear();
     let mut child = std::process::Command::new(exe())
         .args(start_args(&data_dir(), downloads, ports))
         .args(test_no_connect().then_some("--no-connect"))
-        .envs(start_env(crate::secrets::get(crate::secrets::SOULSEEK).as_ref(), session_key(), &crate::secrets::random_hex(24)))
+        .envs(start_env(login, session_key(), &crate::secrets::random_hex(24)))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

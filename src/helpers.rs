@@ -201,14 +201,35 @@ pub fn arrived(h: Helper) -> u64 {
 
 /// Starts fetching a helper, unless it is already being fetched. Returns at once; `state` says how it goes.
 pub fn start(h: Helper, ctx: &egui::Context) {
+    let ctx = ctx.clone();
+    start_with(h, move || ctx.request_repaint());
+}
+
+/// Whether the helper is there to be used, and where: ffmpeg wherever the importer finds it (the PATH, its
+/// own folder, WinGet's), slskd in its own folder only.
+pub fn found(h: Helper) -> Option<PathBuf> {
+    match h {
+        Helper::Ffmpeg => crate::importer::tools::find_tool("ffmpeg").ok().filter(|_| crate::importer::tools::find_tool("ffprobe").is_ok()),
+        Helper::Soulseek => Some(crate::slskd::exe()).filter(|p| p.is_file()),
+    }
+}
+
+/// The name used for it in Cadence's engine conversation ("ffmpeg", "slskd").
+pub fn id(h: Helper) -> &'static str {
+    h.slug()
+}
+
+/// `start` without a window: `changed` is called (at most every 120 ms while bytes arrive, and once at the
+/// end) whenever `state` has something new. Cadence's engine uses this. False when a fetch of this helper
+/// was already going (that one goes on; `changed` is not called for it).
+pub fn start_with(h: Helper, changed: impl Fn() + Send + 'static) -> bool {
     let mut slot = JOBS[h.index()].lock().unwrap_or_else(|e| e.into_inner());
     if slot.as_ref().is_some_and(|j| j.stage.load(Ordering::Relaxed) < 2) {
-        return;
+        return false;
     }
     let j = Arc::new(Job::default());
     *slot = Some(j.clone());
     drop(slot);
-    let ctx = ctx.clone();
     std::thread::spawn(move || {
         let pin = h.pin();
         crate::config::log(&format!("helpers: fetching {} {} from {}", h.slug(), pin.version, pin.url));
@@ -217,7 +238,7 @@ pub fn start(h: Helper, ctx: &egui::Context) {
             let mut at = last.lock().unwrap_or_else(|e| e.into_inner());
             if at.elapsed() >= Duration::from_millis(120) {
                 *at = Instant::now();
-                ctx.request_repaint();
+                changed();
             }
         };
         let got = open(pin.url).and_then(|body| install(h, body, &h.home(), &j, &tick));
@@ -235,8 +256,9 @@ pub fn start(h: Helper, ctx: &egui::Context) {
             }
         }
         j.stage.store(2, Ordering::Relaxed);
-        ctx.request_repaint();
+        changed();
     });
+    true
 }
 
 /// Stops a fetch. What was fetched so far is removed; nothing already in place is touched.

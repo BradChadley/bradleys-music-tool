@@ -43,6 +43,14 @@ use std::time::{Duration, Instant};
 pub const REPO: &str = "https://github.com/BradChadley/bradleys-music-tool";
 pub const KOFI: &str = "https://ko-fi.com/bradchadley";
 pub const CADENCE: &str = "https://github.com/BradChadley/Cadence-Releases";
+
+/// This is the Music Tool's last version: its tools now live in Cadence (`crate::retire`), and no newer
+/// Music Tool will come. The updater does not look for one (nothing is asked of GitHub, now or later) and
+/// says so quietly in Settings: no error, no prompt. A version already fetched and waiting still goes in.
+pub const RETIRED: bool = true;
+
+/// What Settings says in the last version, where it would say how updating stands.
+pub const RETIRED_WORDS: &str = "This is the last version of the Music Tool. Its tools now live in Cadence.";
 /// The public half of the author's signing key: X then Y of a point on P-256, as hex. An update is taken
 /// only when its checksum is signed by the private half (`tools\sign-update.ps1` on the author's PC).
 const PUBLIC_KEY: &str = "65a23585fb97bae6b74c5d67d997da82c962b6b6a699962288a2e0bf75efc6b7abd3123e3c8d8e6a05154860c9344c977e2f10a0cbb993065ba46f58bd8b1685";
@@ -572,6 +580,8 @@ pub enum State {
     Out(String, Why),
     /// the last check or fetch did not work; it is tried again by itself
     Failed,
+    /// the Music Tool's last version: no newer one comes (`RETIRED`), so nothing is looked for
+    Retired,
 }
 
 static STATE: Mutex<State> = Mutex::new(State::Idle);
@@ -661,10 +671,23 @@ pub fn stop_fetch() {
 /// Starts the worker, once the window is up. Nothing here is on the way to opening the window: the first
 /// look is five seconds later.
 pub fn start(ctx: &egui::Context, p: Policy) {
+    start_with(ctx, p, RETIRED);
+}
+
+/// `start`, told whether this is the last version (`RETIRED`; the tests say both). The last version starts
+/// no worker: it never looks for a newer one, so it can neither fail nor ask, and Settings says why. An
+/// update that was already fetched and waits beside the app still shows, and goes in as usual.
+fn start_with(ctx: &egui::Context, p: Policy, retired: bool) {
     // (with every frame, whatever the choice: a first start after a swap says when it is up and working)
     settle(ctx);
     set_policy(p);
     if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    if retired {
+        // (once: `start` is called with every frame)
+        let lying = Places::here().and_then(|p| staged(&p, &trusted_key(), &current()));
+        set(lying.map_or(State::Retired, |m| State::Ready(m.version)));
         return;
     }
     let Some(src) = source() else { return };
@@ -1151,6 +1174,23 @@ mod tests {
     // A key made only for these tests (its private half was thrown away) and what it signed.
     const KEY: &str = "83960de7fda01e71609942c5a27c947c0b8999bb09551467f4cb039b491f5ba376ede663bc5d3cc25568c215427d9f37f80a210eaa9e5cc1fc1b047a9b413ae6";
     const BYTES: &[u8] = b"not a real program, only bytes to sign";
+
+    #[test]
+    fn the_last_version_never_looks_for_another_and_says_so_quietly() {
+        let ctx = egui::Context::default();
+        start_with(&ctx, Policy::Auto, true);
+        assert_eq!(state(), State::Retired);
+        // "Check now", a changed choice and every frame's start: still nothing is looked for, nothing fails
+        check_now();
+        set_policy(Policy::Tell);
+        for _ in 0..3 {
+            start_with(&ctx, Policy::Tell, true);
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(state(), State::Retired);
+        assert!(RETIRED, "this is the Music Tool's last version");
+        assert!(RETIRED_WORDS.contains("last version") && RETIRED_WORDS.contains("Cadence") && !RETIRED_WORDS.contains('\u{2014}'));
+    }
 
     fn signed() -> Manifest {
         Manifest {

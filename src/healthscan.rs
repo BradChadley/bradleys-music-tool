@@ -463,6 +463,24 @@ fn ticks_of(m: &std::fs::Metadata) -> u128 {
     m.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| 621_355_968_000_000_000u128 + d.as_secs() as u128 * 10_000_000 + (d.subsec_nanos() / 100) as u128).unwrap_or(0)
 }
 
+/// The key a check keeps this file's tags under, as the file is now (for readers of the tag cache, such as
+/// Organize's preview).
+pub fn tag_key(file: &Path, m: &std::fs::Metadata) -> String {
+    file_key(&file.to_string_lossy(), m.len(), ticks_of(m))
+}
+
+/// The tags the app's checks have saved for this library (its own check's cache, then the older check's
+/// for files this one has not read), keyed by `tag_key`. Only reads; failed reads are left out.
+pub fn saved_tags(library: &Path) -> HashMap<String, Info> {
+    let cache_dir = crate::config::cache_dir();
+    let id = library_id(&library.to_string_lossy());
+    let mut cache: HashMap<String, Info> = HashMap::new();
+    load_tags(&cache_dir.join(format!("health-tags-{id}.txt")), &mut cache, false);
+    load_tags(&cache_dir.join("library-tags-cache.txt"), &mut cache, true);
+    cache.retain(|_, i| i.ok);
+    cache
+}
+
 fn load_tags(path: &Path, into: &mut HashMap<String, Info>, seed: bool) {
     use std::io::BufRead;
     let Ok(f) = std::fs::File::open(path) else { return };

@@ -1,7 +1,13 @@
 [package]
 name = "bradleys-music-tool"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2024"
+
+# All the logic and every page is the library (src\lib.rs). Two thin programs use it: the Music Tool's window
+# (src\main.rs) and Cadence's hidden engine (src\bin\cadence-engine.rs, see ENGINE-PROTOCOL.md).
+[lib]
+# (the comments hold no examples to run)
+doctest = false
 
 [dependencies]
 # The lighter OpenGL backend ("glow") instead of the default wgpu one: same picture, much less memory at rest.
@@ -14,7 +20,7 @@ ureq = { version = "3.5.1", features = ["json"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp", "gif", "ico"] }
 md5 = "0.7"
 trash = "5"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_IO", "Win32_System_JobObjects", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_Threading", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_System_Memory", "Win32_System_IO", "Win32_System_JobObjects", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_Globalization", "Win32_System_Console"] }
 dirs = "7.0.0"
 chrono = "0.4.45"
 open = "5.4.5"

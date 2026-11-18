@@ -85,7 +85,7 @@ impl Replacement {
         let r = Replacement { dir, was_at: was_at.to_path_buf(), new_at: new_at.to_path_buf(), aside, kept: slot.join(leaf) };
         let batch = serde_json::json!({ "Id": id, "Title": title, "When": now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "Library": library.to_string_lossy() });
         let removed = serde_json::json!({ "Kind": "removed", "Original": r.was_at.to_string_lossy(), "Backup": r.kept.to_string_lossy(), "Aside": r.aside.to_string_lossy(), "Reason": "replaced by a new import" });
-        let written = std::fs::write(r.dir.join("batch.json"), batch.to_string()).and_then(|_| r.append(&format!("{removed}\n")));
+        let written = write_record(&r.dir, &batch).and_then(|_| r.append(&format!("{removed}\n")));
         if let Err(e) = written {
             let _ = std::fs::remove_dir_all(&r.dir); // nothing has moved: leave no half record behind
             return Err(crate::util::plain_err(format!("the undo record couldn't be written, so the old album was not touched: {e}")));
@@ -224,6 +224,56 @@ pub struct BatchInfo {
     pub when: Option<chrono::DateTime<chrono::Local>>,
     pub changes: usize,
     pub undone: bool,
+    /// what made it: "repair", "edit" (Edit details), "organize", "import" (an import that replaced an
+    /// album or tracks) or "restore" (Backup's bring-back). Written by `Batch::begin_kind`; a record from
+    /// before that is told by its title (`kind_of`).
+    pub kind: String,
+    /// the library it was made in (empty in a record that does not say)
+    pub library: String,
+    /// every place in the library it changed, each once (`touched`), read in the same pass as the count
+    pub places: Vec<PathBuf>,
+}
+
+/// What made a batch: the kind written in its record, else told by its title.
+pub fn kind_of(written: &str, title: &str) -> String {
+    if !written.trim().is_empty() {
+        return written.trim().to_lowercase();
+    }
+    let t = title.trim_start().to_lowercase();
+    if t.starts_with("import:") {
+        "import"
+    } else if t.starts_with("backup:") {
+        "restore"
+    } else if t.starts_with("organize") {
+        "organize"
+    } else if t.starts_with("edit details") {
+        "edit"
+    } else {
+        "repair"
+    }
+    .to_string()
+}
+
+/// The places a batch's lines name, each once, in the order they were written.
+fn places_in(list: &[serde_json::Value]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = vec![];
+    for e in list {
+        for k in ["Original", "From", "To", "Path", "File"] {
+            let p = text(e, k);
+            if !p.is_empty() && !out.iter().any(|o| o.as_os_str().eq_ignore_ascii_case(&p)) {
+                out.push(PathBuf::from(p));
+            }
+        }
+    }
+    out
+}
+
+/// The moves inside the library a batch made, oldest first: (from, to).
+pub fn moves(root: &Path, id: &str) -> Vec<(PathBuf, PathBuf)> {
+    if id.is_empty() || id.contains(['\\', '/', ':']) || id.starts_with('.') {
+        return vec![];
+    }
+    entries(&root.join(id)).iter().filter(|e| e["Kind"] == "moved").map(|e| (PathBuf::from(text(e, "From")), PathBuf::from(text(e, "To")))).filter(|(f, t)| !f.as_os_str().is_empty() && !t.as_os_str().is_empty()).collect()
 }
 
 fn text(v: &serde_json::Value, k: &str) -> String {
@@ -234,6 +284,27 @@ fn leaf(p: &Path) -> String {
     p.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
 }
 
+/// Writes a batch's `batch.json` and waits until it is on the disk, with its folder's entry for it, before
+/// the first line of the log is written: after a power cut a batch is never left with its log and a torn or
+/// missing record (which hid it from Repair history, and its Undo with it).
+pub(crate) fn write_record(dir: &Path, record: &serde_json::Value) -> std::io::Result<()> {
+    let mut f = std::fs::File::create(dir.join("batch.json"))?;
+    f.write_all(record.to_string().as_bytes())?;
+    f.sync_all()?;
+    sync_dir(dir);
+    Ok(())
+}
+
+/// Asks Windows to put a folder's entries on the disk (best effort: NTFS journals them anyway, and a folder
+/// that cannot be opened for this is not an error).
+pub(crate) fn sync_dir(dir: &Path) {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    if let Ok(d) = std::fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_BACKUP_SEMANTICS).open(dir) {
+        let _ = d.sync_all();
+    }
+}
+
 fn is_empty_dir(dir: &Path) -> bool {
     std::fs::read_dir(dir).map(|mut d| d.next().is_none()).unwrap_or(false)
 }
@@ -241,6 +312,12 @@ fn is_empty_dir(dir: &Path) -> bool {
 impl Batch {
     /// Starts a batch: its folder and the note of what it is. Nothing in the library has changed yet.
     pub fn begin(root: &Path, library: &Path, title: &str) -> Result<Batch, String> {
+        Batch::begin_kind(root, library, title, "")
+    }
+
+    /// `begin`, with what made the batch written into its record ("edit", "organize", ...; see
+    /// `BatchInfo::kind`). "" writes none, and the kind is then told by the title.
+    pub fn begin_kind(root: &Path, library: &Path, title: &str, kind: &str) -> Result<Batch, String> {
         let now = chrono::Local::now();
         let id = format!("{}-{}", now.format("%Y%m%d-%H%M%S"), rand_hex(6));
         let dir = root.join(&id);
@@ -249,14 +326,40 @@ impl Batch {
         if fresh_root {
             hide(root);
         }
-        let batch = serde_json::json!({ "Id": id, "Title": title, "When": now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "Library": library.to_string_lossy() });
-        std::fs::write(dir.join("batch.json"), batch.to_string()).map_err(|e| crate::util::plain_err(format!("couldn't write the undo record: {e}")))?;
+        let mut batch = serde_json::json!({ "Id": id, "Title": title, "When": now.format("%Y-%m-%dT%H:%M:%S%.6f%:z").to_string(), "Library": library.to_string_lossy() });
+        if !kind.is_empty() {
+            batch["Kind"] = serde_json::Value::String(kind.to_string());
+        }
+        write_record(&dir, &batch).map_err(|e| crate::util::plain_err(format!("couldn't write the undo record: {e}")))?;
         Ok(Batch { id, dir, changes: Default::default() })
     }
 
     /// How many changes the batch has made.
     pub fn changes(&self) -> usize {
         self.changes.get()
+    }
+
+    /// Writes one line to the batch's log and waits until it is on the disk, for a change the caller makes
+    /// right after (Organize's write-ahead journal). If this fails, the caller must change nothing.
+    pub fn journal(&self, entry: serde_json::Value) -> Result<(), String> {
+        let line = format!("{entry}\n");
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join("log.jsonl"))
+            .and_then(|mut f| f.write_all(line.as_bytes()).and_then(|_| f.sync_all()))
+            .map_err(|e| crate::util::plain_err(format!("the undo record couldn't be written, so nothing was changed: {e}")))
+    }
+
+    /// A batch that is already written, to add lines to its log (Organize settling a run that was cut
+    /// off). Never `close` it: it counts no changes of its own.
+    pub fn reopen(dir: &Path) -> Batch {
+        Batch { id: leaf(dir), dir: dir.to_path_buf(), changes: Default::default() }
+    }
+
+    /// Counts one change the caller made after writing it down with `journal`.
+    pub fn count_change(&self) {
+        self.changes.set(self.changes.get() + 1);
     }
 
     /// A batch that changed nothing leaves no record behind.
@@ -389,11 +492,19 @@ pub fn batches(root: &Path) -> Vec<BatchInfo> {
             let dir = e.path();
             let meta: serde_json::Value = serde_json::from_str(std::fs::read_to_string(dir.join("batch.json")).ok()?.trim_start_matches('\u{feff}')).ok()?;
             let id = leaf(&dir);
+            let title = text(&meta, "Title");
+            let kind = kind_of(&text(&meta, "Kind"), &title);
+            let list = entries(&dir);
+            // (an organize batch counts the albums it moved; "done" and "notdone" lines are notes, not changes)
+            let changes = if kind == "organize" { list.iter().filter(|e| e["Kind"] == "done").count() } else { list.iter().filter(|e| e["Kind"] != "done" && e["Kind"] != "notdone").count() };
             Some(BatchInfo {
-                title: text(&meta, "Title"),
+                library: text(&meta, "Library"),
+                places: places_in(&list),
+                title,
                 when: chrono::DateTime::parse_from_rfc3339(&text(&meta, "When")).ok().map(|d| d.with_timezone(&chrono::Local)),
-                changes: entries(&dir).len(),
+                changes,
                 undone: dir.join("undone.txt").exists(),
+                kind,
                 id,
             })
         })
@@ -455,7 +566,7 @@ pub fn to_recycle_bin(dir: &Path) -> Result<(), String> {
 }
 
 /// The lines of a batch's log that can be read, oldest first.
-fn entries(dir: &Path) -> Vec<serde_json::Value> {
+pub(crate) fn entries(dir: &Path) -> Vec<serde_json::Value> {
     let log = std::fs::read(dir.join("log.jsonl")).unwrap_or_default();
     String::from_utf8_lossy(&log).lines().filter_map(|l| serde_json::from_str::<serde_json::Value>(l.trim().trim_start_matches('\u{feff}')).ok()).filter(|v| v.is_object()).collect()
 }
@@ -482,6 +593,15 @@ pub fn touched(root: &Path, id: &str) -> Vec<PathBuf> {
 /// be put back, in plain words; with none, the batch is marked undone. Nothing is deleted: what the repair
 /// put in the library moves into the batch's folder. Safe to run again after being cut off.
 pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
+    undo_except(root, id, &|_| false, &|| false)
+}
+
+/// What an Undo that was stopped part way says: what is back stays back, and running it again finishes.
+pub const STOPPED: &str = "Undo was stopped part way. What was put back stays back; Undo it again to put back the rest.";
+
+/// `undo`, leaving alone every line about a place `skip` names (a file still playing, or a folder holding
+/// it): each is said in what comes back, and the batch is not marked undone, so a later Undo finishes it.
+pub fn undo_except(root: &Path, id: &str, skip: &dyn Fn(&Path) -> bool, stop: &dyn Fn() -> bool) -> Result<Vec<String>, String> {
     if id.is_empty() || id.contains(['\\', '/', ':']) || id.starts_with('.') {
         return Err("That is not a repair.".into());
     }
@@ -508,13 +628,25 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
     };
     let aside = |p: &Path| dir.join(format!("undone-{}-{}", rand_hex(6), leaf(p)));
     let make_parent = |p: &Path| p.parent().map(std::fs::create_dir_all).transpose().map(|_| ());
+    // Organize's moves found not to have happened (a "notdone" line names the step): nothing to put back
+    let not_done: std::collections::HashSet<u64> = list.iter().filter(|e| e["Kind"] == "notdone").filter_map(|e| e["Step"].as_u64()).collect();
     let mut problems = vec![];
     for (n, e) in list.iter().enumerate().rev() {
-        if already.contains(&n) {
+        if already.contains(&n) || (e["Kind"] == "moved" && e["Step"].as_u64().is_some_and(|s| not_done.contains(&s))) {
             continue;
+        }
+        // a stop lands between lines: each line is wholly put back (and written down) or not touched, and
+        // the batch is not marked undone, so a later Undo finishes it
+        if stop() {
+            problems.push(STOPPED.to_string());
+            break;
         }
         let (original, backup) = (PathBuf::from(text(e, "Original")), PathBuf::from(text(e, "Backup")));
         let (from, to, path) = (PathBuf::from(text(e, "From")), PathBuf::from(text(e, "To")), PathBuf::from(text(e, "Path")));
+        if let Some(p) = [&original, &to, &from, &path, &PathBuf::from(text(e, "File"))].into_iter().find(|p| !p.as_os_str().is_empty() && skip(p)) {
+            problems.push(format!("{}: {}", p.display(), crate::guard::STILL_PLAYING));
+            continue;
+        }
         let done: Result<(), String> = match e["Kind"].as_str().unwrap_or("") {
             // a file was swapped for a fixed copy: the fixed copy moves into the batch, the old one returns
             "replaced" => {
@@ -578,6 +710,8 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
             Ok(()) => note_done(n)?,
             Err(why) => problems.push(why),
         }
+        #[cfg(test)]
+        crate::repair::mid_write::here(&dir);
     }
     // marked undone only when everything is back: with something left over, Undo can be run again
     if problems.is_empty() {

@@ -55,16 +55,36 @@ pub struct Ctx {
     /// 320 kbps MP3s: the choice in Settings
     pub keep_lossless: bool,
     pub mp3_quality: crate::import_quality::Mp3Quality,
+    /// lyrics are looked up for the songs that have none (false: none are; a track's own lyrics are kept)
+    pub save_lyrics: bool,
+    /// Some(true): the download is never sent to the Recycle Bin after its album is in; Some(false): it always
+    /// is; None: as `import::KEEP_ORIGINALS` says (the Music Tool's window and its test runs)
+    pub keep_originals: Option<bool>,
+    /// how an imported download goes to the Recycle Bin (a test's is a folder of its own)
+    pub trash: fn(&std::path::Path) -> Result<(), String>,
+    /// set from outside to stop an import: it is checked between tracks and right before the album is put in
+    /// place, and a stopped import removes its build folder and adds nothing (None: it cannot be stopped)
+    pub stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// pending-cleanup.txt is read, changed and rewritten, so one album at a time
+    /// Cadence's engine: the folder compilations (artist "Various Artists") go into (`compilations_folder`)
+    pub compilations_folder: String,
+    /// Cadence's engine, Keep the library organized: a new album goes straight to Artist  Album (Year), never
+    /// onto a shelf or beside the copy it replaces (false: the Music Tool's way)
+    pub keep_organized: bool,
     pending_lock: Mutex<()>,
 }
 
 impl Ctx {
     pub fn new(source: PathBuf, library: PathBuf, no_online: bool, ffmpeg: PathBuf, ffprobe: PathBuf) -> Self {
+        Self::new_in(source, library, no_online, ffmpeg, ffprobe, std::env::temp_dir().join("music-recs-import"))
+    }
+
+    /// `new`, with its scratch folder (conversions, covers being fetched) at `work_dir`. Cadence's engine keeps
+    /// its own in its own folder, never the Music Tool's.
+    pub fn new_in(source: PathBuf, library: PathBuf, no_online: bool, ffmpeg: PathBuf, ffprobe: PathBuf, work_dir: PathBuf) -> Self {
         // the alias list, the import log and the list of leftover downloads are in the app's data folder, the
         // saved audio checks and the uploader signatures in its cache folder
         let data_dir = crate::config::app_dir();
-        let work_dir = std::env::temp_dir().join("music-recs-import");
         let _ = std::fs::create_dir_all(&work_dir);
         let cache_dir = crate::config::cache_dir();
         let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -110,8 +130,14 @@ impl Ctx {
             lyrics: crate::importer::lyrics::Lookup { dir: cache_dir.join("lyrics"), online: !no_online, timed: true, agent: mk(20) },
             keep_lossless: false,
             mp3_quality: Default::default(),
+            save_lyrics: true,
+            keep_originals: None,
+            trash: |p| trash::delete(p).map_err(|e| e.to_string()),
+            stop: None,
             api: mk(20),
             dl: mk(90),
+            compilations_folder: crate::organize::DEFAULT_COMPILATIONS.into(),
+            keep_organized: false,
             pending_lock: Mutex::new(()),
         };
         c.load_aliases();
@@ -119,6 +145,16 @@ impl Ctx {
         // uploader signatures the Health check learned from your library, so new downloads with the same junk get cleaned
         crate::importer::rules::load_signatures(&cache_dir.join("junk-signatures.txt"));
         c
+    }
+
+    /// Whether someone outside asked this import to stop (see `stop`).
+    pub fn stopped(&self) -> bool {
+        self.stop.as_ref().is_some_and(|s| s.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// Whether the download is left where it is after its album is in (see `keep_originals`).
+    pub fn keeps_originals(&self) -> bool {
+        self.keep_originals.unwrap_or_else(|| crate::importer::import::KEEP_ORIGINALS.load(std::sync::atomic::Ordering::Relaxed))
     }
 
     pub fn log(&self, msg: &str) {

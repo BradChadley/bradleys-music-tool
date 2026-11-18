@@ -98,12 +98,12 @@ pub static KEEP_ORIGINALS: std::sync::atomic::AtomicBool = std::sync::atomic::At
 /// Sends the original download to the Recycle Bin. Returns false (and remembers it, with `imported`: the
 /// `inventory_print` of what was imported from it) if Soulseek still has it open.
 pub fn remove_original(ctx: &Ctx, u: &Unit, imported: &str) -> bool {
-    if KEEP_ORIGINALS.load(Ordering::Relaxed) {
+    if ctx.keeps_originals() {
         return true;
     }
     let files: Vec<PathBuf> = if u.is_dir { walk_files(&u.item) } else { vec![u.item.clone()] };
     let key = u.item.to_string_lossy().to_string();
-    if !any_locked(&files) && trash::delete(&u.item).is_ok() {
+    if !any_locked(&files) && (ctx.trash)(&u.item).is_ok() {
         ctx.set_pending(&key, None);
         return true;
     }
@@ -613,20 +613,24 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         report("The artist or album name is empty or can't be a folder name - type a name and import again", 1.0);
         return ImportResult::Failed;
     }
-    let artist_dir = ctx.library.join(&u.artist);
-    u.folder = fitted_folder(ctx, &u.artist, &u.folder);
-    let existing = find_existing_album(ctx, &u.artist, &u.folder);
+    // (a compilation's folder is the compilations folder Settings names; the tags keep "Various Artists")
+    let artist = crate::importer::scan::folder_artist(ctx, &u.artist);
+    if !is_folder_name(&artist) {
+        report("The artist or album name is empty or can't be a folder name - type a name and import again", 1.0);
+        return ImportResult::Failed;
+    }
+    let artist_dir = ctx.library.join(&artist);
+    u.folder = fitted_folder(ctx, &artist, &u.folder);
+    let existing = find_existing_album(ctx, &artist, &u.folder);
     // The album goes beside the copy it replaces (which may be on a shelf, or in a genre folder), else where
-    // this artist keeps such releases, else in the artist's folder.
-    let home = match &existing {
-        Some(e) => e.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| artist_dir.clone()),
-        None => crate::importer::scan::home_for_new(ctx, &u.artist, &u.folder, u.tracks.len()),
-    };
+    // this artist keeps such releases, else in the artist's folder; with Keep the library organized, always
+    // into the artist's folder (see `home_for`).
+    let home = crate::importer::scan::home_for(ctx, &artist, &u.folder, u.tracks.len(), existing.as_deref());
     let final_dir = home.join(&u.folder);
     // the copy this import may replace must be one album folder of this artist, nothing wider, and the place
     // it goes must be inside the library
     let inside = home.starts_with(&ctx.library) && home != ctx.library;
-    if !is_folder_name(&u.folder) || !inside || existing.as_ref().is_some_and(|e| !crate::importer::scan::is_album_of(ctx, &u.artist, e)) {
+    if !is_folder_name(&u.folder) || !inside || existing.as_ref().is_some_and(|e| !crate::importer::scan::is_album_of(ctx, &artist, e)) {
         report("The album's place in the library couldn't be worked out safely - nothing changed", 1.0);
         ctx.log(&format!("REFUSED unsafe destination: {} / {}", u.artist, u.folder));
         return ImportResult::Failed;
@@ -635,7 +639,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     if u.action == Action::Cleanup && existing.is_some() {
         // compared with what was imported from it, not with the rescan: a rescan reads late arrivals as part of it
         let imported = ctx.pending_print(&u.item.to_string_lossy());
-        if !KEEP_ORIGINALS.load(Ordering::Relaxed) && !leftover_is_what_was_imported(ctx, u) {
+        if !ctx.keeps_originals() && !leftover_is_what_was_imported(ctx, u) {
             report("The leftover download holds files that were not imported, so it was left alone. Remove it yourself, or import the new files from it.", 1.0);
             ctx.log(&format!("KEPT leftover (holds files that were not imported): {}", u.item.display()));
             return ImportResult::OkKept;
@@ -709,8 +713,12 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     // Lyrics: LRCLIB is asked now about the songs the list had not got to yet (its answers are kept, so a
     // song is asked about once). Lyrics a file has are never written over, unless they were flagged and the
     // choice was to replace or clean them.
-    let asks: Vec<(usize, String, String, f64)> = crate::importer::scan::lyric_asks(u).into_iter().filter(|a| u.tracks[a.0].lyric_found.is_none()).collect();
+    // (none at all when Settings say not to save lyrics)
+    let asks: Vec<(usize, String, String, f64)> = crate::importer::scan::lyric_asks(u).into_iter().filter(|a| ctx.save_lyrics && u.tracks[a.0].lyric_found.is_none()).collect();
     for (n, (i, artist, title, secs)) in asks.iter().enumerate() {
+        if ctx.stopped() {
+            return stopped_here(ctx, u, &build, &artist_dir, report);
+        }
         if ctx.lyrics.online && ctx.lyrics.known(artist, title, *secs).is_none() {
             report(&format!("Finding lyrics {}/{}...", n + 1, asks.len()), 0.0);
         }
@@ -922,7 +930,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
                 if i + 1 >= jobs.len() {
                     drained.fire(); // the last job is taken: the next album can start
                 }
-                if i >= jobs.len() {
+                if i >= jobs.len() || ctx.stopped() {
                     break;
                 }
                 let _slot = Slot::take(); // one conversion per core across all albums
@@ -946,6 +954,9 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
             report(&format!("{} {}/{}: {}", if r_ok(&results) { "Converting" } else { "FAILED" }, n, total, results.last().unwrap().2), n as f64 / total.max(1) as f64);
         }
     });
+    if ctx.stopped() {
+        return stopped_here(ctx, u, &build, &artist_dir, report);
+    }
 
     // tags on the byte-for-byte copies: one call to the TagLib helper for the whole album
     let mut rewritten: Vec<&Job> = vec![];
@@ -1025,6 +1036,10 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     // from here on the library itself changes: one writer at a time (see `library_lock`), so a Health repair
     // or an Undo never works on what this import is putting in place, nor this import on what they are
     let _held = crate::library_lock::hold();
+    // (the last moment an import can be stopped: after this the album is put in place)
+    if ctx.stopped() {
+        return stopped_here(ctx, u, &build, &artist_dir, report);
+    }
 
     // "Replace only these tracks": the album in the library stays, and only the tracks Health flagged are
     // swapped for the ones just built, each matched by its number and its length
@@ -1036,7 +1051,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
                 crate::replace::done(&ctx.replacements, old);
                 crate::links::folder_changed(old); // Health looks at this artist again
                 ctx.log(&format!("REPLACED {n} track(s) in {} (old files kept in the undo backups)", old.display()));
-                if !KEEP_ORIGINALS.load(Ordering::Relaxed) && !changed_since_scan(u) && remove_original(ctx, u, &scanned_print(u)) {
+                if !ctx.keeps_originals() && !changed_since_scan(u) && remove_original(ctx, u, &scanned_print(u)) {
                     report(&format!("Replaced {n} {} - the rest of the album was left as it is", if n == 1 { "track" } else { "tracks" }), 1.0);
                     ImportResult::Ok
                 } else {
@@ -1110,7 +1125,7 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
         u.format_fixes()
     ));
     // files that arrived after the scan were not imported: never recycle a folder that holds more than was read
-    if !KEEP_ORIGINALS.load(Ordering::Relaxed) && changed_since_scan(u) {
+    if !ctx.keeps_originals() && changed_since_scan(u) {
         report(&format!("{verb} - {cover_note}. The download folder changed after it was scanned (files were added or changed), so it was left in place. Rescan to bring in the rest."), 1.0);
         ctx.log(&format!("KEPT original (changed since scan): {}", u.item.display()));
         return ImportResult::OkKept;
@@ -1122,6 +1137,21 @@ pub fn import_unit(ctx: &Ctx, u: &mut Unit, report: &dyn Fn(&str, f64), cover: O
     report(&format!("{verb} - {cover_note}. Soulseek still has the original open, so it was left in place; Rescan later to remove it."), 1.0);
     ctx.log(&format!("KEPT original (in use): {}", u.item.display()));
     ImportResult::OkKept
+}
+
+/// An import that was asked to stop (`Ctx::stop`): its build folder goes, and the artist's folder too if it is left
+/// empty (this import made it), and nothing is added. The download is left where it is.
+fn stopped_here(ctx: &Ctx, u: &Unit, build: &Path, artist_dir: &Path, report: &dyn Fn(&str, f64)) -> ImportResult {
+    {
+        let _g = ARTIST_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = std::fs::remove_dir_all(build);
+        if std::fs::read_dir(artist_dir).map(|mut d| d.next().is_none()).unwrap_or(false) {
+            let _ = std::fs::remove_dir(artist_dir);
+        }
+    }
+    report("Stopped - nothing added, download left in place", 1.0);
+    ctx.log(&format!("STOPPED {}", u.name));
+    ImportResult::Failed
 }
 
 /// Swaps single tracks of an album in the library for the ones just built from a download. Every track asked

@@ -19,6 +19,8 @@ mod page;
 mod native;
 mod sqlite;
 mod schedule;
+/// What Cadence's engine needs of Backup (`service::backup` calls it).
+pub(crate) mod api;
 
 pub fn run_if_requested() -> Option<i32> { schedule::requested() }
 
@@ -49,6 +51,81 @@ struct Places {
     /// a test run: settings and logs are in the test's own folder, and the worker leaves
     /// Cadence, the music tool's data and the code alone
     test: bool,
+    /// how drives are named and folders are known (Windows itself, or a test's stand-in)
+    disks: Arc<dyn Disks>,
+    /// what is saved beside the music after a backup
+    snapshots: Snapshots,
+    /// where backup history older than 30 days goes (the Recycle Bin)
+    recycle: fn(&Path) -> Result<(), String>,
+    /// started by a nightly task, not by hand: the run says so in its log
+    nightly: bool,
+}
+
+impl Places {
+    /// The Music Tool's places: Windows' own drives, its three snapshots, the real Recycle Bin.
+    fn new(config: PathBuf, logs: PathBuf, test: bool) -> Places {
+        Places { config, logs, test, disks: Arc::new(RealDisks), snapshots: Snapshots::MusicTool, recycle: |p| trash::delete(p).map_err(|e| crate::util::plain_err(e.to_string())), nightly: false }
+    }
+}
+
+/// What a backup saves beside the music, in folders of their own at the top of the backup.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Snapshots {
+    /// the Music Tool's backup: Cadence's data, the Music Tool's own data, and the code (`_Cadence`,
+    /// `_MusicTool`, `_Code`)
+    MusicTool,
+    /// Cadence's engine: only Cadence's own data folder, its databases through SQLite's online snapshot
+    Cadence(PathBuf),
+    /// nothing beside the music
+    Nothing,
+}
+
+/// What a backup reads of the drives. Windows itself (`RealDisks`), or a test's stand-in, so a test can be
+/// "a different disk at the same letter" without a second disk.
+pub(crate) trait Disks: Send + Sync {
+    /// The name of the disk at `root` ("D:\"), or None when no disk is there.
+    fn label(&self, root: &str) -> Option<String>;
+    /// A folder's identity: its volume's serial number and its file ID.
+    fn dir_id(&self, path: &Path) -> Result<String, String>;
+    /// The roots of the drives that are there now ("C:\", ...).
+    fn roots(&self) -> Vec<String>;
+    /// Whether the drive at `root` can be pulled out.
+    fn removable(&self, root: &str) -> bool;
+    /// Whether the drive at `root` is one a backup may go to: a disk in this PC or one plugged in (not a
+    /// network drive, not a CD).
+    fn usable(&self, root: &str) -> bool;
+    /// Free and total bytes on the drive that holds `path`.
+    fn space(&self, path: &str) -> Option<(u64, u64)>;
+    /// Asks Windows to let go of the drive that holds `folder`; Ok only once it is really gone.
+    fn eject(&self, folder: &str) -> Result<(), String>;
+}
+
+/// Windows' own drives.
+pub(crate) struct RealDisks;
+
+impl Disks for RealDisks {
+    fn label(&self, root: &str) -> Option<String> {
+        volume_label(root)
+    }
+    fn dir_id(&self, path: &Path) -> Result<String, String> {
+        native::directory_id(path)
+    }
+    fn roots(&self) -> Vec<String> {
+        drive_roots()
+    }
+    fn removable(&self, root: &str) -> bool {
+        can_eject(root, false)
+    }
+    fn usable(&self, root: &str) -> bool {
+        // DRIVE_REMOVABLE (2) or DRIVE_FIXED (3)
+        matches!(unsafe { windows_sys::Win32::Storage::FileSystem::GetDriveTypeW(wide(root).as_ptr()) }, 2 | 3)
+    }
+    fn space(&self, path: &str) -> Option<(u64, u64)> {
+        disk_space(path)
+    }
+    fn eject(&self, folder: &str) -> Result<(), String> {
+        eject(folder, false)
+    }
 }
 
 /// Existing backups keep their settings and logs in their original folder. A test run (`MUSIC_RECS_DATA` set) has its
@@ -64,22 +141,22 @@ fn places_for(tool: &Path, data: Option<std::ffi::OsString>) -> Places {
     match data.filter(|d| !d.is_empty()) {
         Some(d) => {
             let base = PathBuf::from(d).join("backup");
-            Places { config: base.join("config.json"), logs: base.join("logs"), test: true }
+            Places::new(base.join("config.json"), base.join("logs"), true)
         }
-        None => Places { config: tool.join("config.json"), logs: tool.join("logs"), test: false },
+        None => Places::new(tool.join("config.json"), tool.join("logs"), false),
     }
 }
 
 /// Which of the two backups: the main one (the nightly task's) or the second, on a drive plugged in by hand.
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
-enum Which {
+pub(crate) enum Which {
     #[default]
     Main,
     Second,
 }
 
 impl Which {
-    fn log_name(self) -> &'static str {
+    pub(crate) fn log_name(self) -> &'static str {
         match self {
             Which::Main => "backup-log.txt",
             Which::Second => "backup-log-second.txt",
@@ -149,6 +226,8 @@ struct Run {
     part_problems: Vec<(Part, String)>,
     /// the header said "(second backup)"
     second: bool,
+    /// started by a nightly task ("Started by the nightly task."), not by hand
+    nightly: bool,
     /// old copies of changed files moved to `_changed` before the new ones were copied
     kept_old: Option<u64>,
     /// old copies that could not be kept and were replaced
@@ -380,6 +459,9 @@ fn parse_stamp(s: &str) -> Option<NaiveDateTime> {
 }
 
 /// Reads the script's summary text (its log, or what it printed) into runs, oldest first.
+/// The line a run started by a nightly task writes right under its header.
+pub(crate) const NIGHTLY_LINE: &str = "Started by the nightly task.";
+
 fn parse_runs(text: &str) -> Vec<Run> {
     #[derive(PartialEq)]
     enum List {
@@ -470,6 +552,8 @@ fn parse_runs(text: &str) -> Vec<Run> {
             // "Data (C:\...): robocopy code 16 (details: C:\...\robocopy_x.txt)": the details are in the log
             let what = what.split(" (details: ").next().unwrap_or(what).trim();
             run.part_problems.push((part.unwrap_or(Part::LegacyPlayer), what.to_string()));
+        } else if line.starts_with(NIGHTLY_LINE) {
+            run.nightly = true;
         } else if line.starts_with("Backing up ") {
             run.second = line.ends_with("(second backup)");
         } else if let Some(c) = rx.kept_old.captures(line) {
@@ -918,8 +1002,13 @@ fn read_tail(path: &Path, max: u64) -> Option<String> {
 }
 
 fn query_task() -> Task {
+    query_task_named(TASK_NAME)
+}
+
+/// A task of Task Scheduler, by its name, as `query_task` reads the Music Tool's. Only reads.
+fn query_task_named(name: &str) -> Task {
     let out = Command::new("schtasks")
-        .args(["/query", "/tn", TASK_NAME, "/fo", "LIST", "/v"])
+        .args(["/query", "/tn", name, "/fo", "LIST", "/v"])
         .stdin(Stdio::null())
         .creation_flags(NO_WINDOW)
         .output();
@@ -953,7 +1042,7 @@ fn query_task() -> Task {
     };
     let status = field("Status");
     Task::Found {
-        native: field("Task To Run").contains("--backup-run"),
+        native: field("Task To Run").contains("--backup-run") || field("Task To Run").contains("--backup-nightly"),
         enabled: !field("Scheduled Task State").eq_ignore_ascii_case("Disabled"),
         running: status.eq_ignore_ascii_case("Running"),
         schedule,
@@ -1139,7 +1228,22 @@ fn still_different(library: &Path, backup: &Path, rels: &[String]) -> Vec<String
 /// history can put it back. The file that comes in keeps the copy's date (so the next backup has nothing
 /// to copy), is compared with the copy before it takes the damaged file's place, and is listened to again so
 /// that Health's saved result is the new file's. Nothing in the backup is changed.
-fn bring_back(library: &Path, backup: &Path, undo_root: &Path, rels: &[String], ffmpeg: &Path, ffprobe: &Path) -> Result<crate::repair::Done, String> {
+///
+/// `tools` (ffmpeg, ffprobe) listens to each file that came in; without them that is left to the next check.
+/// `kind` is written into the batch's record ("" lets the title tell it: "Backup:" is a restore). `vet` is
+/// asked about each library file right before it is swapped (Cadence's guard: read-only, open, playing);
+/// its Err leaves that file alone, said in `problems`. `stopped` ends the run between files.
+#[allow(clippy::too_many_arguments)]
+fn bring_back(
+    library: &Path,
+    backup: &Path,
+    undo_root: &Path,
+    rels: &[String],
+    tools: Option<(&Path, &Path)>,
+    kind: &str,
+    vet: &mut dyn FnMut(&Path) -> Result<(), String>,
+    stopped: &dyn Fn() -> bool,
+) -> Result<crate::repair::Done, String> {
     let mut done = crate::repair::Done::default();
     // what can be brought back at all (the record's title says how many)
     let mut pairs: Vec<(&String, PathBuf, PathBuf)> = vec![];
@@ -1155,17 +1259,30 @@ fn bring_back(library: &Path, backup: &Path, undo_root: &Path, rels: &[String], 
         return Ok(done);
     }
     let title = format!("Backup: brought back {} the library had damaged", if pairs.len() == 1 { "1 file".to_string() } else { format!("{} files", pairs.len()) });
-    // one writer to the library at a time (see `library_lock`): an import or a repair waits until these are back
-    let _held = crate::library_lock::hold();
-    let batch = crate::undo::Batch::begin(undo_root, library, &title)?;
+    // One writer to the library at a time (see `library_lock`), but only around each swap: the wait for a
+    // playing file, the copy out of the backup and the listening afterwards happen with the library free, so
+    // an import or a repair is never held up for the whole run. The damaged file must still be what it was
+    // before its copy was made when the copy takes its place.
+    let batch = crate::undo::Batch::begin_kind(undo_root, library, &title, kind)?;
     for (n, (rel, original, source)) in pairs.into_iter().enumerate() {
+        if stopped() {
+            break;
+        }
         let said = (|| -> Result<PathBuf, String> {
+            vet(&original)?;
+            let was = std::fs::metadata(&original).map(|m| (m.len(), m.modified().ok())).map_err(|_| "it is no longer in the library".to_string())?;
+            #[cfg(test)]
+            test_pause::copying(&original);
             let copy = batch.dir.join("work").join(format!("back-{n}")).join(original.file_name().unwrap_or_default());
             copy.parent().map(std::fs::create_dir_all).transpose().and_then(|_| std::fs::copy(&source, &copy)).map_err(|e| crate::util::plain_err(format!("it could not be copied from the backup: {e}")))?;
             if !same_bytes(&source, &copy) {
                 return Err("what was copied from the backup is not the same as the copy there, so nothing was changed".into());
             }
             let date = std::fs::metadata(&source).and_then(|m| m.modified()).map_err(|e| crate::util::plain_err(format!("the copy's date could not be read: {e}")))?;
+            let _held = crate::library_lock::hold();
+            if std::fs::metadata(&original).map(|m| (m.len(), m.modified().ok())).ok() != Some(was) {
+                return Err("it was changed by something else (an import, a repair, or another program) while its copy was brought out of the backup, so it was left as it is now".into());
+            }
             batch.replaced(&original, &copy, "this file was damaged and its copy in the backup is sound")?;
             // the copy's own date (the swap stamps a fresh one), so the library's file and its copy agree and
             // the next backup copies nothing. Not being able to set it only costs one more copy.
@@ -1175,8 +1292,10 @@ fn bring_back(library: &Path, backup: &Path, undo_root: &Path, rels: &[String], 
         match said {
             Ok(original) => {
                 done.changed += 1;
-                let length = crate::healthscan::probe(ffprobe, &original).duration;
-                crate::importer::quality::recheck(ffmpeg, &original, length);
+                if let Some((ffmpeg, ffprobe)) = tools {
+                    let length = crate::healthscan::probe(ffprobe, &original).duration;
+                    crate::importer::quality::recheck(ffmpeg, &original, length);
+                }
                 crate::links::folder_changed(&original); // Health looks at its folder again
             }
             Err(why) => done.problems.push(format!("{rel}: {why}")),
@@ -1187,6 +1306,25 @@ fn bring_back(library: &Path, backup: &Path, undo_root: &Path, rels: &[String], 
     }
     batch.close();
     Ok(done)
+}
+
+/// Tests: holds a bring-back while it copies, so a test can show the library is free meanwhile.
+#[cfg(test)]
+pub(crate) mod test_pause {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Barrier, Mutex};
+    /// (a file in this library, the barrier it waits at once it is copying, the one that lets it go on)
+    pub(crate) static AT_COPY: Mutex<Vec<(PathBuf, Arc<Barrier>, Arc<Barrier>)>> = Mutex::new(vec![]);
+    pub(super) fn copying(file: &Path) {
+        let gate = {
+            let mut at = AT_COPY.lock().unwrap();
+            at.iter().position(|(lib, _, _)| file.starts_with(lib)).map(|i| at.remove(i))
+        };
+        if let Some((_, reached, go_on)) = gate {
+            reached.wait();
+            go_on.wait();
+        }
+    }
 }
 
 // ------------------------------------------------------------------ what needs a look
@@ -1816,7 +1954,7 @@ impl BackupPage {
                     let _backup_lock = native::RunLock::take(&bk)?;
                     native::validate_binding(&places(), which, &lib, &bk)?;
                     let ffprobe = crate::importer::tools::find_tool("ffprobe")?;
-                    let done = bring_back(&lib, &bk, &crate::repair::backups_root(&lib), &copy_sound, &ffmpeg, &ffprobe);
+                    let done = bring_back(&lib, &bk, &crate::repair::backups_root(&lib), &copy_sound, Some((&ffmpeg, &ffprobe)), "", &mut |_| Ok(()), &|| false);
                     // what was heard of the files that came in takes the place of the saved results
                     crate::importer::quality::save_cache(&crate::config::cache_dir().join("quality-cache.txt"));
                     done
@@ -2629,6 +2767,39 @@ Log: C:\\x\\backup-log.txt
     }
 
     #[test]
+    fn bringing_back_leaves_the_library_free_while_it_copies_and_catches_a_change_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("music-recs-bring-free-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
+        let (lib, bk, undo) = (dir.join("lib"), dir.join("bk"), dir.join("undo"));
+        let rel = r"A\Rocket (2020)\01 One.mp3";
+        std::fs::create_dir_all(lib.join(r"A\Rocket (2020)")).unwrap();
+        std::fs::create_dir_all(bk.join(r"A\Rocket (2020)")).unwrap();
+        std::fs::write(lib.join(rel), b"the damaged file").unwrap();
+        std::fs::write(bk.join(rel), b"the sound copy of it").unwrap();
+        let (reached, go_on) = (Arc::new(std::sync::Barrier::new(2)), Arc::new(std::sync::Barrier::new(2)));
+        test_pause::AT_COPY.lock().unwrap().push((lib.clone(), reached.clone(), go_on.clone()));
+        let run = {
+            let (lib, bk, undo) = (lib.clone(), bk.clone(), undo.clone());
+            std::thread::spawn(move || bring_back(&lib, &bk, &undo, &[rel.to_string()], None, "", &mut |_| Ok(()), &|| false))
+        };
+        reached.wait();
+        // it is copying now: another writer (a repair's step, an import) gets the library at once
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            let _held = crate::library_lock::hold();
+            let _ = tx.send(());
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(), "the library was held through the copy");
+        // and changes the file meanwhile: the copy does not take its place
+        std::fs::write(lib.join(rel), b"repaired by someone else meanwhile").unwrap();
+        go_on.wait();
+        let done = run.join().unwrap().unwrap();
+        assert_eq!(done.changed, 0, "{:?}", done.problems);
+        assert!(done.problems[0].contains("changed by something else"), "{:?}", done.problems);
+        assert_eq!(std::fs::read(lib.join(rel)).unwrap(), b"repaired by someone else meanwhile");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_damaged_library_file_comes_back_from_the_backup_and_undo_returns_it() {
         let (ffmpeg, ffprobe) = (crate::importer::tools::find_tool("ffmpeg").unwrap(), crate::importer::tools::find_tool("ffprobe").unwrap());
         let dir = std::env::temp_dir().join(format!("music-recs-pairs-{}-{:x}", std::process::id(), crate::importer::scan::rand_id()));
@@ -2662,7 +2833,7 @@ Log: C:\\x\\backup-log.txt
         assert_eq!(judge_pair(&ffmpeg, &ffprobe, &lib.join("nothing.mp3"), &in_bk), Sound::Gone);
 
         // the sound copy comes back; a path outside the library and a file with no copy are refused
-        let done = bring_back(&lib, &bk, &undo, &[rel.to_string(), r"..\outside.mp3".to_string(), r"A\Rocket (2020)\gone.mp3".to_string()], &ffmpeg, &ffprobe).unwrap();
+        let done = bring_back(&lib, &bk, &undo, &[rel.to_string(), r"..\outside.mp3".to_string(), r"A\Rocket (2020)\gone.mp3".to_string()], Some((&ffmpeg, &ffprobe)), "", &mut |_| Ok(()), &|| false).unwrap();
         assert_eq!((done.changed, done.problems.len()), (1, 2), "{:?}", done.problems);
         assert!(std::fs::read(&in_lib).unwrap() == sound, "the library's file is the backup's copy now");
         assert!(std::fs::read(&in_bk).unwrap() == sound, "the backup is untouched");

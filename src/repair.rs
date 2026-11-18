@@ -73,7 +73,7 @@ pub struct TagStep {
     pub reason: String,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum Step {
     Remove { path: PathBuf, reason: String },
     Move { from: PathBuf, to: PathBuf, reason: String },
@@ -107,6 +107,17 @@ pub struct Plan {
     pub steps: Vec<Step>,
     /// what will not be done, and why, in plain words
     pub problems: Vec<String>,
+    /// the problems that are about one file or folder, with its full path and the why alone (each is also
+    /// in `problems`, as "<name>: why"): two files of one name in different folders are told apart
+    pub about: Vec<(PathBuf, String)>,
+}
+
+impl Plan {
+    /// A problem about one file or folder: in `problems` as "<name>: why", and in `about` with its path.
+    pub fn problem_with(&mut self, what: &Path, why: String) {
+        self.problems.push(format!("{}: {why}", leaf(what)));
+        self.about.push((what.to_path_buf(), why));
+    }
 }
 
 #[derive(Default, Debug)]
@@ -115,6 +126,16 @@ pub struct Done {
     pub batch: Option<String>,
     pub changed: usize,
     pub problems: Vec<String>,
+    /// as `Plan::about`: the problems about one file or folder, with its full path
+    pub about: Vec<(PathBuf, String)>,
+}
+
+impl Done {
+    /// A problem about one file or folder (see `Plan::problem_with`).
+    pub fn problem_with(&mut self, what: &Path, why: String) {
+        self.problems.push(format!("{}: {why}", leaf(what)));
+        self.about.push((what.to_path_buf(), why));
+    }
 }
 
 /// Whether the app can do this kind of repair itself.
@@ -719,29 +740,43 @@ fn why_not_remove(path: &Path, cat: &str) -> Option<String> {
 /// Carries a plan out, each step through the journal. A step that cannot be done is left undone and said;
 /// the others still happen. Each thing is looked at once more just before it is changed.
 pub fn apply(plan: &Plan, title: &str, library: &Path, root: &Path, tools: &Tools) -> Result<Done, String> {
-    let mut done = Done { problems: plan.problems.clone(), ..Default::default() };
     if plan.steps.is_empty() {
-        return Ok(done);
+        return Ok(Done { problems: plan.problems.clone(), ..Default::default() });
     }
-    let batch = Batch::begin(root, library, title)?;
-    apply_into(&batch, plan, library, tools, &mut done);
-    done.changed = batch.changes();
-    done.batch = (done.changed > 0).then(|| batch.id.clone());
-    batch.close();
-    Ok(done)
+    let mut once = Some(Plan { steps: plan.steps.clone(), problems: plan.problems.clone(), about: plan.about.clone() });
+    apply_each(1, title, "", library, root, tools, |_| once.take(), |_, _| true)
 }
 
 /// "Fix all": the same repair for many findings, one after the other, in one batch (one line in Repair
 /// history, one Undo). `each` is called after every finding with (its place in the list, whether all of it
 /// was done) and says whether to go on. Returns what happened in all.
-pub fn apply_all(asks: &[Ask], title: &str, library: &Path, root: &Path, tools: &Tools, mut each: impl FnMut(usize, bool) -> bool) -> Result<Done, String> {
-    let batch = Batch::begin(root, library, title)?;
+pub fn apply_all(asks: &[Ask], title: &str, library: &Path, root: &Path, tools: &Tools, each: impl FnMut(usize, bool) -> bool) -> Result<Done, String> {
+    apply_each(asks.len(), title, "", library, root, tools, |n| Some(plan(&asks[n], library, tools)), each)
+}
+
+/// The one way plans are carried out, in one batch (`kind` is written into its record; see
+/// `undo::Batch::begin_kind`). `next(n)` gives the plan of the n-th of `count` findings just before it is
+/// carried out (planned then, so it sees the library as it is; Cadence's engine also runs its guard there,
+/// and may leave steps out with their problems said), or None to stop before it. `each` is called after
+/// every finding with (its place, whether all of it was done) and says whether to go on. A batch that
+/// changed nothing leaves no record.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_each(count: usize, title: &str, kind: &str, library: &Path, root: &Path, tools: &Tools, next: impl FnMut(usize) -> Option<Plan>, each: impl FnMut(usize, bool) -> bool) -> Result<Done, String> {
+    apply_each_until(count, title, kind, library, root, tools, next, each, &|| false)
+}
+
+/// `apply_each`, ending early once `stop` says so: between findings, between the steps of one, and between
+/// the few files the tag editor is given at a time. What was done is one consistent batch with its Undo.
+#[allow(clippy::too_many_arguments)]
+pub fn apply_each_until(count: usize, title: &str, kind: &str, library: &Path, root: &Path, tools: &Tools, mut next: impl FnMut(usize) -> Option<Plan>, mut each: impl FnMut(usize, bool) -> bool, stop: &dyn Fn() -> bool) -> Result<Done, String> {
+    let batch = Batch::begin_kind(root, library, title, kind)?;
     let mut done = Done::default();
-    for (n, ask) in asks.iter().enumerate() {
-        let plan = plan(ask, library, tools);
+    for n in 0..count {
+        let Some(plan) = next(n) else { break };
         let before = done.problems.len();
         done.problems.extend(plan.problems.iter().cloned());
-        apply_into(&batch, &plan, library, tools, &mut done);
+        done.about.extend(plan.about.iter().cloned());
+        apply_into(&batch, &plan, library, tools, &mut done, stop);
         if !each(n, done.problems.len() == before) {
             break;
         }
@@ -752,13 +787,78 @@ pub fn apply_all(asks: &[Ask], title: &str, library: &Path, root: &Path, tools: 
     Ok(done)
 }
 
+impl Step {
+    /// The file or folder in the library this step changes (for a move, where it is now).
+    pub fn target(&self) -> &Path {
+        match self {
+            Step::Remove { path, .. } => path,
+            Step::Move { from, .. } => from,
+            Step::Tags(t) => &t.file,
+            Step::Create { path, .. } => path,
+            Step::Unwrap { file, .. } => file,
+        }
+    }
+    /// What the step does, in a few plain words (for `repair.plan`).
+    pub fn words(&self) -> String {
+        match self {
+            Step::Remove { path, .. } => format!("Move {} into the undo backups", leaf(path)),
+            Step::Move { from, to, .. } => format!("Move {} to {}", leaf(from), to.parent().map(|p| p.display().to_string()).unwrap_or_default()),
+            Step::Tags(t) => {
+                let mut what: Vec<String> = t.set.iter().map(|(k, v)| if v.is_empty() { format!("clear the {}", k.replace('_', " ")) } else { format!("set the {} to {v}", k.replace('_', " ")) }).collect();
+                if !t.junk.is_empty() {
+                    what.push("take out the junk".into());
+                }
+                if t.cover.is_some() {
+                    what.push("add the cover".into());
+                }
+                if t.vbr {
+                    what.push("add the length header".into());
+                }
+                if t.lyrics.is_some() || t.lyrics_mode == "clear" || t.unhide {
+                    what.push("change the lyrics".into());
+                }
+                if what.is_empty() {
+                    what.push("rewrite the tags".into());
+                }
+                let what = what.join(", ");
+                let mut c = what.chars();
+                let what = c.next().map(|f| f.to_uppercase().chain(c).collect::<String>()).unwrap_or_default();
+                format!("{what} in {}", leaf(&t.file))
+            }
+            Step::Create { path, .. } => format!("Save {}", leaf(path)),
+            Step::Unwrap { file, .. } => format!("Make {} a plain MP3", leaf(file)),
+        }
+    }
+}
+
 /// Undoes a repair (see `undo::undo`). Lyrics that a repair changed without keeping the old file are put
 /// back first, through the tag editor, from the words the undo record holds: each file only if its lyrics
 /// are still what the repair wrote (lyrics changed since then are somebody's later work, and stay). What
 /// comes back is what could not be undone, and which lyrics were left alone because they had changed.
 pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
+    undo_except(root, id, &|_| false, &|| false)
+}
+
+/// `undo`, leaving alone every change to a place `skip` names (the file the player still had loaded at the
+/// end of Cadence's wait, or a folder holding it): each is said, and the batch is not marked undone, so Undo
+/// can be run again for them later.
+pub fn undo_except(root: &Path, id: &str, skip: &dyn Fn(&Path) -> bool, stop: &dyn Fn() -> bool) -> Result<Vec<String>, String> {
     let lines = crate::undo::lyric_lines(root, id)?;
     let mut notes = vec![];
+    let mut skipped = vec![];
+    let lines: Vec<_> = lines
+        .into_iter()
+        .filter(|(file, _, _)| {
+            let playing = skip(file);
+            if playing {
+                skipped.push(format!("{}: {}", file.display(), crate::guard::STILL_PLAYING));
+            }
+            !playing
+        })
+        .collect();
+    if !skipped.is_empty() {
+        return Ok(skipped);
+    }
     if !lines.is_empty() {
         let ffmpeg = tools::find_tool("ffmpeg")?;
         let work = root.join(id).join("undo-work");
@@ -808,7 +908,10 @@ pub fn undo(root: &Path, id: &str) -> Result<Vec<String>, String> {
             return Ok(problems); // not marked undone: Undo can be run again for what is left
         }
     }
-    let mut left = crate::undo::undo(root, id)?;
+    if stop() {
+        return Ok(vec![crate::undo::STOPPED.to_string()]);
+    }
+    let mut left = crate::undo::undo_except(root, id, skip, stop)?;
     left.extend(notes);
     Ok(left)
 }
@@ -863,11 +966,18 @@ fn unwrapped(bytes: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// Carries one plan's steps out in a batch that is already open.
-fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &mut Done) {
+/// How many files the tag editor is given at a time; a stop lands between such groups.
+const TAG_CHUNK: usize = 4;
+
+fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &mut Done, stop: &dyn Fn() -> bool) {
     // each step looks at what it changes and changes it with the library held, so nothing (an import, an
     // Undo) can change it in between
     let held = crate::library_lock::hold();
     for step in &plan.steps {
+        // a stop lands between steps; each step is wholly done or not at all
+        if stop() {
+            break;
+        }
         let said = match step {
             Step::Remove { path, reason } => {
                 if !path.exists() {
@@ -923,7 +1033,7 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
                 Step::Create { path, .. } => path,
                 Step::Unwrap { file, .. } => file,
             };
-            done.problems.push(format!("{}: {why}", leaf(what)));
+            done.problem_with(what, why);
         }
     }
     drop(held);
@@ -933,36 +1043,45 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
     let tag_steps: Vec<&TagStep> = plan.steps.iter().filter_map(|s| if let Step::Tags(t) = s { Some(t) } else { None }).collect();
     if !tag_steps.is_empty() {
         let work = batch.dir.join("work");
-        let mut items: Vec<(PathBuf, &TagStep)> = vec![];
-        let mut snaps: HashMap<String, crate::library_lock::Snapshot> = HashMap::new();
-        for (n, t) in tag_steps.iter().enumerate() {
-            let why = if !t.file.is_file() {
-                Some("it is no longer there".to_string())
-            } else if locked(&t.file) {
-                Some("it is open in another program".to_string())
-            } else {
-                let copy = work.join(n.to_string()).join(leaf(&t.file));
-                match std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| crate::library_lock::copy_with_snapshot(&t.file, &copy)) {
-                    Ok(snap) => {
-                        snaps.insert(copy.to_string_lossy().to_lowercase(), snap);
-                        items.push((copy, t));
-                        None
-                    }
-                    Err(e) => Some(crate::util::plain_err(format!("a working copy could not be made: {e}"))),
-                }
-            };
-            if let Some(why) = why {
-                done.problems.push(format!("{}: {why}", leaf(&t.file)));
-            }
+        if let Some(cache) = &tools.quality_cache {
+            quality::load_cache(cache);
         }
-        if !items.is_empty() {
-            if let Some(cache) = &tools.quality_cache {
-                quality::load_cache(cache);
+        // a few files at a time (the editor works on them side by side), so a stop lands after the files in
+        // hand: each of them is wholly saved or wholly as it was, and the rest are not touched
+        for (c, chunk) in tag_steps.chunks(TAG_CHUNK).enumerate() {
+            if stop() {
+                break;
+            }
+            let mut items: Vec<(PathBuf, &TagStep)> = vec![];
+            let mut snaps: HashMap<String, crate::library_lock::Snapshot> = HashMap::new();
+            for (i, t) in chunk.iter().enumerate() {
+                let n = c * TAG_CHUNK + i;
+                let why = if !t.file.is_file() {
+                    Some("it is no longer there".to_string())
+                } else if locked(&t.file) {
+                    Some("it is open in another program".to_string())
+                } else {
+                    let copy = work.join(n.to_string()).join(leaf(&t.file));
+                    match std::fs::create_dir_all(copy.parent().unwrap_or(&work)).and_then(|_| crate::library_lock::copy_with_snapshot(&t.file, &copy)) {
+                        Ok(snap) => {
+                            snaps.insert(copy.to_string_lossy().to_lowercase(), snap);
+                            items.push((copy, *t));
+                            None
+                        }
+                        Err(e) => Some(crate::util::plain_err(format!("a working copy could not be made: {e}"))),
+                    }
+                };
+                if let Some(why) = why {
+                    done.problem_with(&t.file, why);
+                }
+            }
+            if items.is_empty() {
+                continue;
             }
             let said = run_tag_editor(&items, &tools.ffmpeg);
             #[cfg(test)]
             test_pause::after_tags();
-            let _held = crate::library_lock::hold();
+            let held = crate::library_lock::hold();
             for (copy, t) in &items {
                 let key = copy.to_string_lossy().to_lowercase();
                 match said.get(&key) {
@@ -974,17 +1093,20 @@ fn apply_into(batch: &Batch, plan: &Plan, library: &Path, tools: &Tools, done: &
                         });
                         match swapped {
                             Ok(()) => quality::carry(heard, &t.file), // the audio is the same, so what was heard stands
-                            Err(why) => done.problems.push(format!("{}: {why}", leaf(&t.file))),
+                            Err(why) => done.problem_with(&t.file, why),
                         }
                     }
                     Some(Ok((false, _))) => {}
-                    Some(Err(why)) => done.problems.push(format!("{}: {why}", leaf(&t.file))),
-                    None => done.problems.push(format!("{}: the tag editor did not report back", leaf(&t.file))),
+                    Some(Err(why)) => done.problem_with(&t.file, why.clone()),
+                    None => done.problem_with(&t.file, "the tag editor did not report back".into()),
                 }
             }
-            if let Some(cache) = &tools.quality_cache {
-                quality::save_cache(cache);
-            }
+            drop(held);
+            #[cfg(test)]
+            mid_write::here(&items[0].1.file);
+        }
+        if let Some(cache) = &tools.quality_cache {
+            quality::save_cache(cache);
         }
         // the working copies that were not used are the batch's own scratch, not anything from the library
         let _ = std::fs::remove_dir_all(&work);
@@ -1435,6 +1557,30 @@ mod more_tests {
 
 #[cfg(test)]
 mod lyric_tests;
+
+/// Engine tests: a pause in the middle of a change, by place (a file in a library, or an undo batch's
+/// folder), so a test can stop the job, or start another, while it is part way. The job says it got there,
+/// then waits to be let go on.
+#[cfg(test)]
+pub(crate) mod mid_write {
+    use crossbeam_channel::{Receiver, Sender};
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    static AT: Mutex<Vec<(PathBuf, Sender<()>, Receiver<()>)>> = Mutex::new(vec![]);
+    pub(crate) fn set(under: &Path, reached: Sender<()>, go: Receiver<()>) {
+        AT.lock().unwrap().push((under.to_path_buf(), reached, go));
+    }
+    pub(crate) fn here(place: &Path) {
+        let gate = {
+            let mut at = AT.lock().unwrap();
+            at.iter().position(|(p, _, _)| place.starts_with(p)).map(|i| at.remove(i))
+        };
+        if let Some((_, reached, go)) = gate {
+            let _ = reached.send(());
+            let _ = go.recv();
+        }
+    }
+}
 
 /// A pause point for the tests only (never built into the app): between the tag editor's answer and the
 /// moment its copies take their files' places, where an import can land in the meantime.

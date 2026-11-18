@@ -31,8 +31,12 @@ fn read_output(bytes: &[u8]) -> String {
     }
 }
 fn task_xml() -> Result<Option<String>, String> {
+    task_xml_named(TASK_NAME)
+}
+
+fn task_xml_named(name: &str) -> Result<Option<String>, String> {
     let out = Command::new("schtasks.exe")
-        .args(["/query", "/tn", TASK_NAME, "/xml"])
+        .args(["/query", "/tn", name, "/xml"])
         .stdin(Stdio::null())
         .creation_flags(NO_WINDOW)
         .output()
@@ -44,7 +48,7 @@ fn task_xml() -> Result<Option<String>, String> {
             .creation_flags(NO_WINDOW)
             .output()
             .map_err(|e| e.to_string())?;
-        if !list.status.success() || read_output(&list.stdout).contains(&format!("\"\\{TASK_NAME}\"")) {
+        if !list.status.success() || read_output(&list.stdout).contains(&format!("\"\\{name}\"")) {
             return Err("Windows could not read the existing backup schedule. It was left alone.".into());
         }
         return Ok(None);
@@ -72,17 +76,140 @@ fn replace_action(old: &str, action: &str) -> Result<String, String> {
     Ok(xml.replace("encoding=\"UTF-16\"", "encoding=\"UTF-8\"").replace("encoding=\"utf-16\"", "encoding=\"UTF-8\""))
 }
 fn new_xml(action: &str, sid: &str) -> String {
+    new_xml_for(action, sid, "Back up music with Bradley's Music Tool.", "03:00")
+}
+
+fn new_xml_for(action: &str, sid: &str, description: &str, at: &str) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-<RegistrationInfo><Description>Back up music with Bradley's Music Tool.</Description></RegistrationInfo>
-<Triggers><CalendarTrigger><StartBoundary>{}T03:00:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>
+<RegistrationInfo><Description>{}</Description></RegistrationInfo>
+<Triggers><CalendarTrigger><StartBoundary>{}T{at}:00</StartBoundary><Enabled>true</Enabled><ScheduleByDay><DaysInterval>1</DaysInterval></ScheduleByDay></CalendarTrigger></Triggers>
 <Principals><Principal id="Author"><UserId>{}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals>
 <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><StartWhenAvailable>true</StartWhenAvailable><ExecutionTimeLimit>PT12H</ExecutionTimeLimit></Settings>
 {action}</Task>"#,
+        escape(description),
         chrono::Local::now().date_naive(),
         escape(sid)
     )
+}
+
+// ------------------------------------------------------------------ Cadence's own nightly task
+
+/// Cadence's nightly backup task. Never the Music Tool's ("Music Backup (nightly)"): the engine neither
+/// reads, changes nor removes that one.
+pub(crate) const CADENCE_TASK: &str = "Cadence Backup (nightly)";
+const _: () = assert!(!const_str_eq(CADENCE_TASK, TASK_NAME));
+
+const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The nightly task as Task Scheduler has it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct Nightly {
+    /// Task Scheduler runs it (it is not turned off there)
+    pub(crate) enabled: bool,
+    /// "Daily at 3:00 AM", as Task Scheduler says it
+    pub(crate) schedule: String,
+    /// "Tomorrow at 3:00 AM", or empty
+    pub(crate) next: String,
+    pub(crate) running: bool,
+    /// what its last run ended with (0 when well)
+    pub(crate) result: Option<i64>,
+}
+
+/// Where the nightly task is kept: Windows' Task Scheduler (`TaskScheduler`), or a test's stand-in that
+/// only writes down what it was asked.
+pub(crate) trait Scheduler: Send + Sync {
+    /// Cadence's task, or None when there is none.
+    fn query(&self) -> Result<Option<Nightly>, String>;
+    /// Makes Cadence's task (or replaces Cadence's own): every day at `at` ("03:00") run `exe` with `args`,
+    /// with no window. `work` is a folder of Cadence's for the task's description file.
+    fn create(&self, exe: &Path, args: &str, at: &str, work: &Path) -> Result<(), String>;
+    /// Removes Cadence's task (nothing when there is none).
+    fn remove(&self) -> Result<(), String>;
+}
+
+/// Windows' Task Scheduler, through `schtasks.exe`, only ever for `CADENCE_TASK`.
+pub(crate) struct TaskScheduler;
+
+/// The arguments of the nightly command: `--backup-nightly --data "<Cadence's data folder>"`.
+pub(crate) fn nightly_args(data: &Path) -> Result<String, String> {
+    let data = data.to_string_lossy();
+    if data.contains(['"', '\n', '\r']) {
+        return Err("Cadence's data folder has a character Task Scheduler cannot use.".into());
+    }
+    let quote = |s: &str| format!("\"{}{}\"", s, "\\".repeat(s.chars().rev().take_while(|c| *c == '\\').count()));
+    Ok(format!("--backup-nightly --data {}", quote(&data)))
+}
+
+impl TaskScheduler {
+    /// Cadence's task is one that runs `--backup-nightly`; a task of that name that does something else
+    /// was not made by Cadence, and is left alone.
+    fn ours(xml: &str) -> bool {
+        xml.contains("--backup-nightly")
+    }
+}
+
+impl Scheduler for TaskScheduler {
+    fn query(&self) -> Result<Option<Nightly>, String> {
+        match super::query_task_named(CADENCE_TASK) {
+            super::Task::Unknown => Err("Task Scheduler could not be read.".into()),
+            super::Task::Missing => Ok(None),
+            super::Task::Found { enabled, running, schedule, next, result, .. } => Ok(Some(Nightly { enabled, schedule, next, running, result })),
+        }
+    }
+
+    fn create(&self, exe: &Path, args: &str, at: &str, work: &Path) -> Result<(), String> {
+        let old = task_xml_named(CADENCE_TASK)?;
+        if old.as_deref().is_some_and(|x| !TaskScheduler::ours(x)) {
+            return Err(format!("A task called \"{CADENCE_TASK}\" that Cadence did not make is in Task Scheduler. It was left alone."));
+        }
+        let action = format!("<Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions>", escape(&exe.to_string_lossy()), escape(args));
+        let out = Command::new("whoami.exe").args(["/user", "/fo", "csv", "/nh"]).stdin(Stdio::null()).creation_flags(NO_WINDOW).output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err("Windows could not identify the account for the nightly task.".into());
+        }
+        let output = read_output(&out.stdout);
+        let sid = regex::Regex::new(r"S-1-(?:\d+-)*\d+").unwrap().find(&output).ok_or("Windows did not return an account for the nightly task.")?.as_str().to_string();
+        let xml = new_xml_for(&action, &sid, "Back up your music and Cadence's own library, even when Cadence is closed.", at);
+        std::fs::create_dir_all(work).map_err(|e| e.to_string())?;
+        let path = work.join("nightly-task.xml");
+        std::fs::write(&path, xml).map_err(|e| e.to_string())?;
+        let out = Command::new("schtasks.exe").args(["/create", "/tn", CADENCE_TASK, "/xml"]).arg(&path).arg("/f").stdin(Stdio::null()).creation_flags(NO_WINDOW).output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("The nightly backup could not be set up: {}", read_output(&out.stderr).trim()));
+        }
+        let installed = task_xml_named(CADENCE_TASK)?.ok_or("The nightly backup was not found after it was set up.")?;
+        if !TaskScheduler::ours(&installed) || !installed.contains(&escape(&exe.to_string_lossy())) {
+            return Err("The nightly backup could not be checked after it was set up. Look at it in Task Scheduler.".into());
+        }
+        Ok(())
+    }
+
+    fn remove(&self) -> Result<(), String> {
+        let Some(old) = task_xml_named(CADENCE_TASK)? else { return Ok(()) };
+        if !TaskScheduler::ours(&old) {
+            return Err(format!("A task called \"{CADENCE_TASK}\" that Cadence did not make is in Task Scheduler. It was left alone."));
+        }
+        let out = Command::new("schtasks.exe").args(["/delete", "/tn", CADENCE_TASK, "/f"]).stdin(Stdio::null()).creation_flags(NO_WINDOW).output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!("The nightly backup could not be turned off: {}", read_output(&out.stderr).trim()));
+        }
+        Ok(())
+    }
 }
 pub(super) fn install(at: &Places, source: &Path) -> Result<String, String> {
     let saved = super::read_config(&at.config);
@@ -160,7 +287,8 @@ pub(super) fn requested() -> Option<i32> {
                 return Err("A lab command must use its own backup settings.".into());
             }
         }
-        let at = Places { config, logs, test };
+        // (the Music Tool's nightly task runs this command)
+        let at = Places { nightly: true, ..Places::new(config, logs, test) };
         let flag = |name: &str| args.iter().any(|a| a == name);
         if ["--preview", "--check-all", "--mirror"].iter().filter(|s| flag(s)).count() > 1 {
             return Err("Choose one backup action at a time.".into());

@@ -1,6 +1,6 @@
 //! Native backup work. The library is read only. A new copy is checked before an old copy moves,
 //! every replaced file is kept, and a failed directory read stops the plan before anything is moved.
-use super::{ID_FILE, Kind, Msg, Places, Saved, Which, drive_roots, find_second, fmt_size, read_config, volume_label};
+use super::{ID_FILE, Kind, Msg, Places, Saved, Snapshots, Which, find_second, fmt_size, read_config};
 use chrono::Local;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -48,7 +48,7 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 
 /// A directory's volume serial and file ID survive drive-letter and label changes.
 /// Keep the handle open while reading the ID; never write a marker into the library.
-fn directory_id(path: &Path) -> Result<String> {
+pub(super) fn directory_id(path: &Path) -> Result<String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, GetFileInformationByHandle};
     plain_path(path)?;
@@ -87,14 +87,22 @@ pub(super) fn validate_binding(at: &Places, which: Which, source: &Path, dest: &
     let binding: Binding = serde_json::from_value(value.get(binding_key(which)).cloned().ok_or(
         "Confirm the library and backup folders on the Backup page before running this backup. Existing copies were left alone."
     )?).map_err(|_| "The saved folder identities are not readable. Confirm the folders on the Backup page.".to_string())?;
-    if key(source) != binding.source_path || directory_id(source)? != binding.source_id {
+    if key(source) != binding.source_path || at.disks.dir_id(source)? != binding.source_id {
         return Err("The library folder or its drive has changed. Existing backups were left alone. Confirm the folders on the Backup page only if this is the intended library.".into());
     }
     let marker = fs::read_to_string(plain_path(&dest.join(ID_FILE))?).map_err(|_| "The backup identity file is missing or unreadable. Existing copies were left alone.".to_string())?;
-    if binding.marker.is_empty() || marker.trim_start_matches('\u{feff}').trim() != binding.marker || directory_id(dest)? != binding.destination_id {
+    if binding.marker.is_empty() || marker.trim_start_matches('\u{feff}').trim() != binding.marker || at.disks.dir_id(dest)? != binding.destination_id {
         return Err("This is not the confirmed backup folder or drive. Nothing was copied or moved.".into());
     }
     Ok(())
+}
+
+/// The marker of a confirmed backup (the words in its `_backup-id.txt`), or None when that backup has not
+/// been confirmed. Only reads the settings.
+pub(super) fn bound_marker(at: &Places, which: Which) -> Option<String> {
+    let value = settings(at).ok()?;
+    let b: Binding = serde_json::from_value(value.get(binding_key(which))?.clone()).ok()?;
+    (!b.marker.is_empty()).then_some(b.marker)
 }
 
 /// Only an explicit folder selection/confirmation may enroll or replace identities.
@@ -102,9 +110,9 @@ pub(super) fn validate_binding(at: &Places, which: Which, source: &Path, dest: &
 fn bind(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
     let _lock = RunLock::take(&at.config)?;
     let mut value = settings(at)?;
-    let source_id = directory_id(source)?;
+    let source_id = at.disks.dir_id(source)?;
     let folder = dest.to_string_lossy();
-    let label = volume_label(&format!("{}\\", &folder[..2])).ok_or("The backup drive is not connected.")?;
+    let label = at.disks.label(&format!("{}\\", &folder[..2])).ok_or("The backup drive is not connected.")?;
     fs::create_dir_all(dest).map_err(err)?;
     let marker_path = plain_path(&dest.join(ID_FILE))?;
     let marker = match fs::read_to_string(&marker_path) {
@@ -119,7 +127,7 @@ fn bind(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
         }
         Err(e) => return Err(err(e)),
     };
-    let binding = serde_json::to_value(Binding { source_path: key(source), source_id, destination_id: directory_id(dest)?, marker: marker.clone() }).map_err(err)?;
+    let binding = serde_json::to_value(Binding { source_path: key(source), source_id, destination_id: at.disks.dir_id(dest)?, marker: marker.clone() }).map_err(err)?;
     if value.get(binding_key(which)) != Some(&binding) {
         value.as_object_mut().unwrap().remove(if which == Which::Main { "LastRun" } else { "SecondaryLastRun" });
     }
@@ -135,7 +143,7 @@ fn bind(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()> {
     fs::create_dir_all(at.config.parent().unwrap()).map_err(err)?;
     crate::util::write_atomic(&at.config, &serde_json::to_vec_pretty(&value).map_err(err)?).map_err(err)
 }
-fn safe_roots(source: &Path, dest: &Path, main: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
+pub(super) fn safe_roots(source: &Path, dest: &Path, main: Option<&Path>) -> Result<(PathBuf, PathBuf)> {
     let (source, dest) = (plain_path(source)?, plain_path(dest)?);
     if !source.is_dir() {
         return Err("The library folder was not found.".into());
@@ -406,7 +414,7 @@ fn select_dest(at: &Places, saved: &Saved, which: Which, kind: &Kind) -> Result<
                 return Err("No backup folder has been chosen yet.".into());
             }
             let root = saved.dest.get(..2).filter(|r| r.ends_with(':')).ok_or("The saved backup path has no drive letter.")?;
-            let label = volume_label(&format!("{root}\\")).ok_or("The backup drive is not connected.")?;
+            let label = at.disks.label(&format!("{root}\\")).ok_or("The backup drive is not connected.")?;
             if !saved.label.is_empty() && !label.eq_ignore_ascii_case(&saved.label) {
                 return Err("The disk at the backup drive letter is not the saved disk. Nothing was copied.".into());
             }
@@ -416,7 +424,7 @@ fn select_dest(at: &Places, saved: &Saved, which: Which, kind: &Kind) -> Result<
             let roots = if at.test {
                 std::env::var("MUSIC_RECS_BACKUP_DRIVES").unwrap_or_default().split(';').filter(|s| !s.is_empty()).map(str::to_string).collect()
             } else {
-                drive_roots()
+                at.disks.roots()
             };
             let found = if at.test {
                 roots
@@ -451,7 +459,7 @@ fn remember(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()>
         return Err("The backup settings are not readable. They were left alone.".into());
     }
     let folder = dest.to_string_lossy();
-    let label = volume_label(&format!("{}\\", &folder[..2])).ok_or("The backup drive is no longer connected.")?;
+    let label = at.disks.label(&format!("{}\\", &folder[..2])).ok_or("The backup drive is no longer connected.")?;
     let now = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
     if which == Which::Main {
         value["Destination"] = folder.as_ref().into();
@@ -475,6 +483,39 @@ fn remember(at: &Places, which: Which, source: &Path, dest: &Path) -> Result<()>
 }
 
 pub(super) fn execute(at: &Places, which: Which, kind: &Kind, library: &Path, stop: &AtomicBool, send: &mut dyn FnMut(Msg)) -> Result<()> {
+    execute_following(at, which, kind, library, &[], &mut |_| {}, stop, send)
+}
+
+/// A move inside the library that the backup's copies follow (see `follow_moves`).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Moved {
+    pub(crate) from: PathBuf,
+    pub(crate) to: PathBuf,
+}
+
+/// What following the moves did: copies renamed to match, and moves passed over.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct Followed {
+    pub(crate) renamed: usize,
+    pub(crate) skipped: usize,
+}
+
+/// `execute`, and before anything is compared or copied, the backup's copies are renamed to follow
+/// `moves` (made in the library since), under the same lock and the same checked binding. `followed` is
+/// called once the moves have all been looked at; it is not called when the run stops before them (the
+/// wrong disk, folders not confirmed), so the caller knows they still wait. A copy, a check and a preview
+/// follow no moves (they change nothing).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_following(
+    at: &Places,
+    which: Which,
+    kind: &Kind,
+    library: &Path,
+    moves: &[Moved],
+    followed: &mut dyn FnMut(Followed),
+    stop: &AtomicBool,
+    send: &mut dyn FnMut(Msg),
+) -> Result<()> {
     if at.test {
         let source = plain_path(library)?;
         let lab = at.config.parent().and_then(Path::parent).and_then(Path::parent).ok_or("The lab folder is missing.")?;
@@ -501,6 +542,9 @@ pub(super) fn execute(at: &Places, which: Which, kind: &Kind, library: &Path, st
         Ok(())
     };
     line(format!("==================== {} ====================", Local::now().format("%Y-%m-%d %H:%M")))?;
+    if at.nightly {
+        line(super::NIGHTLY_LINE.to_string())?;
+    }
     let result = (|| {
         let saved = read_config(&at.config);
         let destination = select_dest(at, &saved, which, kind)?;
@@ -515,6 +559,13 @@ pub(super) fn execute(at: &Places, which: Which, kind: &Kind, library: &Path, st
             validate_binding(at, which, &source, &dest)?;
         }
         line(format!("Backing up {}  ->  {}{}", source.display(), dest.display(), if which == Which::Second { "  (second backup)" } else { "" }))?;
+        if kind.copies() {
+            let f = follow_moves(at, which, &source, &dest, moves, stop)?;
+            if f.renamed > 0 {
+                line(format!("Renamed {} copies to follow moves in the library.", f.renamed))?;
+            }
+            followed(f);
+        }
         run(at, which, kind, &source, &dest, stop, &mut line, &mut |files, bytes| send.borrow_mut()(Msg::Copied(files, bytes)))
     })();
     if let Err(why) = &result {
@@ -528,6 +579,114 @@ pub(super) fn execute(at: &Places, which: Which, kind: &Kind, library: &Path, st
         f.sync_all().map_err(err)?;
     }
     result
+}
+
+/// The library-relative form of a path in the library, compared without case. None for the library itself
+/// or anything outside it.
+fn rel_in(source: &Path, path: &Path) -> Option<PathBuf> {
+    // (compared one path part at a time: lowercasing a whole path can change its length, as "İ" does, so
+    // a cut at the lowercased length could land in the wrong place or inside a character)
+    let same = |a: &std::ffi::OsStr, b: &std::ffi::OsStr| a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase();
+    let mut parts = path.components();
+    for want in source.components() {
+        if !parts.next().is_some_and(|got| same(got.as_os_str(), want.as_os_str())) {
+            return None;
+        }
+    }
+    let rest: PathBuf = parts.collect();
+    (!rest.as_os_str().is_empty()).then_some(rest)
+}
+
+/// Renames the backup's copies to follow moves made in the library (Organize, a repair that files loose
+/// tracks, the Undo of either), so a moved album is not copied a second time and its old place is not
+/// counted as removed. The same rules as everything else here: only inside the confirmed backup folder
+/// (checked again before each rename), never a reserved name or a link, never over something (a rename with
+/// no flags, which never replaces), never a copy. A move is passed over, and the file is simply copied as
+/// usual, when the library still has something at its old place, when the backup has no copy there, or
+/// when something is already where it would go. Nothing is lost either way: whatever the backup does not
+/// follow, the comparison that comes next copies again.
+fn follow_moves(at: &Places, which: Which, source: &Path, dest: &Path, moves: &[Moved], stop: &AtomicBool) -> Result<Followed> {
+    let mut f = Followed::default();
+    for m in moves {
+        if stop.load(Ordering::Relaxed) {
+            return Err("Stopped. Copies already finished are kept.".into());
+        }
+        let (Some(rel_from), Some(rel_to)) = (rel_in(source, &m.from), rel_in(source, &m.to)) else {
+            f.skipped += 1;
+            continue;
+        };
+        let (Ok(from), Ok(to)) = (below(dest, &rel_from), below(dest, &rel_to)) else {
+            f.skipped += 1;
+            continue;
+        };
+        let case_only = key(&rel_from) == key(&rel_to);
+        let there = |p: &Path| fs::symlink_metadata(p).is_ok();
+        // (the library still has its old place filled, or the backup has no copy to rename)
+        if (!case_only && there(&source.join(&rel_from))) || !there(&from) {
+            f.skipped += 1;
+            continue;
+        }
+        if case_only {
+            // already named so: nothing to do
+            let named = fs::read_dir(from.parent().unwrap_or(dest)).ok().and_then(|mut d| d.find_map(|e| e.ok().map(|e| e.file_name()).filter(|n| n.to_string_lossy().eq_ignore_ascii_case(&from.file_name().unwrap_or_default().to_string_lossy()))));
+            if named.is_some_and(|n| n == to.file_name().unwrap_or_default()) {
+                f.skipped += 1;
+                continue;
+            }
+        } else if there(&to) {
+            f.skipped += 1;
+            continue;
+        }
+        // the folders it goes into (a file in the way: passed over)
+        let mut part = PathBuf::new();
+        let mut blocked = false;
+        for c in rel_to.parent().map(|p| p.components().collect::<Vec<_>>()).unwrap_or_default() {
+            part.push(c);
+            let d = below(dest, &part)?;
+            match fs::symlink_metadata(&d) {
+                Ok(md) if md.is_dir() && md.file_attributes() & 0x400 == 0 => {}
+                Ok(_) => {
+                    blocked = true;
+                    break;
+                }
+                Err(_) => fs::create_dir(&d).map_err(err)?,
+            }
+        }
+        if blocked {
+            f.skipped += 1;
+            continue;
+        }
+        validate_binding(at, which, source, dest)?;
+        let went = if case_only {
+            let hop = from.with_file_name(format!("{}.follow-{:x}", from.file_name().unwrap_or_default().to_string_lossy(), crate::importer::scan::rand_id()));
+            crate::organize::rename(&from, &hop).and_then(|_| crate::organize::rename(&hop, &to).inspect_err(|_| {
+                let _ = crate::organize::rename(&hop, &from);
+            }))
+        } else {
+            crate::organize::rename(&from, &to)
+        };
+        match went {
+            Ok(()) => f.renamed += 1,
+            Err(_) => f.skipped += 1,
+        }
+    }
+    Ok(f)
+}
+
+/// How many files a folder holds and how many bytes they take (the backup's own history left out). Only
+/// reads; Err when a folder in it cannot be read, or it holds a link.
+pub(super) fn sizes(root: &Path, backup: bool) -> Result<(u64, u64)> {
+    let t = tree(root, backup)?;
+    Ok((t.files.len() as u64, t.files.values().map(|e| e.size).sum()))
+}
+
+/// What a backup from `source` to `dest` would copy now: files, bytes (by size and date, as a run compares
+/// them). Only reads.
+pub(super) fn to_copy(source: &Path, dest: &Path) -> Result<(u64, u64)> {
+    let (library, backup) = (tree(source, false)?, tree(dest, true)?);
+    let tolerance = if dest.exists() && fat_times(dest) { Duration::from_secs(2) } else { Duration::ZERO };
+    let copies: Vec<&Entry> = library.files.iter().filter(|(k, e)| backup.files.get(*k).is_none_or(|b| !same_meta(e, b, tolerance))).map(|(_, e)| e).collect();
+    Ok((copies.len() as u64, copies.iter().map(|e| e.size).sum()))
 }
 
 fn run(
@@ -723,10 +882,15 @@ fn run(
         return Err("Stopped. Copies already finished are kept.".into());
     }
     if !at.test {
-        snapshots(at, dest, stop, line)?;
+        match &at.snapshots {
+            Snapshots::MusicTool => snapshots(at, dest, stop, line)?,
+            // Cadence's engine: Cadence's own data folder alone (never the Music Tool's data or the code)
+            Snapshots::Cadence(data) => save_snapshot(dest, "_Cadence", "Cadence", &[cadence_source(data.clone())], stop, line)?,
+            Snapshots::Nothing => {}
+        }
     }
     validate_binding(at, which, source, dest)?;
-    clean_history(dest, at.test, line)?;
+    clean_history(dest, at.test, at.recycle, line)?;
     remember(at, which, source, dest)?;
     if which == Which::Second {
         if let Some((free, _)) = super::disk_space(&dest.to_string_lossy()[..3]) {
@@ -748,8 +912,10 @@ fn cadence_source(path: PathBuf) -> SnapshotSource {
         name: "Data", path,
         required: true,
         // Keep imported artwork, saved connections, database history and all other durable files.
-        skip_dirs: ["Cache", "Artwork", "Logs", "Models", "Heard", "UpdateDownloads"].map(PathBuf::from).to_vec(),
-        skip_files: vec!["waveforms.db", "waveforms.db-wal", "waveforms.db-shm", "error.log", "running.marker"],
+        // The engine's folder (Tools) keeps its settings, lists and backup settings; its helpers, caches,
+        // downloads and backup logs (open while a backup writes them) are left out.
+        skip_dirs: ["Cache", "Artwork", "Logs", "Models", "Heard", "UpdateDownloads", "Tools/slskd", "Tools/tools", "Tools/downloads", "Tools/cache", "Tools/import-work", "Tools/backup/logs"].map(PathBuf::from).to_vec(),
+        skip_files: vec!["waveforms.db", "waveforms.db-wal", "waveforms.db-shm", "error.log", "running.marker", "engine.log", "library-changing.lock"],
     }
 }
 fn snapshot_files(root: &Path, skip_dirs: &[PathBuf], skip_files: &[&str]) -> Result<Vec<PathBuf>> {
@@ -930,7 +1096,7 @@ fn save_snapshot(
     }
     line(format!("{label}: saved today's copy ({count} files, {}) to {}", fmt_size(bytes), dated.display()))
 }
-fn clean_history(dest: &Path, test: bool, line: &mut dyn FnMut(String) -> Result<()>) -> Result<()> {
+fn clean_history(dest: &Path, test: bool, recycle: fn(&Path) -> Result<()>, line: &mut dyn FnMut(String) -> Result<()>) -> Result<()> {
     let cutoff = Local::now().date_naive() - chrono::Duration::days(30);
     for (folder, what, daily) in [
         ("_changed", "old copies", false),
@@ -970,7 +1136,7 @@ fn clean_history(dest: &Path, test: bool, line: &mut dyn FnMut(String) -> Result
                 fs::create_dir_all(&bin).map_err(err)?;
                 fs::rename(path, bin.join(path.file_name().unwrap())).map_err(err)?;
             } else {
-                trash::delete(path).map_err(err)?;
+                recycle(path)?;
             }
         }
         if !old.is_empty() {
@@ -983,6 +1149,18 @@ fn clean_history(dest: &Path, test: bool, line: &mut dyn FnMut(String) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_path_part_that_grows_when_lowercased_still_gives_the_right_place() {
+        // "İ" (U+0130) is two bytes, and three once lowercased: a cut at the lowercased length went wrong
+        let lib = Path::new(r"X:\Müzİk İİİ");
+        assert_eq!(rel_in(lib, Path::new(r"X:\MÜZİK İİİ\İstanbul\01 Song.mp3")), Some(PathBuf::from(r"İstanbul\01 Song.mp3")));
+        assert_eq!(rel_in(Path::new(r"X:\İİİİ"), Path::new(r"x:\İİİİ\a.mp3")), Some(PathBuf::from("a.mp3")));
+        assert_eq!(rel_in(Path::new(r"X:\İİİİ"), Path::new(r"X:\İİİİx\a.mp3")), None, "a folder whose name only starts the same");
+        assert_eq!(rel_in(Path::new(r"X:\Music\"), Path::new("X:/music/A/b.mp3")), Some(PathBuf::from(r"A\b.mp3")));
+        assert_eq!(rel_in(Path::new(r"X:\Music"), Path::new(r"X:\Music")), None, "the library itself");
+    }
+
     struct Lab {
         base: PathBuf,
         source: PathBuf,
@@ -1000,7 +1178,7 @@ mod tests {
             let source = base.join("library");
             let dest = base.join("backup");
             fs::create_dir_all(&source).unwrap();
-            let at = Places { config: base.join("data/backup/config.json"), logs: base.join("data/backup/logs"), test: true };
+            let at = Places::new(base.join("data/backup/config.json"), base.join("data/backup/logs"), true);
             Self { base, source, dest, at }
         }
         fn write(&self, rel: &str, bytes: &[u8]) {
@@ -1450,7 +1628,7 @@ mod tests {
         let legacy = l.dest.join("_MusicBee/2000-01-01");
         fs::create_dir_all(&legacy).unwrap();
         fs::write(legacy.join("library.mbl"), b"old library").unwrap();
-        clean_history(&l.dest, true, &mut |_| Ok(())).unwrap();
+        clean_history(&l.dest, true, l.at.recycle, &mut |_| Ok(())).unwrap();
         assert_eq!(fs::read_dir(l.dest.join("_Cadence")).unwrap().count(), 30);
         assert!(l.dest.join("_Cadence").join(today.format("%Y-%m-%d").to_string()).exists());
         assert_eq!(fs::read(legacy.join("library.mbl")).unwrap(), b"old library");

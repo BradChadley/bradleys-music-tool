@@ -44,6 +44,9 @@ pub struct Config {
     /// the page that was open when the app was last used ("home", "recs", "downloads", "library", "health", "backup")
     pub last_page: String,
     pub dismissed: BTreeSet<String>,
+    /// Cadence's engine: the artist and title of each Not interested release key, so Settings can list them
+    /// for Bring back after the release has left the recommendations
+    pub dismissed_names: std::collections::BTreeMap<String, (String, String)>,
     /// artist keys whose new releases are hidden (artist_key form) -> display name
     pub muted: std::collections::BTreeMap<String, String>,
     /// artist key -> the MusicBrainz artist you picked for it (fixes same-name mix-ups)
@@ -70,9 +73,36 @@ pub struct Config {
     /// cover put right, another lossless kind becomes FLAC (false: every lossless download becomes a 320 MP3)
     pub keep_lossless: bool,
     pub mp3_quality: crate::import_quality::Mp3Quality,
+    /// lyrics are looked up and saved into new albums (false: none are looked up; a track's own are kept)
+    pub save_lyrics: bool,
+    /// a download goes to the Recycle Bin once its album is safely in the library (false: it is left where
+    /// it arrived)
+    pub recycle_originals: bool,
+    /// a copy that starts at once (its owner has a free upload slot) ranks above better ones that wait in
+    /// line (false: a free slot does not lift a copy above better ones)
+    pub prefer_starts_now: bool,
+    /// Cadence's engine ends its Soulseek client after this many minutes with nothing to do (no search or
+    /// download running, nothing in the client's list on its way, no look at its state); 0: never
+    pub soulseek_idle_minutes: f64,
     /// what to do about new versions of the app: "auto" (fetch them and put them in), "tell" (only say
     /// that one is out) or "off" (never check); see `crate::update::Policy`
     pub updates: String,
+    /// what Cadence may change in the library on its own (Cadence's engine; the Music Tool's window has
+    /// `look_only` instead): "look" (nothing: no repairs, no Fix all, no Organize; imports and Edit details,
+    /// which a person asks for by hand, still work), "repair" (repairs too) or "organize" (repairs and
+    /// Organize). `look_only` set counts as "look" whatever this says (see `library_changes`).
+    pub library_changes: String,
+    /// Cadence runs a quick check of the artist folders of new albums once they are in
+    pub auto_check_new: bool,
+    /// Cadence's engine: the folder (in the music folder) marked compilations go into, by Organize and by
+    /// imports. Cleaned by the Windows rules; "Various Artists" when empty
+    pub compilations_folder: String,
+    /// Cadence's engine: a new album that arrives (Get music, an import, a replacement, a folder the watcher
+    /// sees) is filed by Artist \ Album (Year) at once, one album at a time (`organize.album`), when
+    /// `library_changes` is "organize". Albums already in the library move only through an Organize preview.
+    /// Off until Cadence sets it: Cadence sends its own answer (on once the person has chosen Organize), so
+    /// an engine that starts before Cadence has said anything files nothing on its own
+    pub keep_organized: bool,
     #[serde(skip)]
     pub load_error: Option<String>,
 }
@@ -122,6 +152,7 @@ impl Default for Config {
             view_kinds: [true, true, false, true],
             last_page: String::new(),
             dismissed: BTreeSet::new(),
+            dismissed_names: Default::default(),
             muted: Default::default(),
             pins: Default::default(),
             colors: Default::default(),
@@ -134,17 +165,38 @@ impl Default for Config {
             lyrics_plain: false,
             keep_lossless: false,
             mp3_quality: Default::default(),
+            save_lyrics: true,
+            recycle_originals: true,
+            prefer_starts_now: true,
+            soulseek_idle_minutes: 20.0,
             updates: "auto".into(),
+            // (Cadence's engine only: the Music Tool's window has `look_only` and never reads this)
+            library_changes: "organize".into(),
+            compilations_folder: crate::organize::DEFAULT_COMPILATIONS.into(),
+            keep_organized: false,
+            auto_check_new: true,
             load_error: None,
         }
     }
 }
 
+static ENGINE_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Cadence's engine: every path below `app_dir` is in this folder for the rest of the run. Set once, at
+/// the engine's start, before anything reads a path; false if it was already set.
+pub fn set_engine_dir(dir: PathBuf) -> bool {
+    ENGINE_DIR.set(dir).is_ok()
+}
+
 /// Where settings, cache and results live. `MUSIC_RECS_DATA` points it elsewhere
 /// (used for testing, so tests never touch your real settings).
+///
+/// Cadence's engine keeps everything in Cadence's own data folder instead (`set_engine_dir`), never in the
+/// Music Tool's: the two never share settings, caches or helpers.
 pub fn app_dir() -> PathBuf {
-    let d = match std::env::var_os("MUSIC_RECS_DATA") {
-        Some(p) if !p.is_empty() => PathBuf::from(p),
+    let d = match (ENGINE_DIR.get(), std::env::var_os("MUSIC_RECS_DATA")) {
+        (Some(engine), _) => engine.clone(),
+        (None, Some(p)) if !p.is_empty() => PathBuf::from(p),
         _ => dirs::data_local_dir().unwrap_or_else(|| PathBuf::from(".")).join("music-recs"),
     };
     let _ = std::fs::create_dir_all(&d);
@@ -330,6 +382,18 @@ impl Config {
             }
         }
     }
+    /// What may be changed in the library: "look", "repair" or "organize". `look_only` (the Music Tool's
+    /// own switch) always means "look"; a value this program does not know counts as "look" too, the
+    /// careful reading.
+    pub fn library_changes(&self) -> &str {
+        match self.library_changes.as_str() {
+            _ if self.look_only => "look",
+            "repair" => "repair",
+            "organize" => "organize",
+            _ => "look",
+        }
+    }
+
     pub fn has_lastfm(&self) -> bool {
         !self.lastfm_user.trim().is_empty() && !self.lastfm_api_key.trim().is_empty()
     }

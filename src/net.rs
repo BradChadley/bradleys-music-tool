@@ -42,6 +42,8 @@ pub struct Net {
     /// Deezer allows 50 requests per 5 seconds; this stays well under
     pub deezer: Limiter,
     pub bandcamp: Limiter,
+    /// tests only: every address is asked of this local stand-in server instead (`stand_in`)
+    stand_in: Option<String>,
 }
 
 impl Net {
@@ -61,6 +63,26 @@ impl Net {
             lastfm: Limiter::new(Duration::from_millis(220)),
             deezer: Limiter::new(Duration::from_millis(150)),
             bandcamp: Limiter::new(Duration::from_millis(1000)),
+            stand_in: None,
+        }
+    }
+
+    /// Tests only: a `Net` that asks a stand-in server on this PC (`base`, "http://127.0.0.1:<port>") for
+    /// every address, as "<base>/<host><path>", with no waiting between requests. The real services are never
+    /// reached; the cache is keyed by the real address as always.
+    #[cfg(test)]
+    pub fn stand_in(cache_dir: PathBuf, base: &str) -> Self {
+        assert!(base.starts_with("http://127.0.0.1:"), "a stand-in is on this PC only");
+        let agent: ureq::Agent = ureq::Agent::config_builder().timeout_global(Some(Duration::from_secs(30))).http_status_as_error(false).user_agent(USER_AGENT).build().into();
+        let quick = || Limiter::new(Duration::from_millis(1));
+        Self { agent, cache_dir, mb: quick(), itunes: quick(), lastfm: quick(), deezer: quick(), bandcamp: quick(), stand_in: Some(base.trim_end_matches('/').to_string()) }
+    }
+
+    /// The address a request goes to: the real one, or the stand-in's (tests).
+    fn to(&self, url: &str) -> String {
+        match (&self.stand_in, url.strip_prefix("https://")) {
+            (Some(base), Some(rest)) => format!("{base}/{rest}"),
+            _ => url.to_string(),
         }
     }
 
@@ -76,7 +98,7 @@ impl Net {
         let mut last_err = String::new();
         for attempt in 0..3 {
             limiter.wait();
-            match self.agent.post(url).send_json(body) {
+            match self.agent.post(self.to(url)).send_json(body) {
                 Ok(mut r) if r.status().as_u16() == 200 => {
                     let b = r.body_mut().read_to_vec().map_err(|e| e.to_string())?;
                     let v: serde_json::Value = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
@@ -124,7 +146,7 @@ impl Net {
             if let Some(l) = limiter {
                 l.wait();
             }
-            let resp = self.agent.get(url).call();
+            let resp = self.agent.get(self.to(url)).call();
             let mut resp = match resp {
                 Ok(r) => r,
                 Err(e) => {

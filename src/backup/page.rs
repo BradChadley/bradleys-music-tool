@@ -883,7 +883,7 @@ fn last_backup(ui: &mut Ui, run: Option<&Run>, last_ok: Option<NaiveDateTime>, c
 
 /// What a backup did besides copying, short enough for one quiet line: "All 28,499 copies checked ·
 /// Cadence, tool data and code saved". (`run_notes` has it in full, with the numbers.)
-fn run_brief(run: &Run) -> String {
+pub(super) fn run_brief(run: &Run) -> String {
     let mut parts = vec![];
     let albums = run.albums_phrase();
     if !albums.is_empty() {

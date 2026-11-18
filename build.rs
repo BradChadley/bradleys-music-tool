@@ -1,11 +1,14 @@
-//! Gives the program file its own icon, name and version, so Explorer, the taskbar and Windows' own
-//! messages about the file show what it is. The version is the one in `Cargo.toml`.
+//! Gives each program file its own icon, name and version, so Explorer, the taskbar and Windows' own
+//! messages about the file show what it is: the Music Tool's window (`bradleys-music-tool.exe`) and
+//! Cadence's hidden engine (`cadence-engine.exe`, which Task Manager shows as "Cadence engine"). The
+//! version is the one in `Cargo.toml`.
 //!
 //! The resource text is written here and only compiled by `winresource`: its own writer puts a backslash
 //! before an apostrophe, and the name came out as "Bradley\'s Music Tool".
 use std::path::PathBuf;
 
-const NAME: &str = "Bradley's Music Tool";
+/// (program, the name Windows shows)
+const PROGRAMS: [(&str, &str); 2] = [("bradleys-music-tool", "Bradley's Music Tool"), ("cadence-engine", "Cadence engine")];
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -21,10 +24,12 @@ fn main() {
     // (the icon's place is only read while building; it is not kept in the program file)
     let icon = PathBuf::from(var("CARGO_MANIFEST_DIR")).join("assets").join("bradleys-music-tool.ico");
     let icon = icon.to_string_lossy().replace('\\', "\\\\");
-    let rc = format!(
-        r#"#pragma code_page(65001)
-1 ICON "{icon}"
-1 VERSIONINFO
+    for (program, name) in PROGRAMS {
+        // the engine never shows a window, so it carries no icon of its own
+        let icon_line = if program == "bradleys-music-tool" { format!("1 ICON \"{icon}\"\n") } else { String::new() };
+        let rc = format!(
+            r#"#pragma code_page(65001)
+{icon_line}1 VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
 PRODUCTVERSION {major},{minor},{patch},0
 FILEOS 0x40004
@@ -34,12 +39,12 @@ FILETYPE 0x1
     {{
         BLOCK "040904B0"
         {{
-            VALUE "ProductName", "{NAME}"
-            VALUE "FileDescription", "{NAME}"
+            VALUE "ProductName", "{name}"
+            VALUE "FileDescription", "{name}"
             VALUE "FileVersion", "{version}"
             VALUE "ProductVersion", "{version}"
-            VALUE "InternalName", "bradleys-music-tool"
-            VALUE "OriginalFilename", "bradleys-music-tool.exe"
+            VALUE "InternalName", "{program}"
+            VALUE "OriginalFilename", "{program}.exe"
         }}
     }}
     BLOCK "VarFileInfo"
@@ -48,12 +53,13 @@ FILETYPE 0x1
     }}
 }}
 "#
-    );
-    let file = PathBuf::from(var("OUT_DIR")).join("program-file.rc");
-    std::fs::write(&file, rc).expect("the resource text could not be written");
-    let mut res = winresource::WindowsResource::new();
-    res.set_resource_file(&file.to_string_lossy());
-    if let Err(why) = res.compile() {
-        panic!("the program file's icon and version could not be built in: {why}");
+        );
+        let file = PathBuf::from(var("OUT_DIR")).join(format!("{program}.rc"));
+        std::fs::write(&file, rc).expect("the resource text could not be written");
+        let mut res = winresource::WindowsResource::new();
+        res.set_resource_file(&file.to_string_lossy());
+        if let Err(why) = res.compile_for(program) {
+            panic!("the icon and version of {program}.exe could not be built in: {why}");
+        }
     }
 }

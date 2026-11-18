@@ -1535,7 +1535,7 @@ impl HealthPage {
             let done = crate::importer::tools::find_tool("ffprobe").and_then(|ffprobe| crate::loose::settle_keeping(&ffprobe, &library, &crate::repair::backups_root(&library), Path::new(&album.folder), &album.held, keep_lossless));
             let done = done.map(|d| {
                 drop_loose_files(&report, &cat, &path, &d.moved);
-                crate::repair::Done { batch: d.batch, changed: d.moved.len(), problems: d.stayed }
+                crate::repair::Done { batch: d.batch, changed: d.moved.len(), problems: d.stayed, ..Default::default() }
             });
             let _ = tx.send(Msg::Fixed(done));
             ctx.request_repaint();
@@ -2644,7 +2644,7 @@ fn ignore_file() -> PathBuf {
 
 /// Adds a key to the list of ignored issues, or takes it out. Every other line stays as it is, and so do
 /// the file's line ends and the marker some editors put at the start of a UTF-8 file.
-fn write_ignore(file: &Path, key: &str, on: bool) -> std::io::Result<()> {
+pub(crate) fn write_ignore(file: &Path, key: &str, on: bool) -> std::io::Result<()> {
     let old = match std::fs::read(file) {
         Ok(b) => String::from_utf8_lossy(&b).to_string(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -2708,6 +2708,90 @@ fn load(report_file: &Path, ignore_file: &Path) -> Loaded {
         }
         None => Loaded::Unreadable,
     }
+}
+
+/// The report as Cadence's engine answers `health.report` (ENGINE-PROTOCOL.md, "Health"): read the way
+/// this page reads it (leniently, ignored issues marked, "1 of 1" said of the one track), grouped by album.
+/// Serious and worth-fixing issues are listed album by album; minor ones are grouped by category in
+/// `small_things`. With no report yet `when` is null and the lists are empty; a report that cannot be read
+/// is an error in plain words.
+pub(crate) fn engine_report(report_file: &Path, ignore_file: &Path) -> Result<Value, String> {
+    use serde_json::json;
+    let r = match load(report_file, ignore_file) {
+        Loaded::Ready(r) => r,
+        Loaded::Missing => {
+            return Ok(json!({ "when": null, "updated": null, "deep": false, "files": 0, "albums": 0, "artists": 0, "deep_left": 0, "lists_left": 0, "albums_with_issues": [], "small_things": [] }))
+        }
+        Loaded::Changing => return Err("The report is being written right now. Try again in a moment.".into()),
+        Loaded::Unreadable => return Err("The report of the last check could not be read. Run a check again.".into()),
+    };
+    let key = |i: &Issue| format!("{}|{}", i.cat, r.groups[i.group].path.to_lowercase());
+    let fixes = |i: &Issue| -> Vec<Value> {
+        if i.fix == "redownload" {
+            let mut v = vec![json!({ "words": "Replace album", "choice": "" })];
+            if i.files.len() == 1 {
+                let title = Path::new(&i.files[0]).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                v.push(json!({ "words": format!("Replace only {title}"), "choice": "only" }));
+            }
+            return v;
+        }
+        if !crate::repair::can_fix(&i.fix) {
+            return vec![];
+        }
+        crate::repair::choices(&i.fix, &i.cat, &i.data, i.files.len()).into_iter().map(|(words, choice)| json!({ "words": words, "choice": choice })).collect()
+    };
+    let mut albums = vec![];
+    for g in &r.groups {
+        let issues: Vec<Value> = g
+            .issues
+            .iter()
+            .map(|&n| &r.issues[n])
+            .filter(|i| i.sev < 3)
+            .map(|i| {
+                json!({
+                    "key": key(i), "severity": i.sev, "category": i.cat, "words": i.detail, "files": i.files, "fix": i.fix,
+                    "fixes": fixes(i), "fix_all": crate::repair::can_fix_all(&i.fix), "ignored": i.ignored, "data": i.data,
+                })
+            })
+            .collect();
+        if !issues.is_empty() {
+            albums.push(json!({ "folder": g.folder, "path": g.path, "artist": g.artist, "album": g.album, "issues": issues }));
+        }
+    }
+    // minor ones by category, in the order they are first met (the groups are already worst first)
+    let mut small: Vec<(String, String, HashSet<usize>, Vec<String>, usize)> = vec![];
+    for i in r.issues.iter().filter(|i| i.sev >= 3) {
+        let at = match small.iter().position(|s| s.0 == i.cat && s.1 == i.fix) {
+            Some(at) => at,
+            None => {
+                small.push((i.cat.clone(), i.fix.clone(), HashSet::new(), vec![], 0));
+                small.len() - 1
+            }
+        };
+        let s = &mut small[at];
+        if i.ignored {
+            s.4 += 1;
+        } else {
+            s.2.insert(i.group);
+            s.3.push(key(i));
+        }
+    }
+    let small: Vec<Value> = small
+        .into_iter()
+        .map(|(cat, fix, groups, keys, ignored)| {
+            let mut v = json!({ "category": cat, "fix": fix, "albums": groups.len(), "keys": keys, "ignored": ignored });
+            if crate::repair::can_fix_all(&fix) {
+                v["fix_all_words"] = json!(crate::repair::action_words(&fix, &cat, 2));
+            }
+            v
+        })
+        .collect();
+    let when = |d: Option<DateTime<Local>>| d.map(|d| d.to_rfc3339());
+    Ok(json!({
+        "when": when(r.when), "updated": when(r.updated), "deep": r.deep.unwrap_or(false), "cancelled": r.cancelled, "own": r.own,
+        "files": r.files.unwrap_or(0), "albums": r.albums.unwrap_or(0), "artists": r.artists.unwrap_or(0), "unchecked": r.unchecked,
+        "deep_left": r.deep_left, "lists_left": r.lists_left, "albums_with_issues": albums, "small_things": small,
+    }))
 }
 
 /// File bytes as text, without the marker some editors put at the start of UTF-8 files.
